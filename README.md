@@ -4,9 +4,10 @@
 
 ---
 
+This is a personal project, exploring concepts for an agentic world.
+
+
 ## The idea in one paragraph
-
-
 
 Software is made of **boundaries**: between the raw machine and the program that
 drives it, between what a computation *does* and what it *needs*, between the

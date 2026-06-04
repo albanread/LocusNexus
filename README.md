@@ -75,6 +75,12 @@ feature bolted on, but the join that makes the two systems one language.
 A locus is *where*; a nexus is *what crosses there*. LocusNexus has a locus for
 every power precisely so it can have a small, controlled set of crossings.
 
+## Constrained Power 
+
+*Everything in this section describes the design concept. What's mechanically proved and what's still open is laid out in the status section.*
+
+The concept: Locus gives an agent a full programming language to work in, but over a predefined, application-specific set of verbs — and only those. It can loop, abstract, and compute freely; what it can reach is exactly the verbs you handed it, with no way to name anything else.
+
 ## Threat model
 Locus is not a sandbox and does not try to be one. 
 It assumes the agent is running inside the language, over a verb set a team chose, and addresses two specific failure modes:
@@ -93,11 +99,7 @@ Two mitigations fall out of this directly:
 
 What this does not cover: the correctness of the verbs you mint. 
 
-## Constrained Power 
 
-*Everything in this section describes the design concept. What's mechanically proved and what's still open is laid out in the status section.*
-
-The concept: Locus gives an agent a full programming language to work in, but over a predefined, application-specific set of verbs — and only those. It can loop, abstract, and compute freely; what it can reach is exactly the verbs you handed it, with no way to name anything else.
 
 
 ### Loci and the crossing, concretely

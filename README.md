@@ -75,6 +75,22 @@ feature bolted on, but the join that makes the two systems one language.
 A locus is *where*; a nexus is *what crosses there*. LocusNexus has a locus for
 every power precisely so it can have a small, controlled set of crossings.
 
+## Threat model
+Locus is not a sandbox and does not try to be one. 
+It assumes the agent is running inside the language, over a verb set a team chose, and addresses two specific failure modes:
+1. The agent overreaches. Carried away by a task, it tries to widen its own reach — reach for a syscall, emit raw machine code, write an API call it was never granted. 
+In Locus there is no name for that move: the power isn't in scope, so the code that would use it doesn't type-check. The failure surfaces as a local type error at the call site, not a runtime surprise after the fact.
+
+2. The agent is hijacked. A prompt injection turns it toward something it shouldn't do. The same boundary applies — it can only compose the verbs it holds — but the more useful property here is legibility: because every effect a term can have is written in its type, reviewing what a piece of agent-written code is allowed to touch is reading signatures, not auditing logic.
+An injection that tries to exfiltrate or escalate has to do it through a granted verb, in the open, where effects analysis sees it.
+Two mitigations fall out of this directly:
+
+Review by effects, not by reading. You don't have to trace what agent code does; its type already lists every power it can exercise. Code review shrinks to checking a signature against what the task should need.
+
+An audit trail of reaches. Every crossing through a nexus is a recorded event. When an agent reaches for a power, that reach is logged at the boundary — so "what did it try to touch" is answerable from the record, not reconstructed after an incident.
+
+What this does not cover: the correctness of the verbs you mint
+
 ## Constrained Power 
 
 *Everything in this section describes the design concept. What's mechanically proved and what's still open is laid out in the status section.*

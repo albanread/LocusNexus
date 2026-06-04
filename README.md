@@ -73,29 +73,12 @@ feature bolted on, but the join that makes the two systems one language.
 A locus is *where*; a nexus is *what crosses there*. LocusNexus has a locus for
 every power precisely so it can have a small, controlled set of crossings.
 
-## The corner nobody else offers
+## Power and reach are two dials, not one
 
-Today an AI colleague — an agent, an intern — gets one of two deals, as if power
-and reach were a single dial. A fixed set of canned commands: safe, but rigid, and
-every new move needs a human. Or a full runtime — all of Python, all of Node, the
-kitchen sink: expressive, but one import from anything. Those are two axes, not
-one. LocusNexus sits in the corner the dial hides:
+An AI colleague — an agent, an intern — is usually handed one of two deals, as if power and reach moved together on a single dial.  
 
-|  | Narrow, **curated** world reach | Wide, **open** world reach |
-|---|---|---|
-| **High** expressivity | **LocusNexus** — a full language (`locusc`) over a bounded, curated world surface | the kitchen sink — all of Python, all of Node, one import from anything |
-| **Low** expressivity | a fixed tool set — canned commands, every new move needs a human | a raw shell |
+Locus can provide an agent with a full programming language with a predefined application specific set of verbs to compose.
 
-Power and reach look like a single dial — but they are two axes. LocusNexus is the
-**upper-left** quadrant the dial hides: full expressivity over a narrow, curated surface.
-
-A team mints and seals a curated set of world-verbs — `readProjectFile`,
-`writeLog`, `query` — each scoped to exactly what it should touch. The colleague agent
-gets the **whole language** to compose them: loops, abstraction, real computation.
-What it can *reach* is exactly that verb set, and everything else is not forbidden
-so much as **unsayable**. The mistake "it touched the network" isn't caught after
-the fact — there is no name for it to write. Real leverage, without the keys to the
-floor.
 
 ### Loci and the crossing, concretely
 

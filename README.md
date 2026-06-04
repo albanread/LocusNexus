@@ -18,6 +18,22 @@ to the language, and where forward-effect binds to backward-need. The name is th
 thesis — *locus* is the place, *nexus* is the crossing, and the project is the
 binding and controlling force between them.
 
+The whole shape fits on one screen. A program's pure code performs **effects** that are
+written in its type; those effects are the only thing that reaches a **nexus**, the one
+controlled crossing; across it sit the **loci**, each carrying a set of **sealed** powers
+the world granted.
+
+```mermaid
+flowchart TD
+    PC[Pure code] --> EF[Effects in the type]
+    EF --> HA[Handlers]
+    HA --> RS[Results]
+    EF --> NEX{{nexus - the one controlled crossing}}
+    NEX --> LA[Locus A - sealed powers]
+    NEX --> LB[Locus B - sealed powers]
+    NEX --> LC[Locus C - sealed powers]
+```
+
 ## The two boundaries the name is built on
 
 **The world boundary — where authority enters.** Raw power (calling the OS,
@@ -28,6 +44,24 @@ utter it, cannot invoke it, cannot build an adapter to it — while every line t
 *implements* it stays readable. A seal removes authority, not visibility. This is
 the nexus through which all real-world reach must pass, and it is one-directional
 and auditable by construction.
+
+A sealed power keeps its *implementation* fully readable while making its *authority*
+unsayable above the boundary — a seal removes the ability to **wield**, not the ability to
+**read**:
+
+```mermaid
+classDiagram
+    class WriteFile {
+        <<sealed power>>
+        +tag : WriteFile
+        +impl : the OS write syscall
+        +constraints : the world rules
+    }
+```
+
+The `impl` line is real, auditable code living at the boundary. Above it, no application
+term can *name* `WriteFile` to invoke it — so "it wrote a file it shouldn't" is not a bug
+caught after the fact; it is a sentence with no words to write it.
 
 **The calculus boundary — where effect meets need.** Effects (what a computation
 does as it runs forward) and coeffects (what it demands of its context) are two
@@ -47,19 +81,13 @@ every new move needs a human. Or a full runtime — all of Python, all of Node, 
 kitchen sink: expressive, but one import from anything. Those are two axes, not
 one. LocusNexus sits in the corner the dial hides:
 
-```
-                    world reach
-                  narrow        wide
-                ┌───────────┬───────────┐
-   expressivity │  canned   │  the      │
-        high    │  + a real │  kitchen  │  ← LocusNexus is upper-left:
-                │  language │  sink     │    a full language over a
-                │ (locusc) │           │    bounded, curated world surface
-                ├───────────┼───────────┤
-        low     │  fixed    │  raw      │
-                │  tool set │  shell    │
-                └───────────┴───────────┘
-```
+|  | Narrow, **curated** world reach | Wide, **open** world reach |
+|---|---|---|
+| **High** expressivity | **LocusNexus** — a full language (`locusc`) over a bounded, curated world surface | the kitchen sink — all of Python, all of Node, one import from anything |
+| **Low** expressivity | a fixed tool set — canned commands, every new move needs a human | a raw shell |
+
+Power and reach look like a single dial — but they are two axes. LocusNexus is the
+**upper-left** quadrant the dial hides: full expressivity over a narrow, curated surface.
 
 A team mints and seals a curated set of world-verbs — `readProjectFile`,
 `writeLog`, `query` — each scoped to exactly what it should touch. The colleague agent
@@ -68,6 +96,41 @@ What it can *reach* is exactly that verb set, and everything else is not forbidd
 so much as **unsayable**. The mistake "it touched the network" isn't caught after
 the fact — there is no name for it to write. Real leverage, without the keys to the
 floor.
+
+### Loci and the crossing, concretely
+
+A team mints a **locus**: a named bundle of exactly the powers it should carry. Here a
+filesystem locus for a build agent, granting three verbs and nothing else.
+
+```mermaid
+classDiagram
+    class BuildFS {
+        <<locus>>
+        +read()
+        +write()
+        +list()
+    }
+```
+
+The colleague's code never touches a syscall. It `perform`s an effect against the locus;
+the **nexus** is where that crossing happens, binding the forward effect to the locus's
+sealed power on the world side.
+
+```mermaid
+sequenceDiagram
+    participant Program
+    participant Nexus
+    participant World
+    Program->>Nexus: perform readFile(l)
+    Nexus->>World: use l.powers.read
+    World-->>Program: bytes
+    Program->>Nexus: perform writeFile(l)
+    Nexus->>World: use l.powers.write
+    World-->>Program: ok
+```
+
+`l.powers.write` lives only on the world side of the nexus. The program holds `l`, names
+the verb, and receives the result — never the key.
 
 ## What this buys you
 

@@ -87,6 +87,8 @@ floor.
 
 Locus's big idea is that a *program's type tells you the truth about what it does* — which powers it uses (touch the disk, allocate memory, call the OS) and when it runs. We're trying to prove that promise can't be cheated. Not argue it — prove it, with a proof a computer checks line by line. That's what makes it trustworthy instead of just confident.
 
+The science: Locus is a concrete, mechanized instance of the Gaboardi et al. (2016) programme — effects and coeffects, combined by grading and a distributive law — specialized to (effect monad, staging comonad) with algebraic effect handlers and a runST-style sealing rule.
+
 The two promises we're nailing down:
 
 "The label stays true." If a program's type says "this does X," then after the program takes one step of running, the result still does only X — never secretly more. The label on the tin can't drift as you use the contents.

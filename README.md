@@ -6,6 +6,8 @@
 
 ## The idea in one paragraph
 
+
+
 Software is made of **boundaries**: between the raw machine and the program that
 drives it, between what a computation *does* and what it *needs*, between the
 foreign world outside the language and the typed, legible code inside it. Most
@@ -73,11 +75,11 @@ feature bolted on, but the join that makes the two systems one language.
 A locus is *where*; a nexus is *what crosses there*. LocusNexus has a locus for
 every power precisely so it can have a small, controlled set of crossings.
 
-## Power and reach are two dials, not one
+## Constrained Power 
 
-An AI colleague — an agent, an intern — is usually handed one of two deals, as if power and reach moved together on a single dial.  
+*Everything in this section describes the design concept. What's mechanically proved and what's still open is laid out in the status section.*
 
-Locus can provide an agent with a full programming language with a predefined application specific set of verbs to compose.
+The concept: Locus gives an agent a full programming language to work in, but over a predefined, application-specific set of verbs — and only those. It can loop, abstract, and compute freely; what it can reach is exactly the verbs you handed it, with no way to name anything else.
 
 
 ### Loci and the crossing, concretely

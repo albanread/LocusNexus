@@ -1,0 +1,12 @@
+module Bool at services =
+-- stdlib: boolean logic as functions, for higher-order use (e.g. folding a
+-- `List[Bool]` with `bool_and`). The language's `&`/`|` are the *bitwise* Int
+-- operators; these are total `if`-based boolean combinators. Prefixed (`bool_*`)
+-- like the other stdlib surfaces, so they never shadow a user `and`/`or`/`not`.
+
+let bool_not = fn b: Bool => if b then false else true in
+let bool_and = fn a: Bool => fn b: Bool => if a then b else false in
+let bool_or  = fn a: Bool => fn b: Bool => if a then true else b in
+let bool_xor = fn a: Bool => fn b: Bool => if a then bool_not b else b in
+
+()

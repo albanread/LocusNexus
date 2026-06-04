@@ -1,0 +1,22 @@
+module Math at services =
+-- stdlib LAYER 1: math over Linux libm.
+--
+-- Mirrors the Windows Math surface while choosing Linux layer-0 symbols.
+
+let sin   = libm_sin   in
+let cos   = libm_cos   in
+let tan   = libm_tan   in
+let asin  = libm_asin  in
+let acos  = libm_acos  in
+let atan  = libm_atan  in
+let atan2 = libm_atan2 in
+let exp   = libm_exp   in
+let ln    = libm_log   in
+let log10 = libm_log10 in
+let log2  = libm_log2  in
+let ceil  = libm_ceil  in
+let fabs  = libm_fabs  in
+let pow   = libm_pow   in
+let fmod  = libm_fmod  in
+let hypot = libm_hypot in
+()

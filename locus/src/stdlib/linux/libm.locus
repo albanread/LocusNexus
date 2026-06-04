@@ -1,0 +1,20 @@
+module Libm at boundary mints (libm) =
+-- stdlib LAYER 0: libm boundary for Linux.
+
+let libm_sin   = extern "sin"   : Float -> Float in
+let libm_cos   = extern "cos"   : Float -> Float in
+let libm_tan   = extern "tan"   : Float -> Float in
+let libm_asin  = extern "asin"  : Float -> Float in
+let libm_acos  = extern "acos"  : Float -> Float in
+let libm_atan  = extern "atan"  : Float -> Float in
+let libm_exp   = extern "exp"   : Float -> Float in
+let libm_log   = extern "log"   : Float -> Float in
+let libm_log10 = extern "log10" : Float -> Float in
+let libm_log2  = extern "log2"  : Float -> Float in
+let libm_ceil  = extern "ceil"  : Float -> Float in
+let libm_fabs  = extern "fabs"  : Float -> Float in
+let libm_pow   = extern "pow"   : Float -> Float -> Float in
+let libm_atan2 = extern "atan2" : Float -> Float -> Float in
+let libm_fmod  = extern "fmod"  : Float -> Float -> Float in
+let libm_hypot = extern "hypot" : Float -> Float -> Float in
+()

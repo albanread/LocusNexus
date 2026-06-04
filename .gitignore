@@ -1,0 +1,36 @@
+# --- Rust build output ---
+# Cargo's compiled artifacts. Never committed.
+target/
+
+# --- Node / presentation tool dependencies ---
+# Generated presentation workspaces may contain local dependency installs.
+node_modules/
+
+# --- Lean / Lake build output (formal/) ---
+# Compiled .olean/.c/etc. The .lean source, lakefile, lean-toolchain, and
+# lake-manifest.json (the lockfile) ARE committed; the build cache is not.
+.lake/
+
+# --- compiled programs (locusc build output / AOT intermediates) ---
+# `.exe`/`.obj` are build products of `locusc build` (e.g. examples/hello.exe);
+# the `.locus` source is committed, the binary is not.
+*.exe
+*.obj
+
+# Cargo.lock IS committed — Locus heads toward a binary/compiler, so the
+# lockfile is part of the build's reproducibility. (Do not ignore it.)
+
+# --- backup / temp ---
+*.bak
+*.tmp
+*~
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# --- Claude Code: local-only settings (shared settings may be committed) ---
+.claude/settings.local.json

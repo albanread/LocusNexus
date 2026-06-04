@@ -1,0 +1,13 @@
+[package]
+name = "locus-libc"
+version = "0.0.0"
+edition = "2021"
+description = "Locus Linux libc/libm ABI surface and dynamic symbol resolver."
+publish = false
+
+# Keep the Linux oracle out of the root workspace while the port settles.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+locus = { path = "../locus" }

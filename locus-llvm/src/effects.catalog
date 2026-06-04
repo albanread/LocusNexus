@@ -1,0 +1,45 @@
+# Locus effect catalog — how `locusc effects` groups and glosses effects.
+#
+# This is DATA, not compiler code. It is embedded in the compiler, loaded before
+# any `effects` run, and emitted by `locusc republish` (read-only and verifiable
+# in prod, like the stdlib). A project that wants its own taxonomy — say, filing a
+# `Db` effect under `persistence` instead of `user` — edits this and rebuilds its
+# compiler, the same model as the stdlib. It affects ONLY the review / display
+# surface: nothing here changes what a program type-checks or compiles to.
+#
+# Format (whitespace-separated; '#' starts a comment; blank lines ignored):
+#   order    <cat> <cat> ...        -- the categories, in display order
+#   <label>  <cat> <gloss...>       -- an effect label -> category + one-line gloss
+#   kind:<k> <cat> <gloss...>       -- fallback for an unlisted label of KIND k
+#                                      (k = world | user | exn | gc | staging)
+# An explicit <label> wins over a kind fallback; a label matching neither uses the
+# ultimate default (user / "effect"). So a new label is never uncategorised.
+
+order  boundary world memory control user staging
+
+# -- the world's edge: the raw FFI, layer-0 only -----------------------------
+# The one reach a review most wants to SEE — its own bucket, first, so it stands
+# out instead of blending in with the ordinary capabilities.
+winapi      boundary  raw Win32 FFI - the OS boundary (layer-0 only)
+crt         boundary  raw C runtime FFI - the CRT boundary (layer-0 only)
+libc        boundary  raw Linux libc FFI - the OS/C boundary (layer-0 only)
+libm        boundary  raw Linux libm FFI - the math boundary (layer-0 only)
+asm         boundary  raw machine-code boundary (layer-0 only)
+
+# -- abstract IO capabilities ------------------------------------------------
+console       world     terminal output (writeln / print)
+console_float world     terminal float output (writelnFloat)
+read_line   world     terminal input
+fs          world     filesystem access
+net         world     network access
+clock       world     wall-clock / time
+
+# -- the heap and raw memory -------------------------------------------------
+mem         memory    raw memory — peek / poke / fill / copy
+
+# -- fallbacks by label KIND (anything not named above) ----------------------
+kind:gc       memory   managed heap — allocation (the GC effect)
+kind:exn      control  may abort
+kind:user     user     user-declared effect
+kind:staging  staging  staging — let-insertion (generative)
+kind:world    world    world effect

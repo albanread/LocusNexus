@@ -1,0 +1,14 @@
+# Locus's garbage-collected heap: a thin handle layer over the vendored NewGC
+# collector. Kept OUT of the core `locus` crate (which stays std-only) and the
+# `locus-llvm` backend's hot path; it's linked into a program's runtime only when
+# that program actually allocates, so non-allocating programs keep their thin exes.
+[package]
+name = "locus-gc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Precise-only: we disable NewGC's conservative-pin scanner. Our own conservative
+# scan finds live HANDLES (stable indices) and feeds NewGC precise roots (the live
+# handle-table entries), so the collector never has to guess at the stack.
+newgc-core = { path = "../vendor/newgc-core", default-features = false }

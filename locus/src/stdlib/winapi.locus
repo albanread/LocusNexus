@@ -1,0 +1,16 @@
+module Winapi at boundary mints (winapi) =
+-- stdlib LAYER 0: winapi — the raw Win32 imports. CLOSEST TO WORLD.
+--
+-- The kernel of the capability stack (world > winapi > console > ... > app):
+-- only this layer names the Win32 boundary, so it is grafted OUTERMOST, nearest
+-- the `world` that ultimately handles `winapi`. Higher layers build on these; the
+-- app never names them directly. The final `()` is the placeholder body the
+-- loader replaces with the rest of the program.
+
+let getstdhandle = extern "GetStdHandle" : U32 -> Ptr in
+let virtualalloc = extern "VirtualAlloc" : Ptr -> Ptr -> U32 -> U32 -> Ptr in
+let widetoutf8   =
+  extern "WideCharToMultiByte" : U32 -> U32 -> Ptr -> I32 -> Ptr -> I32 -> Ptr -> Ptr -> I32 in
+let writefile    = extern "WriteFile" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in
+
+()

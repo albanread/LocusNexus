@@ -1,0 +1,19 @@
+# The Locus managed-heap runtime: the `gc` effect's handler. Built BOTH ways:
+#   - `rlib`     so `locus-llvm` links it into `locusc` and the JIT can resolve
+#                the shim addresses (runtime_symbols).
+#   - `staticlib` (locus_rt.lib) so the AOT linker can link it into an allocating
+#                program's `.exe` — the SAME real collector the JIT uses, so an
+#                AOT exe exercises it for real (no stubs).
+[package]
+name = "locus-rt"
+version = "0.0.0"
+edition = "2021"
+description = "Locus managed-heap runtime — the gc effect's handler, linked into allocating programs (JIT + AOT)."
+publish = false
+
+[lib]
+name = "locus_rt"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+locus-gc = { path = "../locus-gc" }

@@ -1,0 +1,29 @@
+module Num at services =
+-- stdlib: num — integer and comparison helpers.
+--
+-- Monomorphic on Int: these use Int `<` and `-`. `Ordering` is a stdlib
+-- SUM TYPE — proof that `type` declarations graft, not just `let`s.
+
+type Ordering = Lt | Eq | Gt in
+
+-- abs : Int -> Int
+let abs = fn n: Int => if n < 0 then 0 - n else n in
+-- max / min : Int -> Int -> Int
+let max = fn a: Int => fn b: Int => if a < b then b else a in
+let min = fn a: Int => fn b: Int => if a < b then a else b in
+-- compare : Int -> Int -> Ordering  (performs `gc` — it builds an Ordering)
+let compare = fn a: Int => fn b: Int =>
+  if a < b then Lt else (if b < a then Gt else Eq) in
+
+-- clamp x to [lo, hi] : Int -> Int -> Int -> Int
+let clamp = fn x: Int => fn lo: Int => fn hi: Int =>
+  if x < lo then lo else (if hi < x then hi else x) in
+
+-- Float comparison helpers (the CRT `fabs` is the Float abs; these are the
+-- comparisons num's Int `min`/`max` don't cover).
+let fmin = fn a: Float => fn b: Float => if a < b then a else b in
+let fmax = fn a: Float => fn b: Float => if a < b then b else a in
+let fclamp = fn x: Float => fn lo: Float => fn hi: Float =>
+  if x < lo then lo else (if hi < x then hi else x) in
+
+()

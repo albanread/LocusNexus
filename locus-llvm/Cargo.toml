@@ -1,0 +1,43 @@
+[package]
+name = "locus-llvm"
+version = "0.0.0"
+edition = "2021"
+description = "Locus LLVM/ORC backend — lower the ANF IR to LLVM and JIT it."
+publish = false
+
+[lib]
+name = "locus_llvm"
+
+[features]
+default = ["windows-driver"]
+# Existing Windows compiler surface: Win32 oracle, Windows JIT import table,
+# MSVC AOT, and the bundled MASM runtime. It stays default so current Windows
+# workflows keep building the same crate.
+windows-driver = ["dep:cc", "dep:locus-asm", "dep:locus-rt", "dep:locus-winapi"]
+
+# `locusc` — the Locus compiler driver: `run` (JIT) and `build` (AOT → .exe).
+# The mint-gate blocks app-level minting by default (no build-time toggle): the
+# compiler you ship the app team is locked. See `docs/user-guide-mint-and-seal.md`.
+[[bin]]
+name = "locusc"
+path = "src/main.rs"
+required-features = ["windows-driver"]
+
+[dependencies]
+locus = { path = "../locus" }
+# The Layer-0 macro assembler (vendored wfasm Assembler, text→text). Used to
+# assemble the runtime `.masm` primitives into MC asm, embedded in the AOT object.
+locus-asm = { path = "../vendor/wfasm", optional = true }
+# The managed-heap runtime: the `gc` effect's handler (extern-C shims over the
+# locus-gc collector). Linked into `locusc` as an rlib so the JIT can resolve the
+# shim addresses; also built as a staticlib that the AOT linker links into an
+# allocating program's exe.
+locus-rt = { path = "../locus-rt", optional = true }
+# The Win32 ABI oracle — resolves bare `extern "Sym"` signatures and supplies
+# the demanded DLLs' import libs to the AOT linker.
+locus-winapi = { path = "../locus-winapi", optional = true }
+inkwell.workspace = true
+llvm-sys.workspace = true
+# Used only to locate MSVC `cl.exe` / `link.exe` with the SDK env (`%LIB%`,
+# `%INCLUDE%`) populated — the AOT path drives them to build a `.exe`.
+cc = { version = "1", optional = true }

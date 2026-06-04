@@ -1,0 +1,30 @@
+module Math at services =
+-- stdlib LAYER 1: math — the public CRT-backed math services over layer-0 `crt_*`.
+--
+-- Each `let name = crt_name in …` is MARKER-ONLY: IR lowering remembers the alias
+-- targets an extern and collapses a fully-applied `pow a b` into ONE
+-- `foreign "pow"(a, b)` call (no runtime function value, no curried chain). App
+-- code calls `sin`/`pow`/`atan2`, never `extern`.
+--
+-- NOTE: `sqrt`, `floor`, and `round` are *language-level* numeric forms upstream
+-- (a primitive and casts), so they are deliberately NOT re-exposed here as CRT
+-- services — that would shadow the built-ins. This layer is the transcendental /
+-- CRT-only surface.
+
+let sin   = crt_sin   in
+let cos   = crt_cos   in
+let tan   = crt_tan   in
+let asin  = crt_asin  in
+let acos  = crt_acos  in
+let atan  = crt_atan  in
+let atan2 = crt_atan2 in
+let exp   = crt_exp   in
+let ln    = crt_log   in          -- the CRT `log` is the natural log; expose as `ln`
+let log10 = crt_log10 in
+let log2  = crt_log2  in
+let ceil  = crt_ceil  in
+let fabs  = crt_fabs  in
+let pow   = crt_pow   in
+let fmod  = crt_fmod  in
+let hypot = crt_hypot in
+()

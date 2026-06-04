@@ -1,0 +1,51 @@
+module Result at services =
+-- stdlib: generic Result and effect-polymorphic Result combinators.
+
+type Result[a, b] = Ok(a) | Err(b) in
+
+let result_is_ok =
+  fn res: Result[a, b] =>
+    match res with
+    | Ok(x) => true
+    | Err(e) => false
+in
+
+let result_is_err =
+  fn res: Result[a, b] =>
+    match res with
+    | Ok(x) => false
+    | Err(e) => true
+in
+
+-- the Ok value, or `default` when this is an Err (the Result analog of
+-- `option_with_default`; "unwrap or").
+let result_with_default =
+  fn res: Result[a, b] => fn default: a =>
+    match res with
+    | Ok(x) => x
+    | Err(e) => default
+in
+
+let result_map =
+  fn res: Result[a, b] => fn f: a -> c ! {| r} =>
+    match res with
+    | Ok(x) => Ok(f x)
+    | Err(e) => Err(e)
+in
+
+let result_map_err =
+  fn res: Result[a, b] => fn f: b -> c ! {| r} =>
+    match res with
+    | Ok(x) => Ok(x)
+    | Err(e) => Err(f e)
+in
+
+-- monadic bind on the Ok branch; Err short-circuits unchanged.
+let result_bind =
+  fn res: Result[a, b] => fn f: a -> Result[c, b] ! {| r} =>
+    match res with
+    | Ok(x) => f x
+    | Err(e) => Err(e)
+in
+
+()

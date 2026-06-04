@@ -1,0 +1,17 @@
+[package]
+name = "locus-asm"
+version = "0.0.0"
+edition = "2021"
+description = "MASM-style x86-64 macro assembler (text → LLVM-MC Intel asm), the Layer-0 `asm` provider's front end (D5)."
+publish = false
+
+# VENDORED into Locus from E:\JASM\rust (crate `wfasm`). Per `docs/jasm-boundary-layer.md`
+# R-JASM-3, only the **Assembler** (`asm/`, the LLVM-free text→text engine) is
+# taken — NOT wfasm's `jit`/`llvm` (MCJIT; Locus already owns an LLVM layer) nor
+# its `win32` generator (Locus keeps `locus-winapi` as the single Win32 oracle —
+# no second copy of the API data). Std-only; keep diffs against upstream minimal
+# so fixes can flow back.
+
+[lib]
+name = "locus_asm"
+path = "src/lib.rs"

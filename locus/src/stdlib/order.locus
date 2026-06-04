@@ -1,0 +1,22 @@
+module Order at services =
+-- stdlib: ordering helpers parameterized by an explicit comparator
+-- (`a -> a -> Ordering`, where `Ordering` comes from `num`, which grafts outer of
+-- this module). Trait-ready: a future `Ord` constraint would supply the comparator
+-- implicitly, but the explicit-comparator form is the honest v1 surface. The
+-- callback's effect row threads out through the open tail `r`.
+
+let min_by = fn x: a => fn y: a => fn cmp: a -> a -> Ordering ! {| r} =>
+  match cmp x y with
+  | Gt => y
+  | Lt => x
+  | Eq => x
+in
+
+let max_by = fn x: a => fn y: a => fn cmp: a -> a -> Ordering ! {| r} =>
+  match cmp x y with
+  | Lt => y
+  | Gt => x
+  | Eq => x
+in
+
+()

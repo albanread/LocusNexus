@@ -1,0 +1,14 @@
+name = "locus-calculus"
+defaultTargets = ["LocusCalculus", "Substitution", "Handlers"]
+
+# Formalization of docs/calculus.md — the Locus core calculus.
+# Lean core only; no Mathlib / Batteries dependency.
+
+[[lean_lib]]
+name = "LocusCalculus"
+
+[[lean_lib]]
+name = "Substitution"
+
+[[lean_lib]]
+name = "Handlers"

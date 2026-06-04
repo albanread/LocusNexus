@@ -1,0 +1,51 @@
+module Option at services =
+-- stdlib: generic Option and effect-polymorphic Option combinators.
+
+type Option[a] = None | Some(a) in
+
+let option_is_some =
+  fn opt: Option[a] =>
+    match opt with
+    | None => false
+    | Some(x) => true
+in
+
+let option_is_none =
+  fn opt: Option[a] =>
+    match opt with
+    | None => true
+    | Some(x) => false
+in
+
+let option_with_default =
+  fn opt: Option[a] => fn default: a =>
+    match opt with
+    | None => default
+    | Some(x) => x
+in
+
+let option_map =
+  fn opt: Option[a] => fn f: a -> b ! {| r} =>
+    match opt with
+    | None => None
+    | Some(x) => Some(f x)
+in
+
+-- monadic bind: chain a fallible step. The callback's row passes through `r`.
+let option_bind =
+  fn opt: Option[a] => fn f: a -> Option[b] ! {| r} =>
+    match opt with
+    | None => None
+    | Some(x) => f x
+in
+
+-- convert to a `Result`, using `err` as the Err payload for `None`. (`Result`
+-- grafts OUTER of `Option`, so `Ok`/`Err` are in scope here.)
+let option_to_result =
+  fn opt: Option[a] => fn err: b =>
+    match opt with
+    | None => Err(err)
+    | Some(x) => Ok(x)
+in
+
+()

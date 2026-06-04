@@ -1,0 +1,9 @@
+module Libc at boundary mints (libc) =
+-- stdlib LAYER 0: libc/POSIX boundary for Linux.
+--
+-- Only this layer names raw libc symbols. Services wrap these bindings and seal
+-- the `libc` label before app code sees a stable service API.
+
+let libc_malloc = extern "malloc" : Int -> Ptr in
+let libc_write  = extern "write"  : I32 -> Ptr -> Int -> Int in
+()

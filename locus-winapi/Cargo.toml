@@ -1,0 +1,23 @@
+[package]
+name = "locus-winapi"
+version = "0.0.0"
+edition = "2021"
+description = "Locus — vendored Win32 ABI metadata for the FFI surface (from E:\\windows_api). Ported from NewBF's newbf-winapi."
+publish = false
+
+# A build.rs reads the shared `E:\windows_api\windows_api.db` (Microsoft
+# win32metadata ingested into SQLite) and emits a language-agnostic postcard+zstd
+# ABI blob; lib.rs decodes it lazily and answers `find_function` /
+# `import_lib_for_dll`. The DB path is `LOCUS_WINDOWS_API_DB`-overridable and
+# defaults to the canonical read-only location — the 28 MB DB is NOT vendored;
+# only the tiny projected blob (data/winapi_data.bin.zst) ships in the repo.
+[dependencies]
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde    = { version = "1", features = ["derive"] }
+zstd     = { version = "0.13", default-features = false }
+
+[build-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+serde    = { version = "1", features = ["derive"] }
+zstd     = { version = "0.13", default-features = false }

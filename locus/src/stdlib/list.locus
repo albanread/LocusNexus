@@ -1,0 +1,127 @@
+module List at services =
+-- stdlib: generic List and effect-polymorphic List combinators.
+--
+-- Recursive traversals carry {gc} because matching/constructing sums is
+-- currently effectful. Callback effects pass through the open row tail.
+
+type List[a] = Nil | Cons(a, List[a]) in
+
+let rec list_len : List[a] -> Int ! {gc} =
+  fn xs: List[a] =>
+    match xs with
+    | Nil => 0
+    | Cons(h, t) => 1 + list_len t
+in
+
+let list_is_empty =
+  fn xs: List[a] =>
+    match xs with
+    | Nil => true
+    | Cons(h, t) => false
+in
+
+let rec list_append : List[a] -> List[a] -> List[a] ! {gc} =
+  fn xs: List[a] => fn ys: List[a] =>
+    match xs with
+    | Nil => ys
+    | Cons(h, t) => Cons(h, list_append t ys)
+in
+
+let rec list_map : List[a] -> (a -> b ! {| r}) -> List[b] ! {gc | r} =
+  fn xs: List[a] => fn f: a -> b ! {| r} =>
+    match xs with
+    | Nil => Nil
+    | Cons(h, t) => Cons(f h, list_map t f)
+in
+
+let rec list_fold : List[a] -> b -> (b -> a -> b ! {| r}) -> b ! {gc | r} =
+  fn xs: List[a] => fn init: b => fn f: b -> a -> b ! {| r} =>
+    match xs with
+    | Nil => init
+    | Cons(h, t) => list_fold t (f init h) f
+in
+
+-- reverse via a tail-recursive accumulator (lowers to a loop, not a stack).
+let rec list_rev_onto : List[a] -> List[a] -> List[a] ! {gc} =
+  fn xs: List[a] => fn acc: List[a] =>
+    match xs with
+    | Nil => acc
+    | Cons(h, t) => list_rev_onto t (Cons(h, acc))
+in
+
+let list_reverse =
+  fn xs: List[a] => list_rev_onto xs Nil
+in
+
+-- effect-polymorphic predicate combinators: the callback's row passes through
+-- the open tail `r`, so filtering with an effectful predicate is honest in the
+-- result row.
+let rec list_filter : List[a] -> (a -> Bool ! {| r}) -> List[a] ! {gc | r} =
+  fn xs: List[a] => fn p: a -> Bool ! {| r} =>
+    match xs with
+    | Nil => Nil
+    | Cons(h, t) => if p h then Cons(h, list_filter t p) else list_filter t p
+in
+
+let rec list_all : List[a] -> (a -> Bool ! {| r}) -> Bool ! {gc | r} =
+  fn xs: List[a] => fn p: a -> Bool ! {| r} =>
+    match xs with
+    | Nil => true
+    | Cons(h, t) => if p h then list_all t p else false
+in
+
+let rec list_any : List[a] -> (a -> Bool ! {| r}) -> Bool ! {gc | r} =
+  fn xs: List[a] => fn p: a -> Bool ! {| r} =>
+    match xs with
+    | Nil => false
+    | Cons(h, t) => if p h then true else list_any t p
+in
+
+-- iterate for effect only; the result is Unit and the callback's row is the
+-- whole point — it threads out through `r`.
+let rec list_for_each : List[a] -> (a -> Unit ! {| r}) -> Unit ! {gc | r} =
+  fn xs: List[a] => fn f: a -> Unit ! {| r} =>
+    match xs with
+    | Nil => ()
+    | Cons(h, t) => let u = f h in list_for_each t f
+in
+
+-- the first `n` elements (fewer if the list is shorter); `n <= 0` gives `Nil`.
+let rec list_take : List[a] -> Int -> List[a] ! {gc} =
+  fn xs: List[a] => fn n: Int =>
+    if n < 1 then Nil
+    else (match xs with
+          | Nil => Nil
+          | Cons(h, t) => Cons(h, list_take t (n - 1)))
+in
+
+-- everything after the first `n` elements; `n <= 0` returns the whole list.
+let rec list_drop : List[a] -> Int -> List[a] ! {gc} =
+  fn xs: List[a] => fn n: Int =>
+    if n < 1 then xs
+    else (match xs with
+          | Nil => Nil
+          | Cons(h, t) => list_drop t (n - 1))
+in
+
+-- the first element satisfying `p`, as an `Option` (`Option` grafts OUTER of
+-- `list`, so its constructors are in scope here). The callback's row passes
+-- through `r`.
+let rec list_find : List[a] -> (a -> Bool ! {| r}) -> Option[a] ! {gc | r} =
+  fn xs: List[a] => fn p: a -> Bool ! {| r} =>
+    match xs with
+    | Nil => None
+    | Cons(h, t) => if p h then Some(h) else list_find t p
+in
+
+-- safe 0-indexed access: the `i`th element as an `Option` (`None` if `i` is
+-- negative or past the end).
+let rec list_index : List[a] -> Int -> Option[a] ! {gc} =
+  fn xs: List[a] => fn i: Int =>
+    if i < 0 then None
+    else (match xs with
+          | Nil => None
+          | Cons(h, t) => if i < 1 then Some(h) else list_index t (i - 1))
+in
+
+()

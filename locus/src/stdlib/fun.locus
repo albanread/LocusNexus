@@ -1,0 +1,9 @@
+module Fun at services =
+-- stdlib: generic function helpers. `compose` infers independent callback rows.
+
+let id = fn x => x in
+let compose = fn f => fn g => fn x => f (g x) in
+let const = fn x => fn y => x in
+let flip = fn f => fn x => fn y => f y x in
+
+()

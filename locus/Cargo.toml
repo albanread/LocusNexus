@@ -1,0 +1,13 @@
+[package]
+name = "locus"
+version = "0.0.0"
+edition = "2021"
+description = "Locus — core typechecker (Phase 1). Simple clarity over complex convenience."
+publish = false
+
+[lib]
+name = "locus"
+
+# No dependencies. The core checker is a direct transcription of the
+# calculus (../docs/calculus.md); it leans on std alone, by design.
+[dependencies]

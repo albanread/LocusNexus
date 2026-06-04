@@ -1,0 +1,29 @@
+module Console at services seals (winapi) =
+-- stdlib LAYER 1: console — the `console` capability, SEALING winapi.
+--
+-- `writeln` performs the `console` effect (it does not name `winapi`). THIS
+-- handler discharges `console` by doing the real Win32 output with the layer-0
+-- imports (in scope from further out). So only this layer demands `{winapi}`; the
+-- app's row says `{console}`, never `{winapi}` — the capability seal: the app
+-- cannot reach the boundary, only the console capability can. Replace the handler
+-- with a different `console` clause (a test double, a GUI, a log) and the app is
+-- unchanged.
+--
+-- `writeln` is defined INSIDE the handler's scrutinee, so its `perform console`
+-- is lowered with this handler in scope — the tail clause inlines at the perform
+-- site (no reified continuation), even inside `writeln`'s lifted body.
+
+handle
+  (let writeln = fn s: String => perform console s in
+   let writelnFloat = fn x: Float => perform console_float x in
+   ())                                                  -- placeholder: the app program
+with {
+  console(s) =>
+    let out  = getstdhandle (0 - 11) in                 -- STD_OUTPUT_HANDLE = -11
+    let data = virtualalloc 0 4096 12288 4 in           -- 4 KiB: MEM_COMMIT|RESERVE, PAGE_READWRITE
+    let cnt  = virtualalloc 0 8 12288 4 in              -- a DWORD for lpNumberOfBytesWritten
+    let n    = widetoutf8 65001 0 s (0 - 1) data 4096 0 0 in  -- CP_UTF8, NUL-terminated
+    let ok   = writefile out data (n - 1) cnt 0 in      -- emit n-1 bytes (drop the NUL)
+    resume () ;
+  return(x) => x
+}

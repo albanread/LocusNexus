@@ -1,0 +1,28 @@
+module Crt at boundary mints (crt) =
+-- stdlib LAYER 0: crt — the raw UCRT math imports, backed by `ucrtbase.dll`.
+--
+-- Like `winapi`, this is a boundary layer (world > winapi/crt > services > app):
+-- only a layer-0 module may name `extern`. The `math.*` layer aliases these and
+-- the app never writes `extern "pow"`. Signatures are EXPLICIT and REQUIRED — the
+-- Win32 oracle has no C-runtime types — so the resolver records `symbol →
+-- ucrtbase.dll` from the symbol name alone (JIT: LoadLibrary + GetProcAddress;
+-- AOT: ucrt.lib). The final `()` is the placeholder the loader replaces with the
+-- rest of the program.
+
+let crt_sin   = extern "sin"   : Float -> Float in
+let crt_cos   = extern "cos"   : Float -> Float in
+let crt_tan   = extern "tan"   : Float -> Float in
+let crt_asin  = extern "asin"  : Float -> Float in
+let crt_acos  = extern "acos"  : Float -> Float in
+let crt_atan  = extern "atan"  : Float -> Float in
+let crt_exp   = extern "exp"   : Float -> Float in
+let crt_log   = extern "log"   : Float -> Float in
+let crt_log10 = extern "log10" : Float -> Float in
+let crt_log2  = extern "log2"  : Float -> Float in
+let crt_ceil  = extern "ceil"  : Float -> Float in
+let crt_fabs  = extern "fabs"  : Float -> Float in
+let crt_pow   = extern "pow"   : Float -> Float -> Float in
+let crt_atan2 = extern "atan2" : Float -> Float -> Float in
+let crt_fmod  = extern "fmod"  : Float -> Float -> Float in
+let crt_hypot = extern "hypot" : Float -> Float -> Float in
+()

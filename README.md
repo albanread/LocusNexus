@@ -89,7 +89,7 @@ Review by effects, not by reading. You don't have to trace what agent code does;
 
 An audit trail of reaches. Every crossing through a nexus is a recorded event. When an agent reaches for a power, that reach is logged at the boundary — so "what did it try to touch" is answerable from the record, not reconstructed after an incident.
 
-What this does not cover: the correctness of the verbs you mint
+What this does not cover: the correctness of the verbs you mint. 
 
 ## Constrained Power 
 

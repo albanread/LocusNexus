@@ -1,0 +1,49 @@
+module Random at services exposing
+  (random_seed, random_next_seed, random_next, random_between, random_bool, random_chance) =
+-- stdlib: deterministic seed-threaded pseudo-random helpers.
+--
+-- This is deliberately not ambient entropy. Programs pass a seed in and receive
+-- the next seed back, which makes examples, games, and tests reproducible. A
+-- future platform service can provide a sealed initial seed without changing this
+-- pure core API.
+
+-- Normalize any Int into the Park-Miller seed range 1..2147483646.
+let random_seed = fn seed: Int =>
+  let raw = seed % 2147483647 in
+  let non_negative = if raw < 0 then raw + 2147483647 else raw in
+  if non_negative == 0 then 1 else non_negative in
+
+-- Advance the seed once. This stays scalar and does not allocate.
+let random_next_seed = fn seed: Int =>
+  (random_seed seed * 48271) % 2147483647 in
+
+-- Produce the next raw value and seed. The value is in 1..2147483646.
+let random_next = fn seed: Int =>
+  let next_seed = random_next_seed seed in
+  (next_seed, next_seed) in
+
+-- Produce an Int inside the inclusive range [lo, hi]. If the arguments arrive in
+-- the opposite order, treat them as the same range with swapped endpoints.
+let random_between = fn lo: Int => fn hi: Int => fn seed: Int =>
+  let low = if hi < lo then hi else lo in
+  let high = if hi < lo then lo else hi in
+  let span = high - low + 1 in
+  let (raw, next_seed) = random_next seed in
+  (low + (raw % span), next_seed) in
+
+let random_bool = fn seed: Int =>
+  let (raw, next_seed) = random_next seed in
+  ((raw % 2) == 0, next_seed) in
+
+-- A deterministic Bernoulli draw. Negative numerators count as 0; numerators
+-- above the denominator count as always true; non-positive denominators are false.
+let random_chance = fn numerator: Int => fn denominator: Int => fn seed: Int =>
+  let (raw, next_seed) = random_next seed in
+  if denominator < 1 then
+    (false, next_seed)
+  else
+    let at_least_zero = if numerator < 0 then 0 else numerator in
+    let capped = if denominator < at_least_zero then denominator else at_least_zero in
+    ((raw % denominator) < capped, next_seed) in
+
+()

@@ -1,0 +1,7 @@
+module ArrayRt at boundary mints (gc) exposing () =
+-- Private bridge for allocation-shaped array helpers. Public array services keep
+-- the useful surface small while this module owns the raw managed-heap edge.
+
+let locus_array_new_int = extern "locus_array_new_int" : Int -> Int -> Array[Int] in
+
+()

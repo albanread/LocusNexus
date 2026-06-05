@@ -7,7 +7,8 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 
-use locus::{Handler, OpClause, Return, Row, Term, Type};
+use locus::syntax::InstanceMethod;
+use locus::{BlockItem, Handler, OpClause, Return, Row, Term, Type};
 
 /// `symbol -> shared object` for every Linux C runtime symbol a program demands.
 pub type Demanded = BTreeMap<String, String>;
@@ -133,6 +134,37 @@ fn bx(t: Term) -> Box<Term> {
     Box::new(t)
 }
 
+fn walk_block_item(item: BlockItem, d: &mut Demanded) -> Result<BlockItem, String> {
+    Ok(match item {
+        BlockItem::Let(n, e) => BlockItem::Let(n, walk(e, d)?),
+        BlockItem::LetRec(n, ty, e) => BlockItem::LetRec(n, ty, walk(e, d)?),
+        BlockItem::LetMut(n, e) => BlockItem::LetMut(n, walk(e, d)?),
+        BlockItem::LetTuple(names, e) => BlockItem::LetTuple(names, walk(e, d)?),
+        BlockItem::Instance {
+            trait_name,
+            head,
+            requires,
+            methods,
+            module,
+        } => BlockItem::Instance {
+            trait_name,
+            head,
+            requires,
+            methods: methods
+                .into_iter()
+                .map(|m| {
+                    Ok::<_, String>(InstanceMethod {
+                        name: m.name,
+                        body: walk(m.body, d)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            module,
+        },
+        BlockItem::Effect { .. } | BlockItem::TypeDef { .. } | BlockItem::Trait { .. } => item,
+    })
+}
+
 fn walk(t: Term, d: &mut Demanded) -> Result<Term, String> {
     use Term::*;
     Ok(match t {
@@ -156,6 +188,13 @@ fn walk(t: Term, d: &mut Demanded) -> Result<Term, String> {
         }
         ExternAsm(sym, ty) => ExternAsm(sym, ty),
         Let(n, e, b) => Let(n, bx(walk(*e, d)?), bx(walk(*b, d)?)),
+        Block(items, body) => Block(
+            items
+                .into_iter()
+                .map(|item| walk_block_item(item, d))
+                .collect::<Result<Vec<_>, _>>()?,
+            bx(walk(*body, d)?),
+        ),
         LetRec(n, ty, e, b) => LetRec(n, ty, bx(walk(*e, d)?), bx(walk(*b, d)?)),
         Lam(p, ty, b) => Lam(p, ty, bx(walk(*b, d)?)),
         App(f, a) => App(bx(walk(*f, d)?), bx(walk(*a, d)?)),
@@ -309,6 +348,25 @@ mod tests {
         };
         assert_eq!(*count, Type::Int);
         assert_eq!(*ret, Type::Int);
+    }
+
+    #[test]
+    fn bare_libc_extern_inside_compacted_block_is_filled() {
+        let term = Term::Block(
+            vec![BlockItem::Let(
+                "writeFn".into(),
+                Term::Extern("write".into(), None, None),
+            )],
+            Box::new(Term::Var("writeFn".into())),
+        );
+        let (resolved, demanded) = resolve(term).unwrap();
+        assert_eq!(demanded.get("write").map(String::as_str), Some("libc.so.6"));
+        let Term::Block(items, _) = resolved else {
+            panic!("expected compacted block");
+        };
+        let BlockItem::Let(_, Term::Extern(_, Some(_), _)) = &items[0] else {
+            panic!("expected filled extern in block, got {items:?}");
+        };
     }
 
     #[test]

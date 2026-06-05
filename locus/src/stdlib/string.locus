@@ -1,0 +1,154 @@
+module String at services exposing
+  (StringEq, string_eq, StringOrd, string_ordering, StringShow, string_show,
+   string_len, string_is_empty, string_unit_at,
+   string_empty, string_singleton, string_slice, string_take, string_drop,
+   string_concat, string_append, string_repeat,
+   string_equals, string_compare, string_starts_with, string_ends_with,
+   string_contains_at, string_find_from, string_find, string_last_find,
+   string_contains, string_count) =
+-- UTF-16 helpers over Locus's managed String representation. A String is a
+-- GC-managed scalar array of 16-bit code units: `len s` and `s[i]` are the
+-- ordinary, bounds-checked managed-array surface.
+
+let string_len =
+  fn s: String =>
+    len s
+in
+
+let string_is_empty =
+  fn s: String =>
+    len s == 0
+in
+
+let string_unit_at =
+  fn s: String => fn i: Int =>
+    if i < 0 then
+      None
+    else if i < len s then
+      Some(s[i])
+    else
+      None
+in
+
+let string_empty =
+  fn u: Unit =>
+    locus_string_empty ()
+in
+
+let string_singleton =
+  fn unit: Int =>
+    locus_string_unit unit
+in
+
+let string_slice =
+  fn s: String => fn start: Int => fn count: Int =>
+    let total = len s in
+    let begin =
+      if start < 0 then
+        0
+      else if total < start then
+        total
+      else
+        start
+    in
+    let wanted = if count < 0 then 0 else count in
+    let available = total - begin in
+    let clipped = if available < wanted then available else wanted in
+    locus_string_slice s begin clipped
+in
+
+let string_take =
+  fn s: String => fn count: Int =>
+    string_slice s 0 count
+in
+
+let string_drop =
+  fn s: String => fn count: Int =>
+    let total = len s in
+    let begin =
+      if count < 0 then
+        0
+      else if total < count then
+        total
+      else
+        count
+    in
+    string_slice s begin (total - begin)
+in
+
+let string_concat =
+  fn a: String => fn b: String =>
+    locus_string_concat a b
+in
+
+let string_append =
+  fn a: String => fn b: String =>
+    string_concat a b
+in
+
+let string_repeat =
+  fn s: String => fn count: Int =>
+    locus_string_repeat s (if count < 0 then 0 else count)
+in
+
+let string_equals =
+  fn a: String => fn b: String =>
+    if locus_string_equals a b == 0 then false else true
+in
+
+let string_compare =
+  fn a: String => fn b: String =>
+    locus_string_compare a b
+in
+
+let string_contains_at =
+  fn haystack: String => fn needle: String => fn at: Int =>
+    if locus_string_contains_at haystack needle at == 0 then false else true
+in
+
+let string_starts_with =
+  fn s: String => fn prefix: String =>
+    string_contains_at s prefix 0
+in
+
+let string_ends_with =
+  fn s: String => fn suffix: String =>
+    let at = len s - len suffix in
+    if at < 0 then false else string_contains_at s suffix at
+in
+
+let string_find_from =
+  fn haystack: String => fn needle: String => fn startAt: Int =>
+    locus_string_find_from haystack needle startAt
+in
+
+let string_find =
+  fn haystack: String => fn needle: String =>
+    string_find_from haystack needle 0
+in
+
+let string_last_find =
+  fn haystack: String => fn needle: String =>
+    locus_string_last_find haystack needle
+in
+
+let string_contains =
+  fn haystack: String => fn needle: String =>
+    let i = string_find haystack needle in
+    if i < 0 then false else true
+in
+
+let string_count =
+  fn haystack: String => fn needle: String =>
+    locus_string_count haystack needle
+in
+
+trait StringEq a { string_eq : a -> a -> Bool ! {gc} } in
+trait StringOrd a requires StringEq a { string_ordering : a -> a -> Int ! {gc} } in
+trait StringShow a { string_show : a -> String } in
+
+instance StringEq String { string_eq = fn a: String => fn b: String => string_equals a b } in
+instance StringOrd String { string_ordering = fn a: String => fn b: String => string_compare a b } in
+instance StringShow String { string_show = fn s => s } in
+
+()

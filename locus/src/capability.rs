@@ -15,7 +15,7 @@
 //! and seal it above the services without holding any mint power.
 
 use crate::check::TypeErr;
-use crate::sema::{seal_escape, Node, Typed};
+use crate::sema::{seal_escape, Node, Typed, TypedBlockItem};
 use crate::stdlib::{bound_names, first_mint};
 use crate::syntax::{ModuleDecl, Term, Type};
 use std::collections::{HashMap, HashSet};
@@ -136,6 +136,14 @@ fn binding_types(t: &Typed, out: &mut HashMap<String, Type>) {
             // First (outermost) binding of a name wins — modules graft outermost,
             // so a module's own export is found before any inner shadow.
             out.entry(name.clone()).or_insert_with(|| bound.ty.clone());
+            binding_types(body, out);
+        }
+        Node::Block { items, body } => {
+            for item in items {
+                if let TypedBlockItem::Let { name, bound } = item {
+                    out.entry(name.clone()).or_insert_with(|| bound.ty.clone());
+                }
+            }
             binding_types(body, out);
         }
         Node::Handle { scrutinee, .. } => binding_types(scrutinee, out),
@@ -294,21 +302,34 @@ mod tests {
     // ── the seal half: the module `seals (…)` clause (S4) ───────────────
 
     fn seals_check(src: &str) -> Result<(), TypeErr> {
-        let (term, user_mods) =
-            crate::stdlib::program_with_modules(src).expect("test source parses");
-        let tree =
-            crate::sema::elaborate(&crate::prelude::sig(), &crate::check::Ctx::new(), 0, &term)
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .name("capability-seals-check".into())
+            .stack_size(crate::PIPELINE_STACK_BYTES)
+            .spawn(move || {
+                let (term, user_mods) =
+                    crate::stdlib::program_with_modules(&src).expect("test source parses");
+                let tree = crate::sema::elaborate(
+                    &crate::prelude::sig(),
+                    &crate::check::Ctx::new(),
+                    0,
+                    &term,
+                )
                 .expect("test source elaborates");
-        let mut all = crate::stdlib::stdlib_module_decls();
-        all.extend(user_mods);
-        check_module_seals(&all, &tree)
+                let mut all = crate::stdlib::stdlib_module_decls();
+                all.extend(user_mods);
+                check_module_seals(&all, &tree)
+            })
+            .expect("spawn capability seal worker")
+            .join()
+            .expect("capability seal worker panicked")
     }
 
     #[test]
     fn the_real_console_seal_holds() {
-        // Console `seals (winapi)`, and its exported `writeln` carries `console`,
+        // Console `seals (winapi)`, and its exported `console_writeln` carries `console`,
         // not `winapi` — the kernel export boundary is honoured.
-        seals_check(r#"writeln "hi""#).expect("console's winapi seal holds");
+        seals_check(r#"console_writeln "hi""#).expect("console's winapi seal holds");
     }
 
     #[test]
@@ -405,7 +426,10 @@ mod tests {
         )
         .expect_err("a nested extern in app code is still a mint");
         assert_eq!(err.code(), "RN-E0402");
-        assert!(matches!(err, CapError::MintOutsideBoundary { module: None, .. }));
+        assert!(matches!(
+            err,
+            CapError::MintOutsideBoundary { module: None, .. }
+        ));
     }
 
     #[test]

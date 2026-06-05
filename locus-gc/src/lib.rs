@@ -454,8 +454,14 @@ impl Heap {
     /// Create a heap reserving `reserved_bytes` of address space. Pages are
     /// committed lazily as the heap grows, so the reservation can be generous.
     pub fn new(reserved_bytes: usize) -> Self {
+        let mut inner = PageHeap::with_reservation(reserved_bytes);
+        // Preserve evacuation headroom. NewGC's default 8 MiB trigger budget is
+        // appropriate for the normal runtime reservation, but small heaps used
+        // by regression tests need a proportionally smaller trigger.
+        let trigger_budget = (reserved_bytes / 8).clamp(64 * 1024, 8 * 1024 * 1024);
+        inner.set_gc_budget_min_bytes(trigger_budget);
         Heap {
-            inner: PageHeap::with_reservation(reserved_bytes),
+            inner,
             table: Vec::new(),
             gen: Vec::new(),
             free: Vec::new(),
@@ -556,15 +562,19 @@ impl Heap {
 
     /// Allocate an object with `n_pointers` pointer fields followed by
     /// `n_scalars` scalar fields, all initialised to immediate zero. Returns a
-    /// handle. If the young generation is full, runs a collection and retries
-    /// once — the "reliable emulation of infinite memory."
+    /// handle. Runs the page heap's trigger-aware collection policy before the
+    /// evacuation reserve is gone; if allocation still fails, collects and
+    /// retries once — the "reliable emulation of infinite memory."
     pub fn alloc(&mut self, n_pointers: u32, n_scalars: u32) -> Handle {
+        if self.inner.should_collect() {
+            self.collect_auto();
+        }
         let total = 1 + n_pointers as usize + n_scalars as usize;
         let p = match self.inner.try_alloc_boxed_in(Generation::G0, total) {
             Some(p) => p,
             None => {
                 self.stats.alloc_triggered_collections += 1;
-                self.collect();
+                self.collect_auto();
                 self.inner
                     .try_alloc_boxed_in(Generation::G0, total)
                     .expect("heap exhausted even after collection")
@@ -909,6 +919,22 @@ impl Heap {
         let result = {
             let Heap { inner, table, .. } = self;
             inner.collect_minor(|evac| {
+                for w in table.iter_mut() {
+                    evac.visit(w);
+                }
+            })
+        };
+        self.record_collection(&result);
+        result
+    }
+
+    /// Run NewGC's trigger-aware policy with the live handle table as the
+    /// precise root set. This keeps a destination-page reserve for evacuation
+    /// instead of waiting until G0 has consumed the entire reservation.
+    pub fn collect_auto(&mut self) -> CollectResult {
+        let result = {
+            let Heap { inner, table, .. } = self;
+            inner.collect_auto(|evac| {
                 for w in table.iter_mut() {
                     evac.visit(w);
                 }

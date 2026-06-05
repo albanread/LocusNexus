@@ -17,8 +17,8 @@ use std::collections::BTreeSet;
 use crate::check::{Binding, Ctx, Scheme, Sig, Stage, TypeErr};
 use crate::diag::esc;
 use crate::syntax::{
-    BinOp, CastOp, Coercion, ExternAbi, FloatMathOp, Handler, Label, MaskReduceOp, MemWidth, OpSig,
-    Pattern, Row, RowVarId, Term, TyVarId, Type, ValueLayout, VectorShape,
+    BinOp, BlockItem, CastOp, Coercion, ExternAbi, FloatMathOp, Handler, Label, MaskReduceOp,
+    MemWidth, OpSig, Pattern, Row, RowVarId, Term, TyVarId, Type, ValueLayout, VectorShape,
 };
 use crate::unify::{self, generalize, instantiate, instantiate_ctor, unify, unify_row, UnifyErr};
 use std::collections::HashMap;
@@ -181,6 +181,14 @@ pub enum Node {
         bound: Box<Typed>,
         body: Box<Typed>,
     },
+    /// Internal flattened sequence of already-elaborated bindings followed by a
+    /// tail expression. Surface Locus remains expression-shaped; this keeps long
+    /// stdlib/module spines wide in the typed model instead of rebuilding a deep
+    /// unary `Let` chain.
+    Block {
+        items: Vec<TypedBlockItem>,
+        body: Box<Typed>,
+    },
     /// `let mut name = bound in body` — a **non-escaping scalar mutable local**
     /// (mutability v1; `docs/mutability.md` §3). Typed like a `Let` (the body's
     /// type/row, the bound is a scalar), but the binder is *mutable*: reads of
@@ -306,6 +314,55 @@ pub enum Node {
         scrutinee: Box<Typed>,
         arms: Vec<MatchArmT>,
     },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TypedBlockItem {
+    Let {
+        name: String,
+        bound: Typed,
+    },
+    LetMut {
+        name: String,
+        bound: Typed,
+    },
+    LetTuple {
+        names: Vec<String>,
+        bound: Typed,
+        fields_layout_known: bool,
+    },
+}
+
+impl TypedBlockItem {
+    fn bound(&self) -> &Typed {
+        match self {
+            TypedBlockItem::Let { bound, .. }
+            | TypedBlockItem::LetMut { bound, .. }
+            | TypedBlockItem::LetTuple { bound, .. } => bound,
+        }
+    }
+
+    fn binds_name(&self, needle: &str) -> bool {
+        match self {
+            TypedBlockItem::Let { name, .. } | TypedBlockItem::LetMut { name, .. } => {
+                name == needle
+            }
+            TypedBlockItem::LetTuple { names, .. } => names.iter().any(|name| name == needle),
+        }
+    }
+
+    fn layout_known(&self) -> bool {
+        match self {
+            TypedBlockItem::Let { bound, .. } | TypedBlockItem::LetMut { bound, .. } => {
+                bound.layout_known
+            }
+            TypedBlockItem::LetTuple {
+                bound,
+                fields_layout_known,
+                ..
+            } => bound.layout_known && *fields_layout_known,
+        }
+    }
 }
 
 /// One elaborated `match` arm: which tag it matches (`None` = wildcard), the
@@ -436,6 +493,19 @@ impl Typed {
                 value.has_unknown_layout()
             }
             Node::App { fun, arg } => fun.has_unknown_layout() || arg.has_unknown_layout(),
+            Node::Block { items, body } => {
+                items.iter().any(|item| item.bound().has_unknown_layout())
+                    || body.has_unknown_layout()
+                    || items.iter().any(|item| {
+                        matches!(
+                            item,
+                            TypedBlockItem::LetTuple {
+                                fields_layout_known: false,
+                                ..
+                            }
+                        )
+                    })
+            }
             Node::Let { bound, body, .. }
             | Node::LetMut { bound, body, .. }
             | Node::LetTuple(_, bound, body) => {
@@ -463,9 +533,7 @@ impl Typed {
             }
             Node::VectorStore {
                 arr, idx, value, ..
-            } => {
-                arr.has_unknown_layout() || idx.has_unknown_layout() || value.has_unknown_layout()
-            }
+            } => arr.has_unknown_layout() || idx.has_unknown_layout() || value.has_unknown_layout(),
             Node::Construct { args, .. } => args.iter().any(|(t, _, _)| t.has_unknown_layout()),
             Node::Match { scrutinee, arms } => {
                 scrutinee.has_unknown_layout()
@@ -524,7 +592,7 @@ fn inject_mint(ty: &Type, label: &Label) -> Option<Type> {
 /// polymorphic parameter solves against the argument); in S1 both are ground and
 /// it accepts exactly when `dom == arg` did. The error is the same `Mismatch`.
 fn arg_matches(dom: &Type, arg: &Type) -> Result<(), TypeErr> {
-    if *dom == Type::Ptr && matches!(arg, Type::Ptr | Type::Str | Type::Int) {
+    if *dom == Type::Ptr && matches!(arg, Type::Ptr | Type::Int) {
         return Ok(());
     }
     demand_eq(dom, arg)
@@ -792,6 +860,21 @@ fn overflow_effect() -> Row {
     Row::single(Label::Exn("Overflow".into()))
 }
 
+fn callable_effect_label(sig: &Sig, ctx: &Ctx, name: &str) -> Option<Label> {
+    if ctx.get(name).is_some() {
+        return None;
+    }
+    let label = crate::prelude::op_label(name);
+    if sig.contains_key(&label) {
+        return Some(label);
+    }
+    let user = Label::User(name.to_string());
+    if user != label && sig.contains_key(&user) {
+        return Some(user);
+    }
+    None
+}
+
 fn resolved_type(ty: &Type) -> Type {
     unify::with_store(|s| unify::resolve_ty(s, ty))
 }
@@ -882,7 +965,16 @@ fn numeric_operand_type(op: BinOp, a: &Type, b: &Type) -> Type {
 fn is_vector_bin_op(op: BinOp) -> bool {
     matches!(
         op,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Eq | BinOp::Lt
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
     )
 }
 
@@ -1010,7 +1102,6 @@ fn expect_int(t: &Typed) -> Result<(), TypeErr> {
 /// not an indexable machine word.
 fn elem_width(ty: &Type) -> Result<MemWidth, TypeErr> {
     match ty {
-        Type::Str => Ok(MemWidth::W16),
         Type::Int | Type::Ptr => Ok(MemWidth::W8),
         other => Err(TypeErr::NotIndexable(other.clone())),
     }
@@ -2254,6 +2345,77 @@ fn dict_pass(t: &Typed, scope: &DictScope) -> Typed {
             }
         }
 
+        // ── a flat block — same binding rules as a `let` spine, without the spine
+        Node::Block { items, body } => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    TypedBlockItem::Let { name, bound } => {
+                        if let Some((base, 'D', id)) = dict_untag(name) {
+                            let traits = CONSTRAINED_DEFS
+                                .with(|d| d.borrow().get(&id).cloned())
+                                .unwrap_or_default();
+                            let inner = scope.with_params(&traits);
+                            let mut lowered_bound = dict_pass(bound, &inner);
+                            for trait_name in traits.iter().rev() {
+                                let param = dict_param_name(trait_name);
+                                let dict_ty = dict_record_type(trait_name);
+                                let body_ty = lowered_bound.ty.clone();
+                                let body_row = lowered_bound.row.clone();
+                                lowered_bound = Typed::at(
+                                    Type::Fun(
+                                        Box::new(dict_ty.clone()),
+                                        Box::new(body_ty),
+                                        Row::pure(),
+                                    ),
+                                    Row::pure(),
+                                    lowered_bound.stage,
+                                    Node::Lam {
+                                        param,
+                                        param_ty: dict_ty,
+                                        body: Box::new(Typed {
+                                            row: body_row,
+                                            ..lowered_bound
+                                        }),
+                                    },
+                                );
+                            }
+                            out.push(TypedBlockItem::Let {
+                                name: base.to_string(),
+                                bound: lowered_bound,
+                            });
+                        } else {
+                            out.push(TypedBlockItem::Let {
+                                name: name.clone(),
+                                bound: dict_pass(bound, scope),
+                            });
+                        }
+                    }
+                    TypedBlockItem::LetMut { name, bound } => {
+                        out.push(TypedBlockItem::LetMut {
+                            name: name.clone(),
+                            bound: dict_pass(bound, scope),
+                        });
+                    }
+                    TypedBlockItem::LetTuple {
+                        names,
+                        bound,
+                        fields_layout_known,
+                    } => {
+                        out.push(TypedBlockItem::LetTuple {
+                            names: names.clone(),
+                            bound: dict_pass(bound, scope),
+                            fields_layout_known: *fields_layout_known,
+                        });
+                    }
+                }
+            }
+            Node::Block {
+                items: out,
+                body: Box::new(dict_pass(body, scope)),
+            }
+        }
+
         // ── an `App` — possibly a *directly applied* trait-method use (R2) ───
         Node::App { .. } => {
             if let Some((body, spine)) = devirt_method_app(t) {
@@ -2750,6 +2912,31 @@ fn map_children(node: &Node, f: &dyn Fn(&Typed) -> Typed) -> Node {
         Node::Let { name, bound, body } => Node::Let {
             name: name.clone(),
             bound: b(bound),
+            body: b(body),
+        },
+        Node::Block { items, body } => Node::Block {
+            items: items
+                .iter()
+                .map(|item| match item {
+                    TypedBlockItem::Let { name, bound } => TypedBlockItem::Let {
+                        name: name.clone(),
+                        bound: f(bound),
+                    },
+                    TypedBlockItem::LetMut { name, bound } => TypedBlockItem::LetMut {
+                        name: name.clone(),
+                        bound: f(bound),
+                    },
+                    TypedBlockItem::LetTuple {
+                        names,
+                        bound,
+                        fields_layout_known,
+                    } => TypedBlockItem::LetTuple {
+                        names: names.clone(),
+                        bound: f(bound),
+                        fields_layout_known: *fields_layout_known,
+                    },
+                })
+                .collect(),
             body: b(body),
         },
         Node::LetMut { name, bound, body } => Node::LetMut {
@@ -3275,10 +3462,7 @@ fn elaborate_ref_assign(
     let tv = elaborate_inner(sig, ctx, stage, value)?;
     // The written value must have the cell's content type — a unification demand.
     demand_eq(&resolved, &tv.ty)?;
-    let row = target
-        .row
-        .union(&tv.row)
-        .union(&Row::single(Label::St));
+    let row = target.row.union(&tv.row).union(&Row::single(Label::St));
     Ok(Typed::at(
         Type::Unit,
         row,
@@ -3411,7 +3595,7 @@ fn cell_escapes(_name: &str, _body_ty: &Type) -> bool {
 /// rejects any closure capture** of a mutable local. This is not crippling:
 /// straight-line imperative use (`let mut x = 1 in let _ = x := x + 1 in x`) and
 /// direct mutation are unaffected, and the callback-accumulator pattern is served
-/// by the native `loop … do … else` accumulator and `list_fold`.
+/// by the native `loop … do … return` accumulator and `list_fold`.
 ///
 /// Returns `true` iff `name` occurs as a free [`Node::Var`] inside **any**
 /// [`Node::Lam`] body anywhere in `node`'s tree — i.e. some lambda captures the
@@ -3450,6 +3634,17 @@ fn captured_in_closure(name: &str, node: &Node) -> bool {
         } => {
             captured_in_closure(name, &bound.node)
                 || (b != name && captured_in_closure(name, &body.node))
+        }
+        Node::Block { items, body } => {
+            for item in items {
+                if captured_in_closure(name, &item.bound().node) {
+                    return true;
+                }
+                if item.binds_name(name) {
+                    return false;
+                }
+            }
+            captured_in_closure(name, &body.node)
         }
         Node::LetTuple(binders, bound, body) => {
             captured_in_closure(name, &bound.node)
@@ -3598,6 +3793,17 @@ fn occurs_free(name: &str, node: &Node) -> bool {
             bound,
             body,
         } => occurs_free(name, &bound.node) || (b != name && occurs_free(name, &body.node)),
+        Node::Block { items, body } => {
+            for item in items {
+                if occurs_free(name, &item.bound().node) {
+                    return true;
+                }
+                if item.binds_name(name) {
+                    return false;
+                }
+            }
+            occurs_free(name, &body.node)
+        }
         Node::LetTuple(binders, bound, body) => {
             occurs_free(name, &bound.node)
                 || (!binders.iter().any(|n| n == name) && occurs_free(name, &body.node))
@@ -3714,12 +3920,12 @@ fn occurs_free(name: &str, node: &Node) -> bool {
 }
 
 /// Is `ty` a directly **gc-managed heap datum** — a value whose existence implies
-/// an allocation the collector owns? `Array`/`Named`/`Tuple`/`Record`. Closures
-/// (`Fun`), `Code`, `Str` (immortal static text), and scalars are not.
+/// an allocation the collector owns? `Array`/`Named`/`Tuple`/`Record`/`Str`.
+/// Closures (`Fun`), `Code`, and scalars are not.
 fn is_gc_datum(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Array(_) | Type::Named(..) | Type::Tuple(_) | Type::Record(_)
+        Type::Array(_) | Type::Named(..) | Type::Tuple(_) | Type::Record(_) | Type::Str
     )
 }
 
@@ -3727,8 +3933,8 @@ fn is_gc_datum(ty: &Type) -> bool {
 /// signature — walking arrow domains and results — or `None` if the whole ABI is
 /// GC-blind. The A6 gate (jasm-boundary-layer §A6): Layer-0 asm runs with no
 /// safepoints, read barriers, or handle indirection, so a moving collector could
-/// relocate such a value underneath it. Scalars, raw `Ptr`, `Unit`, `Str`
-/// (immortal), `Vector` (unboxed), `Code`, and closures are all GC-blind here.
+/// relocate such a value underneath it. Scalars, raw `Ptr`, `Unit`, `Vector`
+/// (unboxed), `Code`, and closures are all GC-blind here.
 fn arrow_mentions_gc_datum(ty: &Type) -> Option<Type> {
     match ty {
         Type::Fun(a, b, _) => arrow_mentions_gc_datum(a).or_else(|| arrow_mentions_gc_datum(b)),
@@ -3799,6 +4005,340 @@ fn is_value(e: &Term) -> bool {
     }
 }
 
+fn wrap_block_suffix(item: &TypedBlockItem, suffix: Typed, stage: Stage) -> Typed {
+    match item {
+        TypedBlockItem::Let { name, bound } => {
+            let row = bound.row.union(&suffix.row);
+            let ty = suffix.ty.clone();
+            Typed::at(
+                ty,
+                row,
+                stage,
+                Node::Let {
+                    name: name.clone(),
+                    bound: Box::new(bound.clone()),
+                    body: Box::new(suffix),
+                },
+            )
+        }
+        TypedBlockItem::LetMut { name, bound } => {
+            let row = bound.row.union(&suffix.row);
+            let ty = suffix.ty.clone();
+            Typed::at(
+                ty,
+                row,
+                stage,
+                Node::LetMut {
+                    name: name.clone(),
+                    bound: Box::new(bound.clone()),
+                    body: Box::new(suffix),
+                },
+            )
+        }
+        TypedBlockItem::LetTuple {
+            names,
+            bound,
+            fields_layout_known,
+        } => {
+            let row = bound.row.union(&suffix.row);
+            let ty = suffix.ty.clone();
+            Typed::at_layout(
+                ty,
+                row,
+                stage,
+                *fields_layout_known,
+                Node::LetTuple(names.clone(), Box::new(bound.clone()), Box::new(suffix)),
+            )
+        }
+    }
+}
+
+fn elaborate_block(
+    sig: &Sig,
+    ctx: &Ctx,
+    stage: Stage,
+    items: &[BlockItem],
+    body: &Term,
+) -> Result<Typed, TypeErr> {
+    let mut saved_tyenvs = Vec::new();
+    let mut saved_traitenvs = Vec::new();
+
+    let result = (|| -> Result<Typed, TypeErr> {
+        let mut sig2 = sig.clone();
+        let mut ctx2 = ctx.clone();
+        let mut pending = Vec::with_capacity(items.len());
+
+        for item in items {
+            match item {
+                BlockItem::Let(x, e1) => {
+                    unify::with_store(|s| s.enter_level());
+                    let t1 = elaborate_inner(&sig2, &ctx2, stage, e1);
+                    unify::with_store(|s| s.leave_level());
+                    let t1 = t1?;
+
+                    let binding = if is_value(e1) {
+                        Binding::Poly(unify::with_store(|s| generalize(s, &t1.ty)))
+                    } else {
+                        Binding::Mono(t1.ty.clone())
+                    };
+                    let bind_name = match &binding {
+                        Binding::Poly(scheme) if !scheme.constraints.is_empty() => {
+                            let traits: Vec<String> = scheme
+                                .constraints
+                                .iter()
+                                .map(|c| c.trait_name.clone())
+                                .collect();
+                            record_constrained_def(x, &traits)
+                        }
+                        _ => x.clone(),
+                    };
+                    ctx2.insert(x.clone(), (binding, stage));
+                    pending.push(TypedBlockItem::Let {
+                        name: bind_name,
+                        bound: t1,
+                    });
+                }
+                BlockItem::LetRec(f, ty, e1) => {
+                    unify::with_store(|s| s.enter_level());
+                    let ty = unify::with_store(|s| instantiate_annotation(s, ty));
+                    let valid = validate_named_arity(&ty);
+                    let mut ctxr = ctx2.clone();
+                    ctxr.insert(f.clone(), (Binding::Mono(ty.clone()), stage));
+                    let t1 = valid.and_then(|()| elaborate_inner(&sig2, &ctxr, stage, e1));
+                    unify::with_store(|s| s.leave_level());
+                    let t1 = t1?;
+                    demand_eq(&ty, &t1.ty)?;
+                    let scheme = unify::with_store(|s| generalize(s, &ty));
+                    if !scheme.constraints.is_empty() {
+                        let constraints: Vec<String> =
+                            scheme.constraints.iter().map(|c| c.to_string()).collect();
+                        return Err(TypeErr::TraitV1Unsupported {
+                            what: format!(
+                                "a recursive (`let rec`) function `{f}` with a trait constraint \
+                                 ({}); make it non-recursive (a plain `let`), or monomorphize it \
+                                 (annotate `{f}` at a concrete type so no constraint is generalized)",
+                                constraints.join(", ")
+                            ),
+                        });
+                    }
+                    ctx2.insert(f.clone(), (Binding::Poly(scheme), stage));
+                    pending.push(TypedBlockItem::Let {
+                        name: f.clone(),
+                        bound: t1,
+                    });
+                }
+                BlockItem::LetMut(x, e1) => {
+                    let t1 = elaborate_inner(&sig2, &ctx2, stage, e1)?;
+                    let scalar_ty = resolved_type(&t1.ty);
+                    if !is_mut_scalar(&scalar_ty) {
+                        return Err(TypeErr::MutNonScalar { ty: scalar_ty });
+                    }
+                    ctx2.insert(x.clone(), (Binding::Mut(t1.ty.clone()), stage));
+                    pending.push(TypedBlockItem::LetMut {
+                        name: x.clone(),
+                        bound: t1,
+                    });
+                }
+                BlockItem::LetTuple(names, e) => {
+                    let te = elaborate_inner(&sig2, &ctx2, stage, e)?;
+                    let te_ty = resolved_type(&te.ty);
+                    let Type::Tuple(elem_tys) = &te_ty else {
+                        return Err(TypeErr::Mismatch {
+                            expected: Type::Tuple(vec![Type::Unit; names.len()]),
+                            found: te.ty.clone(),
+                        });
+                    };
+                    if elem_tys.len() != names.len() {
+                        return Err(TypeErr::Mismatch {
+                            expected: Type::Tuple(vec![Type::Unit; names.len()]),
+                            found: te.ty.clone(),
+                        });
+                    }
+                    for (name, ty) in names.iter().zip(elem_tys) {
+                        ctx2.insert(name.clone(), (Binding::Mono(ty.clone()), stage));
+                    }
+                    pending.push(TypedBlockItem::LetTuple {
+                        names: names.clone(),
+                        bound: te,
+                        fields_layout_known: layout_known(elem_tys.iter()),
+                    });
+                }
+                BlockItem::Effect { ops, .. } => {
+                    for op in ops {
+                        sig2.insert(
+                            Label::User(op.op.clone()),
+                            OpSig {
+                                param: op.param.clone(),
+                                result: op.result.clone(),
+                            },
+                        );
+                    }
+                }
+                BlockItem::TypeDef {
+                    name,
+                    params,
+                    variants,
+                    module,
+                } => {
+                    check_typedef_decl(name, params, variants)?;
+                    if let Some(m) = module {
+                        TRAITENV.with(|t| {
+                            t.borrow_mut().type_modules.insert(name.clone(), m.clone());
+                        });
+                    }
+                    let (saved, subst) = TYENV.with(|t| {
+                        let mut env = t.borrow_mut();
+                        let saved = env.clone();
+                        env.sums
+                            .insert(name.clone(), (params.clone(), variants.clone()));
+                        let param_vars: Vec<TyVarId> = params
+                            .iter()
+                            .map(|_| match unify::with_store(|s| s.fresh_ty()) {
+                                Type::Var(id) => id,
+                                _ => unreachable!("fresh_ty yields a Var"),
+                            })
+                            .collect();
+                        let subst: HashMap<String, Type> = params
+                            .iter()
+                            .zip(&param_vars)
+                            .map(|(p, &id)| (p.clone(), Type::Var(id)))
+                            .collect();
+                        let result = Type::Named(
+                            name.clone(),
+                            param_vars.iter().map(|&id| Type::Var(id)).collect(),
+                        );
+                        for (tag, (ctor, fields)) in variants.iter().enumerate() {
+                            let fields = fields.iter().map(|f| rewrite_params(f, &subst)).collect();
+                            env.ctors.insert(
+                                ctor.clone(),
+                                CtorInfo {
+                                    type_name: name.clone(),
+                                    tag: tag as i64,
+                                    ty_params: param_vars.clone(),
+                                    fields,
+                                    result: result.clone(),
+                                },
+                            );
+                        }
+                        (saved, subst)
+                    });
+                    saved_tyenvs.push(saved);
+                    for (_, fields) in variants {
+                        for f in fields {
+                            validate_named_arity(&rewrite_params(f, &subst))?;
+                        }
+                    }
+                }
+                BlockItem::Trait {
+                    name,
+                    param,
+                    supers,
+                    methods,
+                    module,
+                } => {
+                    let info = TraitInfo {
+                        param: param.clone(),
+                        supers: supers.clone(),
+                        methods: methods
+                            .iter()
+                            .map(|m| (m.name.clone(), m.sig.clone()))
+                            .collect(),
+                        module: module.clone(),
+                    };
+                    TRAIT_DEFS.with(|t| t.borrow_mut().insert(name.clone(), info.clone()));
+                    let saved = TRAITENV.with(|t| {
+                        let mut env = t.borrow_mut();
+                        let saved = env.clone();
+                        env.traits.insert(name.clone(), info);
+                        saved
+                    });
+                    saved_traitenvs.push(saved);
+                    for m in methods {
+                        let scheme =
+                            unify::with_store(|s| mint_method_scheme(s, name, param, &m.sig));
+                        ctx2.insert(m.name.clone(), (Binding::Poly(scheme), stage));
+                    }
+                }
+                BlockItem::Instance {
+                    trait_name,
+                    head,
+                    requires,
+                    methods,
+                    module,
+                } => {
+                    check_instance_coherence(trait_name, head)?;
+                    check_instance_termination(trait_name, head, requires)?;
+                    check_instance_orphan(trait_name, head, module.as_deref())?;
+                    let (trait_param, trait_supers) = TRAITENV.with(|t| {
+                        t.borrow()
+                            .traits
+                            .get(trait_name)
+                            .map(|i| (i.param.clone(), i.supers.clone()))
+                            .unwrap_or_default()
+                    });
+                    let method_bodies =
+                        check_instance(&sig2, &ctx2, stage, trait_name, head, methods)?;
+                    INSTANCES.with(|i| {
+                        i.borrow_mut().push(InstanceInfo {
+                            trait_name: trait_name.clone(),
+                            head: head.clone(),
+                            requires: requires.clone(),
+                            trait_param,
+                            trait_supers,
+                            methods: methods.iter().map(|m| m.name.clone()).collect(),
+                            method_bodies,
+                            module: module.clone(),
+                        })
+                    });
+                }
+            }
+        }
+
+        let body_t = elaborate_inner(&sig2, &ctx2, stage, body)?;
+        let mut suffix = body_t.clone();
+        for item in pending.iter().rev() {
+            if let TypedBlockItem::LetMut { name, .. } = item {
+                if let Some(escaping) = mut_escape(name, &suffix.ty) {
+                    return Err(TypeErr::MutEscapes { ty: escaping });
+                }
+                if captured_in_closure(name, &suffix.node) {
+                    return Err(TypeErr::MutEscapes {
+                        ty: suffix.ty.clone(),
+                    });
+                }
+            }
+            suffix = wrap_block_suffix(item, suffix, stage);
+        }
+
+        if pending.is_empty() {
+            return Ok(body_t);
+        }
+
+        let row = pending
+            .iter()
+            .fold(body_t.row.clone(), |row, item| row.union(&item.bound().row));
+        let layout_known = body_t.layout_known && pending.iter().all(TypedBlockItem::layout_known);
+        Ok(Typed::at_layout(
+            body_t.ty.clone(),
+            row,
+            stage,
+            layout_known,
+            Node::Block {
+                items: pending,
+                body: Box::new(body_t),
+            },
+        ))
+    })();
+
+    for saved in saved_traitenvs.into_iter().rev() {
+        TRAITENV.with(|t| *t.borrow_mut() = saved);
+    }
+    for saved in saved_tyenvs.into_iter().rev() {
+        TYENV.with(|t| *t.borrow_mut() = saved);
+    }
+    result
+}
+
 /// The recursive elaboration worker (the judgment proper). Calls itself and
 /// [`elaborate_handle`]; reaches unification through the thread-local store. The
 /// public [`elaborate`] wraps this with store-reset and zonk.
@@ -3815,10 +4355,11 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
         Term::Unit => Ok(Typed::at(Type::Unit, Row::pure(), stage, Node::Unit)),
         Term::Str(s) => Ok(Typed::at(
             Type::Str,
-            Row::pure(),
+            Row::single(Label::Gc),
             stage,
             Node::Str(s.clone()),
         )),
+        Term::Block(items, body) => elaborate_block(sig, ctx, stage, items, body),
 
         // (extern) — a foreign function. The `winapi` effect is injected onto
         // the arrow (calling the OS always shows in the row); the reference
@@ -3897,15 +4438,23 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
             }
 
             let operand_ty = match op {
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Eq | BinOp::Lt => {
-                    numeric_operand_type(*op, &ta.ty, &tb.ty)
-                }
+                BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge => numeric_operand_type(*op, &ta.ty, &tb.ty),
                 BinOp::AddWrap
                 | BinOp::SubWrap
                 | BinOp::MulWrap
                 | BinOp::AddChecked
                 | BinOp::SubChecked
                 | BinOp::MulChecked
+                | BinOp::Mod
                 | BinOp::And
                 | BinOp::Or
                 | BinOp::Xor
@@ -4305,6 +4854,20 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
                         elem_layout,
                     },
                 ))
+            } else if b.ty == Type::Str {
+                let elem_layout = ValueLayout::scalar_bytes(2, 2);
+                let row = b.row.union(&i.row).union(&Row::single(Label::Gc));
+                Ok(Typed::at_layout(
+                    Type::Int,
+                    row,
+                    stage,
+                    elem_layout.known,
+                    Node::ArrayGet {
+                        arr: Box::new(b),
+                        idx: Box::new(i),
+                        elem_layout,
+                    },
+                ))
             } else {
                 let w = elem_width(&b.ty)?;
                 let row = b.row.union(&i.row).union(&mem_effect());
@@ -4386,7 +4949,7 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
         // `len a` — an array's element count.
         Term::Len(a) => {
             let ta = elaborate_inner(sig, ctx, stage, a)?;
-            if !matches!(ta.ty, Type::Array(_)) {
+            if !matches!(ta.ty, Type::Array(_) | Type::Str) {
                 return Err(TypeErr::NotArray(ta.ty.clone()));
             }
             let row = ta.row.union(&Row::single(Label::Gc));
@@ -5051,6 +5614,10 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
         // (app) — pay f's, the arg's, and the latent rows.
         Term::App(f, arg) => {
             if let Term::Var(name) = &**f {
+                if let Some(label) = callable_effect_label(sig, ctx, name) {
+                    let perform = Term::Perform(label, arg.clone());
+                    return elaborate_inner(sig, ctx, stage, &perform);
+                }
                 if ctx.get(name).is_none() {
                     match name.as_str() {
                         "sum" => {
@@ -5109,7 +5676,8 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
             match &ft.ty {
                 // A **concrete** arrow (the monomorphic case, and every extern):
                 // keep the existing path, including the FFI `arg_matches`
-                // coercion that lets a `Str`/`Int` reach a `Ptr` parameter.
+                // allowance that lets raw `Ptr`/`Int` words reach a `Ptr`
+                // parameter.
                 Type::Fun(dom, cod, latent) => {
                     arg_matches(dom, &at.ty)?;
                     let ty = (**cod).clone();
@@ -5502,9 +6070,7 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
                 content,
                 row,
                 stage,
-                Node::Deref {
-                    cell: Box::new(te),
-                },
+                Node::Deref { cell: Box::new(te) },
             ))
         }
 
@@ -6037,6 +6603,7 @@ impl Typed {
             } => format!("lam {param}:{param_ty}"),
             Node::App { .. } => "app".into(),
             Node::Let { name, .. } => format!("let {name}"),
+            Node::Block { items, .. } => format!("block/{}", items.len()),
             Node::LetMut { name, .. } => format!("let mut {name}"),
             Node::Assign { name, .. } => format!("{name} :="),
             Node::RefNew { .. } => "ref".into(),
@@ -6103,6 +6670,7 @@ impl Typed {
             Node::Lam { .. } => "lam",
             Node::App { .. } => "app",
             Node::Let { .. } => "let",
+            Node::Block { .. } => "block",
             Node::LetMut { .. } => "letMut",
             Node::Assign { .. } => "assign",
             Node::RefNew { .. } => "refNew",
@@ -6231,6 +6799,12 @@ impl Typed {
             }
             Node::Let { bound, body, .. } | Node::LetMut { bound, body, .. } => {
                 bound.write_text(s, inner);
+                body.write_text(s, inner);
+            }
+            Node::Block { items, body } => {
+                for item in items {
+                    item.bound().write_text(s, inner);
+                }
                 body.write_text(s, inner);
             }
             Node::Assign { value, .. } => value.write_text(s, inner),
@@ -6510,6 +7084,31 @@ impl Typed {
                     body.json_node()
                 )
             }
+            Node::Block { items, body } => {
+                let binders: Vec<String> = items
+                    .iter()
+                    .map(|item| match item {
+                        TypedBlockItem::Let { name, .. } | TypedBlockItem::LetMut { name, .. } => {
+                            format!("[\"{}\"]", esc(name))
+                        }
+                        TypedBlockItem::LetTuple { names, .. } => {
+                            let names: Vec<String> = names
+                                .iter()
+                                .map(|name| format!("\"{}\"", esc(name)))
+                                .collect();
+                            format!("[{}]", names.join(","))
+                        }
+                    })
+                    .collect();
+                let mut kids: Vec<String> =
+                    items.iter().map(|item| item.bound().json_node()).collect();
+                kids.push(body.json_node());
+                f += &format!(
+                    ",\"binders\":[{}],\"children\":[{}]",
+                    binders.join(","),
+                    kids.join(",")
+                );
+            }
             Node::Assign { name, value } => {
                 f += &format!(
                     ",\"name\":\"{}\",\"children\":[{}]",
@@ -6517,12 +7116,8 @@ impl Typed {
                     value.json_node()
                 )
             }
-            Node::RefNew { value, .. } => {
-                f += &format!(",\"children\":[{}]", value.json_node())
-            }
-            Node::Deref { cell, .. } => {
-                f += &format!(",\"children\":[{}]", cell.json_node())
-            }
+            Node::RefNew { value, .. } => f += &format!(",\"children\":[{}]", value.json_node()),
+            Node::Deref { cell, .. } => f += &format!(",\"children\":[{}]", cell.json_node()),
             Node::RefAssign { target, value, .. } => {
                 f += &format!(
                     ",\"children\":[{},{}]",
@@ -6698,6 +7293,47 @@ mod tests {
         // the deepest node — the perform — is itself decorated with {console}.
         assert_eq!(body.ty, Type::Unit);
         assert_eq!(body.row, Row::single(world("console")));
+    }
+
+    #[test]
+    fn operation_call_sugar_elaborates_to_perform() {
+        let e = crate::parse::parse("effect ask : Unit -> Int in ask()").unwrap();
+        let t = el(0, &e);
+        assert_eq!(t.ty, Type::Int);
+        assert_eq!(t.row, Row::single(Label::User("ask".into())));
+        assert!(matches!(
+            t.node,
+            Node::Perform {
+                label: Label::User(ref name),
+                ..
+            } if name == "ask"
+        ));
+    }
+
+    #[test]
+    fn handler_sugar_discharges_operation_call_sugar() {
+        let e = crate::parse::parse(
+            "effect ask : Unit -> Int in handle (ask() + 1) with { ask(_) -> 41 }",
+        )
+        .unwrap();
+        let t = el(0, &e);
+        assert_eq!(t.ty, Type::Int);
+        assert!(t.row.is_pure(), "handler should discharge ask: {}", t.row);
+        assert!(matches!(t.node, Node::Handle { .. }));
+    }
+
+    #[test]
+    fn operation_call_sugar_respects_local_shadowing() {
+        let e =
+            crate::parse::parse("effect ask : Unit -> Int in let ask = fn x: Unit => 7 in ask()")
+                .unwrap();
+        let t = el(0, &e);
+        assert_eq!(t.ty, Type::Int);
+        assert!(
+            t.row.is_pure(),
+            "local function call should be pure: {}",
+            t.row
+        );
     }
 
     #[test]
@@ -7470,7 +8106,7 @@ mod tests {
     #[test]
     fn a_trait_and_instance_program_elaborates() {
         let t = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              0",
         )
@@ -7486,7 +8122,7 @@ mod tests {
     #[test]
     fn using_a_trait_method_resolves_against_its_instance() {
         let t = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              show 5",
         )
@@ -7518,7 +8154,7 @@ mod tests {
     #[test]
     fn an_instance_with_an_unknown_method_is_rn_e0239() {
         let err = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" ; nope = fn x => 0 } in \
              0",
         )
@@ -7542,7 +8178,7 @@ mod tests {
     #[test]
     fn a_constraint_carried_through_a_let_resolves_at_the_use() {
         let t = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              let f = show in f 7",
         )
@@ -7592,7 +8228,7 @@ mod tests {
     #[test]
     fn a_constraint_on_an_abstract_var_passes_via_caller_evidence() {
         let t = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              let describe = fn x => show x in describe 5",
         )
@@ -7605,7 +8241,7 @@ mod tests {
     #[test]
     fn a_use_with_no_instance_is_rn_e0230() {
         let err = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              show true",
         )
@@ -7625,7 +8261,7 @@ mod tests {
     fn two_overlapping_instances_are_rn_e0231() {
         let err = check_src(
             "type List[a] = Nil | Cons(a, List[a]) in \
-             trait Show a { show : a -> String } in \
+             trait Show a { show : a -> String ! {gc} } in \
              instance Show List[a] { show = fn x => \"l\" } in \
              instance Show List[Int] { show = fn x => \"li\" } in \
              0",
@@ -7641,7 +8277,7 @@ mod tests {
     #[test]
     fn a_duplicate_instance_is_rn_e0237() {
         let err = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"a\" } in \
              instance Show Int { show = fn x => \"b\" } in \
              0",
@@ -7681,7 +8317,7 @@ mod tests {
         // it to `show` (consuming an `a`) makes the intermediate type ambiguous.
         let err = check_src(
             "trait Read a { read : String -> a } in \
-             trait Show a { show : a -> String } in \
+             trait Show a { show : a -> String ! {gc} } in \
              instance Read Int { read = fn s => 0 } in \
              instance Show Int { show = fn x => \"n\" } in \
              let roundtrip = fn s => show (read s) in 0",
@@ -7722,7 +8358,7 @@ mod tests {
     fn an_orphan_instance_is_rn_e0232() {
         let err = check_program(
             "module Display at services = \
-               trait Show a { show : a -> String } in () \
+               trait Show a { show : a -> String ! {gc} } in () \
              module Geometry at services = \
                type Point = Point(Int) in () \
              module App at app = \
@@ -7745,7 +8381,7 @@ mod tests {
     fn an_instance_in_the_type_module_is_lawful() {
         let t = check_program(
             "module Display at services = \
-               trait Show a { show : a -> String } in () \
+               trait Show a { show : a -> String ! {gc} } in () \
              module Geometry at services = \
                type Point = Point(Int) in \
                instance Show Point { show = fn p => \"pt\" } in () \
@@ -7767,9 +8403,9 @@ mod tests {
     #[test]
     fn a_recursive_constrained_generic_is_rn_e0246() {
         let err = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
-             let rec f : a -> String = fn x => let _ = show x in f x in \
+             let rec f : a -> String ! {gc} = fn x => let _ = show x in f x in \
              f 5",
         )
         .expect_err("a recursive `let rec` carrying a trait constraint cannot lower in v1");
@@ -7805,7 +8441,7 @@ mod tests {
         // body-check; the use-site gate is the clean point the brief specifies.)
         let err = check_src(
             "type List[a] = Nil | Cons(a, List[a]) in \
-             trait Show a { show : a -> String } in \
+             trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              instance Show List[a] requires Show a { show = fn xs => \"list\" } in \
              show (Cons(7, Nil))",
@@ -7850,7 +8486,7 @@ mod tests {
     #[test]
     fn resolution_records_dictionary_evidence_for_sprint3() {
         let _ = check_src(
-            "trait Show a { show : a -> String } in \
+            "trait Show a { show : a -> String ! {gc} } in \
              instance Show Int { show = fn x => \"n\" } in \
              show 5",
         )
@@ -7936,14 +8572,26 @@ mod tests {
     fn deref_and_assign_carry_st() {
         let t = check_src("let r = ref 0 in !r").expect("deref type-checks");
         assert_eq!(t.ty, Type::Int);
-        assert!(has_label(&t.row, &Label::Gc), "the `ref` alloc ⇒ gc: {}", t.row);
-        assert!(has_label(&t.row, &Label::St), "the `!r` read ⇒ st: {}", t.row);
+        assert!(
+            has_label(&t.row, &Label::Gc),
+            "the `ref` alloc ⇒ gc: {}",
+            t.row
+        );
+        assert!(
+            has_label(&t.row, &Label::St),
+            "the `!r` read ⇒ st: {}",
+            t.row
+        );
 
         // A write through a Ref-typed name: `r := !r + 1` is Unit ! {st} (plus gc).
         let w = check_src("let r = ref 0 in r := !r + 1")
             .expect("ref-assign through a Ref-typed name type-checks");
         assert_eq!(w.ty, Type::Unit);
-        assert!(has_label(&w.row, &Label::St), "the `:=`/`!` ⇒ st: {}", w.row);
+        assert!(
+            has_label(&w.row, &Label::St),
+            "the `:=`/`!` ⇒ st: {}",
+            w.row
+        );
     }
 
     /// The headline gate program type-checks to `Int` and its row carries `st`
@@ -7987,7 +8635,10 @@ mod tests {
         };
         assert_eq!(elems[0], Type::Named("Ref".into(), vec![Type::Int]));
         let Type::Fun(_, ret, latent) = &elems[1] else {
-            panic!("second element should be the tick closure, got {}", elems[1]);
+            panic!(
+                "second element should be the tick closure, got {}",
+                elems[1]
+            );
         };
         assert_eq!(**ret, Type::Int);
         assert!(
@@ -8030,7 +8681,10 @@ mod tests {
         };
         assert_eq!(**dom, Type::Named("Ref".into(), vec![Type::Int]));
         assert_eq!(**cod, Type::Int);
-        assert!(has_label(latent, &Label::St), "the body reads ⇒ st in the arrow: {latent}");
+        assert!(
+            has_label(latent, &Label::St),
+            "the body reads ⇒ st in the arrow: {latent}"
+        );
     }
 
     /// `x := e` on a plain (immutable, non-`Ref`) `let` binding is still

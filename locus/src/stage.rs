@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use crate::sema::{Node, Typed, TypedHandler, TypedOpClause, TypedReturn};
+use crate::sema::{Node, Typed, TypedBlockItem, TypedHandler, TypedOpClause, TypedReturn};
 use crate::syntax::{BinOp, Row, Type};
 
 type Env = HashMap<String, GenVal>;
@@ -238,6 +238,46 @@ impl Staging {
                 bound: Box::new(self.reduce(bound, env)?),
                 body: Box::new(self.reduce(body, &shadow(env, name))?),
             }),
+            Node::Block { items, body } => {
+                let mut out = Vec::with_capacity(items.len());
+                let mut inner_env = env.clone();
+                for item in items {
+                    match item {
+                        TypedBlockItem::Let { name, bound } => {
+                            out.push(TypedBlockItem::Let {
+                                name: name.clone(),
+                                bound: self.reduce(bound, &inner_env)?,
+                            });
+                            inner_env = shadow(&inner_env, name);
+                        }
+                        TypedBlockItem::LetMut { name, bound } => {
+                            out.push(TypedBlockItem::LetMut {
+                                name: name.clone(),
+                                bound: self.reduce(bound, &inner_env)?,
+                            });
+                            inner_env = shadow(&inner_env, name);
+                        }
+                        TypedBlockItem::LetTuple {
+                            names,
+                            bound,
+                            fields_layout_known,
+                        } => {
+                            out.push(TypedBlockItem::LetTuple {
+                                names: names.clone(),
+                                bound: self.reduce(bound, &inner_env)?,
+                                fields_layout_known: *fields_layout_known,
+                            });
+                            for name in names {
+                                inner_env = shadow(&inner_env, name);
+                            }
+                        }
+                    }
+                }
+                rb(Node::Block {
+                    items: out,
+                    body: Box::new(self.reduce(body, &inner_env)?),
+                })
+            }
             // A mutable local residualizes structurally, like `Let`: reduce the
             // initializer, shadow the name (a mutable local is never a static
             // cross-stage constant), reduce the body, rebuild the node.
@@ -564,6 +604,39 @@ impl Staging {
                 env2.insert(name.clone(), v);
                 self.gen_code(body, &env2, ins)?
             }
+            Node::Block { items, body } => {
+                let mut env2 = env.clone();
+                for item in items {
+                    match item {
+                        TypedBlockItem::Let { name, bound } => {
+                            let mut v = self.gen_code(bound, &env2, ins)?;
+                            if let GenVal::Closure { self_name, .. } = &mut v {
+                                *self_name = Some(name.clone());
+                            }
+                            env2.insert(name.clone(), v);
+                        }
+                        TypedBlockItem::LetTuple { names, bound, .. } => {
+                            let GenVal::Tuple(vals) = self.gen_code(bound, &env2, ins)? else {
+                                return Err(
+                                    "staging: a generation-stage block tuple binding needs a \
+                                     statically-known tuple"
+                                        .into(),
+                                );
+                            };
+                            for (name, v) in names.iter().zip(vals.into_iter()) {
+                                env2.insert(name.clone(), v);
+                            }
+                        }
+                        TypedBlockItem::LetMut { .. } => {
+                            return Err(
+                                "staging: mutable cells are not available at the generation stage"
+                                    .into(),
+                            )
+                        }
+                    }
+                }
+                self.gen_code(body, &env2, ins)?
+            }
             Node::Lam { param, body, .. } => GenVal::Closure {
                 param: param.clone(),
                 body: body.clone(),
@@ -845,10 +918,10 @@ fn eval_binop(op: BinOp, x: i64, y: i64) -> Result<i64, String> {
         BinOp::Add | BinOp::AddWrap => x.wrapping_add(y),
         BinOp::Sub | BinOp::SubWrap => x.wrapping_sub(y),
         BinOp::Mul | BinOp::MulWrap => x.wrapping_mul(y),
-        BinOp::Div => {
+        BinOp::Div | BinOp::Mod => {
             return Err(
-                "staging: integer division is parsed and typechecked, but compile-time \
-                 division is FPWork S3"
+                "staging: integer division/remainder is parsed and typechecked, but \
+                 compile-time division is FPWork S3"
                     .into(),
             )
         }
@@ -867,7 +940,11 @@ fn eval_binop(op: BinOp, x: i64, y: i64) -> Result<i64, String> {
         BinOp::Shl => x << y,
         BinOp::Shr => x >> y,
         BinOp::Eq => i64::from(x == y),
+        BinOp::Ne => i64::from(x != y),
         BinOp::Lt => i64::from(x < y),
+        BinOp::Le => i64::from(x <= y),
+        BinOp::Gt => i64::from(x > y),
+        BinOp::Ge => i64::from(x >= y),
     })
 }
 

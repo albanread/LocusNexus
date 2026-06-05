@@ -45,19 +45,31 @@ USAGE:
   locusc republish [DIR]         write the embedded Linux stdlib to DIR for review
   locusc --help
 
+OPTIONS:
+  --trace-stack-usage            print compiler tree-depth / spine metrics to stderr
+
 `run`'s exit code is the program's i64 result; effects print as they execute.
 `asm` writes to stdout unless `-o` is given - the same code the executable contains.
 ";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match dispatch(&args) {
-        Ok(code) => code,
-        Err(msg) => {
-            eprintln!("locusc: {msg}");
-            2
-        }
-    };
+    let code = std::thread::Builder::new()
+        .name("linux-locusc-main".into())
+        .stack_size(locus::PIPELINE_STACK_BYTES)
+        .spawn(move || match dispatch(&args) {
+            Ok(code) => code,
+            Err(msg) => {
+                eprintln!("locusc: {msg}");
+                2
+            }
+        })
+        .expect("spawn linux locusc worker")
+        .join()
+        .unwrap_or_else(|_| {
+            eprintln!("locusc: internal error (worker panicked)");
+            101
+        });
     process::exit(code);
 }
 
@@ -79,8 +91,16 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<i32, String> {
-    let file = args.first().ok_or("usage: locusc run FILE")?;
-    let compiled = compile_file(file)?;
+    let mut file: Option<String> = None;
+    let mut trace_stack = false;
+    for a in args {
+        match a.as_str() {
+            "--trace-stack-usage" => trace_stack = true,
+            other => file = Some(other.to_string()),
+        }
+    }
+    let file = file.ok_or("usage: locusc run [--trace-stack-usage] FILE")?;
+    let compiled = compile_file(&file, trace_stack)?;
     let result = jit_run_i64(&compiled.ir, &compiled.demanded)?;
     Ok(result as i32)
 }
@@ -89,19 +109,22 @@ fn cmd_build(args: &[String]) -> Result<i32, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut always_gc = false;
+    let mut trace_stack = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = Some(it.next().ok_or("`-o` needs a path")?.clone()),
             "--always-gc" => always_gc = true,
+            "--trace-stack-usage" => trace_stack = true,
             other => file = Some(other.to_string()),
         }
     }
-    let file = file.ok_or("usage: locusc build FILE [-o EXE] [--always-gc]")?;
+    let file =
+        file.ok_or("usage: locusc build [--trace-stack-usage] FILE [-o EXE] [--always-gc]")?;
     let output = out
         .map(PathBuf::from)
         .unwrap_or_else(|| default_linux_exe_path(&file));
-    let compiled = compile_file(&file)?;
+    let compiled = compile_file(&file, trace_stack)?;
     build_elf_executable(&compiled.ir, &compiled.demanded, &output, always_gc)?;
     println!("built {}", output.display());
     Ok(0)
@@ -110,15 +133,17 @@ fn cmd_build(args: &[String]) -> Result<i32, String> {
 fn cmd_asm(args: &[String]) -> Result<i32, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut trace_stack = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = Some(it.next().ok_or("`-o` needs a path")?.clone()),
+            "--trace-stack-usage" => trace_stack = true,
             other => file = Some(other.to_string()),
         }
     }
-    let file = file.ok_or("usage: locusc asm FILE [-o OUT.s]")?;
-    let compiled = compile_file(&file)?;
+    let file = file.ok_or("usage: locusc asm [--trace-stack-usage] FILE [-o OUT.s]")?;
+    let compiled = compile_file(&file, trace_stack)?;
     let asm = emit_asm_text(&compiled.ir)?;
     match out {
         Some(path) => {
@@ -133,19 +158,36 @@ fn cmd_asm(args: &[String]) -> Result<i32, String> {
 fn cmd_effects(args: &[String]) -> Result<i32, String> {
     let mut file: Option<&str> = None;
     let mut json = false;
+    let mut trace_stack = false;
     for a in args {
         match a.as_str() {
             "--json" => json = true,
+            "--trace-stack-usage" => trace_stack = true,
             other => file = Some(other),
         }
     }
-    let file = file.ok_or("usage: locusc effects FILE [--json]")?;
+    let file = file.ok_or("usage: locusc effects [--trace-stack-usage] FILE [--json]")?;
     let src = read_source(file)?;
     guard_layer2(&src, &read_boundary_manifest(Path::new(file)))?;
+    if trace_stack {
+        trace_stack_header("linux-locusc");
+        if let Ok(program) = locus::parse_program(&src) {
+            trace_shape("user source", locus::program_source_shape(&program));
+        }
+    }
     let term = locus::linux_program(&src).map_err(|e| e.msg)?;
+    if trace_stack {
+        trace_shape("stdlib-grafted term", locus::term_shape(&term));
+    }
     let (term, _demanded) = locus_libc::resolve(term)?;
+    if trace_stack {
+        trace_shape("libc-resolved term", locus::term_shape(&term));
+    }
     let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
         .map_err(|e| e.to_string())?;
+    if trace_stack {
+        trace_shape("typed tree", locus::typed_shape(&tree));
+    }
     let labels: Vec<&locus::Label> = tree.row.labels().collect();
     let ty = tree.ty.to_string();
     if json {
@@ -207,6 +249,7 @@ fn label_kind(l: &locus::Label) -> &'static str {
         User(_) => "user",
         Exn(_) => "exn",
         Gc => "gc",
+        St => "state",
         Insert => "staging",
     }
 }
@@ -367,9 +410,9 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
-fn compile_file(file: &str) -> Result<CompiledProgram, String> {
+fn compile_file(file: &str, trace_stack: bool) -> Result<CompiledProgram, String> {
     let src = read_source(file)?;
-    compile_source_on_pipeline(&src, Path::new(file))
+    compile_source_on_pipeline(&src, Path::new(file), trace_stack)
 }
 
 fn read_source(file: &str) -> Result<String, String> {
@@ -391,36 +434,81 @@ struct CompiledProgram {
 }
 
 fn run_source_on_pipeline(src: &str, source_file: &Path) -> Result<i64, String> {
-    let compiled = compile_source_on_pipeline(src, source_file)?;
+    let compiled = compile_source_on_pipeline(src, source_file, false)?;
     jit_run_i64(&compiled.ir, &compiled.demanded)
 }
 
-fn compile_source_on_pipeline(src: &str, source_file: &Path) -> Result<CompiledProgram, String> {
+fn compile_source_on_pipeline(
+    src: &str,
+    source_file: &Path,
+    trace_stack: bool,
+) -> Result<CompiledProgram, String> {
     let src = src.to_string();
     let source_file = source_file.to_path_buf();
     std::thread::Builder::new()
         .name("locus-linux-pipeline".into())
         .stack_size(locus::PIPELINE_STACK_BYTES)
         .spawn(move || {
+            if trace_stack {
+                trace_stack_header("linux-locusc");
+                if let Ok(program) = locus::parse_program(&src) {
+                    trace_shape("user source", locus::program_source_shape(&program));
+                }
+            }
             let (term, user_modules) =
                 locus::linux_program_with_modules(&src).map_err(|e| e.msg)?;
+            if trace_stack {
+                trace_shape("stdlib-grafted term", locus::term_shape(&term));
+            }
             let (term, demanded) = locus_libc::resolve(term)?;
+            if trace_stack {
+                trace_shape("libc-resolved term", locus::term_shape(&term));
+            }
             guard_layer2(&src, &read_boundary_manifest(&source_file))?;
             let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
                 .map_err(|e| e.to_string())?;
+            if trace_stack {
+                trace_shape("typed tree", locus::typed_shape(&tree));
+            }
             let mut all_modules = locus::linux_stdlib_module_decls();
             all_modules.extend(user_modules);
             locus::check_module_seals(&all_modules, &tree).map_err(|e| e.to_string())?;
             let tree = locus::stage_reduce(&tree)?;
+            if trace_stack {
+                trace_shape("stage-reduced tree", locus::typed_shape(&tree));
+            }
             if tree.has_unknown_layout() {
                 return Err(locus::TypeErr::RepresentationPolymorphicLayout.to_string());
             }
             let ir = locus::lower(&tree);
+            if trace_stack {
+                trace_shape("anf ir", locus::ir_shape(&ir));
+            }
             Ok(CompiledProgram { ir, demanded })
         })
         .map_err(|e| e.to_string())?
         .join()
         .map_err(|_| "locus-linux pipeline worker panicked".to_string())?
+}
+
+fn trace_stack_header(tool: &str) {
+    let bytes = locus::PIPELINE_STACK_BYTES;
+    eprintln!(
+        "{tool} stack trace: configured pipeline stack = {} bytes ({} MiB)",
+        bytes,
+        bytes / (1024 * 1024)
+    );
+}
+
+fn trace_shape(label: &str, shape: locus::ShapeMetrics) {
+    eprintln!(
+        "  {label:<21} nodes={:<6} max_depth={:<5} binding_spine={:<5} app_spine={:<5} type_depth={}",
+        shape.nodes,
+        shape.max_depth,
+        shape.max_binding_spine,
+        shape.max_app_spine,
+        shape.max_type_depth
+    );
 }
 
 fn read_boundary_manifest(source_file: &Path) -> std::collections::HashSet<String> {
@@ -1030,7 +1118,7 @@ module Bits at boundary mints (asm) =
 (rotl 1 4) + (popcount 255) + (bswap (bswap 18))
 "#;
         let (root, source_file) = temp_project(src, &["Bits"]).unwrap();
-        let compiled = compile_source_on_pipeline(src, &source_file).unwrap();
+        let compiled = compile_source_on_pipeline(src, &source_file, false).unwrap();
         let exe = root.join("bits");
         build_elf_executable(&compiled.ir, &compiled.demanded, &exe, false).unwrap();
         let status = Command::new(&exe).status().expect("run ELF executable");
@@ -1045,7 +1133,7 @@ module Bits at boundary mints (asm) =
         }
         let src = "let a = [1, 2, 39] in a[0] + a[1] + a[2]";
         let (root, source_file) = temp_project(src, &[]).unwrap();
-        let compiled = compile_source_on_pipeline(src, &source_file).unwrap();
+        let compiled = compile_source_on_pipeline(src, &source_file, false).unwrap();
         let exe = root.join("gc-array");
         build_elf_executable(&compiled.ir, &compiled.demanded, &exe, false).unwrap();
         let status = Command::new(&exe).status().expect("run GC ELF executable");

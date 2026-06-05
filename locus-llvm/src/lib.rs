@@ -15,7 +15,7 @@
 //!   via an LLVM `TargetMachine`, compiles a tiny C runtime (the CRT `main` plus
 //!   the closure allocator `locus_alloc`), and links it with MSVC `link.exe` into
 //!   a standalone executable. `42` becomes exit code 42. JIT *and* AOT.
-//! - **Output is ordinary Locus:** `writeln` (the prelude, [`locus::stdlib`])
+//! - **Output is ordinary Locus:** `console_writeln` (the prelude, [`locus::stdlib`])
 //!   over raw Win32 — there is no native console. The only runtime symbol is the
 //!   closure allocator [`runtime::locus_alloc`].
 
@@ -26,13 +26,15 @@ pub mod asm_runtime;
 #[cfg(feature = "windows-driver")]
 pub mod jit;
 pub mod lower;
+#[cfg(all(feature = "windows-driver", feature = "mcp"))]
+pub mod mcp;
 #[cfg(feature = "windows-driver")]
 pub mod runtime;
 #[cfg(feature = "windows-driver")]
 pub mod winapi_resolve;
 
 #[cfg(feature = "windows-driver")]
-pub use aot::{build_exe, emit_asm, emit_library_object, link_program};
+pub use aot::{build_exe, emit_asm, emit_asm_opt, emit_library_object, link_program};
 #[cfg(feature = "windows-driver")]
 pub use jit::jit_run_i64;
 pub use lower::{emit_library_module, LibExport};
@@ -43,7 +45,7 @@ mod tests {
 
     /// parse (+ prelude graft) → resolve bare externs (oracle) → elaborate →
     /// ANF → JIT → run, returning the `i64` result. The full driver path, so
-    /// tests can call prelude fns (`writeln`) and bare Win32 externs.
+    /// tests can call prelude fns (`console_writeln`) and bare Win32 externs.
     fn run(src: &str) -> Result<i64, String> {
         let src = src.to_string();
         std::thread::Builder::new()
@@ -61,6 +63,32 @@ mod tests {
             .map_err(|e| e.to_string())?
             .join()
             .map_err(|_| "llvm test worker panicked".to_string())?
+    }
+
+    fn run_agent_text(
+        src: &str,
+        responses: Vec<String>,
+    ) -> Result<(i64, crate::runtime::AgentTranscript), String> {
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .name("llvm-test-run-agent".into())
+            .stack_size(locus::PIPELINE_STACK_BYTES)
+            .spawn(move || {
+                let term = locus::program(&src).map_err(|e| e.msg)?;
+                let (term, apis) = crate::winapi_resolve::resolve(term)?;
+                let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
+                    .map_err(|e| e.to_string())?;
+                let tree = locus::stage_reduce(&tree)?;
+                let ir = locus::lower(&tree);
+                let (run_result, transcript) =
+                    crate::runtime::with_agent_text_session(responses, String::new(), || {
+                        jit_run_i64(&ir, &apis)
+                    });
+                run_result.map(|value| (value, transcript))
+            })
+            .map_err(|e| e.to_string())?
+            .join()
+            .map_err(|_| "llvm agent test worker panicked".to_string())?
     }
 
     fn run_f64(src: &str) -> Result<f64, String> {
@@ -89,16 +117,21 @@ let emit = fn out: Int => fn j: Int => fn cp: Int =>
      let _ = out[j + 2] <- (0x80 | ((cp >> 6) & 0x3F)) in
      let _ = out[j + 3] <- (0x80 | (cp & 0x3F)) in j + 4)
 in
-let rec go : String -> Int -> Int -> Int -> Int ! {mem} =
-  fn s: String => fn out: Int => fn i: Int => fn j: Int =>
-    let unit = s[i] in
-    if unit == 0 then j
-    else if unit < 0xD800 then go s out (i + 1) (emit out j unit)
-    else if unit < 0xDC00 then
-      (let lo = s[i + 1] in
-       let cp = 0x10000 + ((unit - 0xD800) << 10) + (lo - 0xDC00) in
-       go s out (i + 2) (emit out j cp))
-    else go s out (i + 1) (emit out j unit)
+let rec go : String -> Int -> Int -> Int -> Int -> Int ! {mem, gc} =
+  fn s: String => fn out: Int => fn limit: Int => fn i: Int => fn j: Int =>
+    if i < limit then
+      let unit = s[i] in
+      if unit < 0xD800 then go s out limit (i + 1) (emit out j unit)
+      else if unit < 0xDC00 then
+        if (i + 1) < limit then
+          (let lo = s[i + 1] in
+           let cp = 0x10000 + ((unit - 0xD800) << 10) + (lo - 0xDC00) in
+           go s out limit (i + 2) (emit out j cp))
+        else
+          go s out limit (i + 1) (emit out j unit)
+      else go s out limit (i + 1) (emit out j unit)
+    else
+      j
 in
 let alloc = extern "VirtualAlloc" : Int -> Int -> I32 -> I32 -> Int in
 let out = alloc 0 256 0x3000 0x04 in
@@ -107,7 +140,9 @@ let out = alloc 0 256 0x3000 0x04 in
     /// Build a converter program for `input`, returning `ret` (which can read
     /// `n` = the byte count, and `out[k]` = the k-th UTF-8 byte).
     fn convert(input: &str, ret: &str) -> String {
-        format!("{CONVERTER} let n = go \"{input}\" out 0 0 in {ret}")
+        format!(
+            "{CONVERTER} let input = \"{input}\" in let n = go input out (len input) 0 0 in {ret}"
+        )
     }
 
     /// The same front-end path as `run`, stopping at the ANF IR (for the asm
@@ -129,15 +164,21 @@ let out = alloc 0 256 0x3000 0x04 in
             .expect("LLVM IR worker panicked")
     }
 
-    fn llvm_function_body<'a>(text: &'a str, name: &str) -> &'a str {
-        let needle = format!("define i64 @{name}");
-        let start = text.find(&needle).expect("LLVM function is present");
-        let rest = &text[start..];
-        let end = rest[1..]
-            .find("\ndefine ")
-            .map(|idx| idx + 1)
-            .unwrap_or(rest.len());
-        &rest[..end]
+    fn llvm_function_body_containing<'a>(text: &'a str, needles: &[&str]) -> &'a str {
+        let mut rest = text;
+        while let Some(start) = rest.find("define i64 @") {
+            let body_start = &rest[start..];
+            let end = body_start[1..]
+                .find("\ndefine ")
+                .map(|idx| idx + 1)
+                .unwrap_or(body_start.len());
+            let body = &body_start[..end];
+            if needles.iter().all(|needle| body.contains(needle)) {
+                return body;
+            }
+            rest = &body_start[end..];
+        }
+        panic!("LLVM function body containing {needles:?} is present");
     }
 
     #[test]
@@ -303,11 +344,9 @@ let out = alloc 0 256 0x3000 0x04 in
         // it through the handle it was handed — proving the cell is a real, passable
         // heap object (not a stack slot). `bump` reads !s (41), writes 42, returns 42.
         assert_eq!(
-            run(
-                "let r = ref 41 in \
+            run("let r = ref 41 in \
                  let bump = fn s => (let _ = (s := !s + 1) in !s) in \
-                 bump r"
-            )
+                 bump r")
             .unwrap(),
             42
         );
@@ -401,11 +440,9 @@ let out = alloc 0 256 0x3000 0x04 in
         // two scalar fields, so projecting each exercises cumulative scalar-cell
         // offset accumulation (Int@0, Quad@1..2, Int@3).
         assert_eq!(
-            run(
-                "let t = (1, splatQuad (toFloat32 2.0), 3) in \
+            run("let t = (1, splatQuad (toFloat32 2.0), 3) in \
                  let (a, q, b) = t in \
-                 a * 100 + round (fromFloat32 (q.x) + fromFloat32 (q.w)) + b"
-            )
+                 a * 100 + round (fromFloat32 (q.x) + fromFloat32 (q.w)) + b")
             .unwrap(),
             107
         );
@@ -966,8 +1003,8 @@ let out = alloc 0 256 0x3000 0x04 in
         // is a clean diagnostic, NOT a forced reduction (a silent surprise) and NOT a
         // vector-as-exit-code miscompile. The message names the honest fixes: project
         // a lane, reduce a mask, sum the lanes, or storeQuad into an out-array.
-        let err = run("Quad(toFloat32 1.0, toFloat32 2.0, toFloat32 3.0, toFloat32 4.0)")
-            .unwrap_err();
+        let err =
+            run("Quad(toFloat32 1.0, toFloat32 2.0, toFloat32 3.0, toFloat32 4.0)").unwrap_err();
         assert!(
             err.contains("program result requires a scalar cell"),
             "the top-level vector result is rejected, not miscompiled: {err}"
@@ -977,9 +1014,7 @@ let out = alloc 0 256 0x3000 0x04 in
             "the message explains WHY (a vector is not an exit code): {err}"
         );
         assert!(
-            err.contains("project a lane")
-                && err.contains("storeQuad")
-                && err.contains("sum v"),
+            err.contains("project a lane") && err.contains("storeQuad") && err.contains("sum v"),
             "the message is actionable (names the honest reductions): {err}"
         );
         // A top-level `Pair` result is the same clean error (any vector shape).
@@ -1005,6 +1040,26 @@ let out = alloc 0 256 0x3000 0x04 in
     }
 
     #[test]
+    fn jits_integer_remainder_with_checked_codegen_path() {
+        assert_eq!(run("7 % 3").unwrap(), 1);
+        assert_eq!(run("(0 - 7) % 2").unwrap(), -1);
+        assert_eq!(run("7 % (0 - 2)").unwrap(), 1);
+        assert_eq!(run("let n = 17 in n % 5").unwrap(), 2);
+    }
+
+    #[test]
+    fn jits_short_circuit_bool_connectives() {
+        assert_eq!(run("if true && true then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if true && false then 0 else 1").unwrap(), 1);
+        assert_eq!(run("if false || true then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if ~false then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if ~true then 0 else 1").unwrap(), 1);
+        assert_eq!(run("if ~(3 < 5) then 0 else 1").unwrap(), 1);
+        assert_eq!(run("if false && ((1 / 0) == 0) then 0 else 1").unwrap(), 1);
+        assert_eq!(run("if true || ((1 / 0) == 0) then 1 else 0").unwrap(), 1);
+    }
+
+    #[test]
     fn integer_division_emits_zero_and_overflow_trap() {
         let ctx = inkwell::context::Context::create();
         let ir = ir_of("let id = fn x: Int => x in (id 6) / (id 3)");
@@ -1021,6 +1076,26 @@ let out = alloc 0 256 0x3000 0x04 in
         assert!(
             text.contains("div.zero") && text.contains("div.overflow"),
             "division should guard zero and i64::MIN / -1:\n{text}"
+        );
+    }
+
+    #[test]
+    fn integer_remainder_emits_zero_and_overflow_trap() {
+        let ctx = inkwell::context::Context::create();
+        let ir = ir_of("let id = fn x: Int => x in (id 7) % (id 3)");
+        let module = crate::lower::emit_module(&ctx, &ir, false).unwrap();
+        let text = module.print_to_string().to_string();
+        assert!(
+            text.contains("srem"),
+            "remainder should lower to srem:\n{text}"
+        );
+        assert!(
+            text.contains("llvm.trap"),
+            "integer remainder should trap before LLVM UB cases:\n{text}"
+        );
+        assert!(
+            text.contains("rem.zero") && text.contains("rem.overflow"),
+            "remainder should guard zero and i64::MIN % -1:\n{text}"
         );
     }
 
@@ -1076,12 +1151,24 @@ let out = alloc 0 256 0x3000 0x04 in
         assert_eq!(run("if 1 < 2 then 10 else 20").unwrap(), 10);
         assert_eq!(run("if 2 < 1 then 10 else 20").unwrap(), 20);
         assert_eq!(run("let x = 5 in if x == 5 then x * 2 else 0").unwrap(), 10);
+        assert_eq!(run("case 2 of | 1 => 10 | 2 => 20 | _ => 30").unwrap(), 20);
+        assert_eq!(run("case 9 of | 1 => 10 | 2 => 20 | _ => 30").unwrap(), 30);
+        assert_eq!(
+            run("let x = 2 in cond | x < 0 => 1 | x == 2 => 22 | _ => 3").unwrap(),
+            22
+        );
         // the else branch must see the OUTER x, not the then-branch's shadow.
         assert_eq!(
             run("let x = 99 in if 2 < 1 then (let x = 1 in x) else x").unwrap(),
             99,
             "branch-local binding must not leak across branches"
         );
+    }
+
+    #[test]
+    fn jits_do_block_sugar() {
+        assert_eq!(run("do { let x = 20; let y = x + 22; y }").unwrap(), 42);
+        assert_eq!(run("do { 1 + 2; 40 + 2 }").unwrap(), 42);
     }
 
     #[test]
@@ -1094,6 +1181,14 @@ let out = alloc 0 256 0x3000 0x04 in
             run("let n = 6 in loop i = 1, acc = 1 while i < n do i + 1, acc * (i + 1) else acc")
                 .unwrap(),
             720
+        );
+        assert_eq!(
+            run("loop i = 0, acc = 0 while i < 10 do i + 1, acc + i return acc").unwrap(),
+            45
+        );
+        assert_eq!(
+            run("do { loop i = 0 while i < 3 do i + 1 endloop; 42 }").unwrap(),
+            42
         );
     }
 
@@ -1139,6 +1234,14 @@ let out = alloc 0 256 0x3000 0x04 in
 
     #[test]
     fn jits_loop_backed_array_stdlib_helpers() {
+        assert_eq!(
+            run("let a = array_make_int 4 7 in array_sum_int a").unwrap(),
+            28
+        );
+        assert_eq!(
+            run("let a = array_make 4 7 in array_sum_int a").unwrap(),
+            28
+        );
         assert_eq!(run("array_sum_int ([10, 20, 30, 40])").unwrap(), 100);
         assert_eq!(
             run("let a = [0, 0, 0, 0] in \
@@ -1216,7 +1319,14 @@ let out = alloc 0 256 0x3000 0x04 in
         let ir = ir_of("array_sum_int ([10, 20, 30, 40])");
         let module = crate::lower::emit_module(&ctx, &ir, false).unwrap();
         let text = module.print_to_string().to_string();
-        let sum_body = llvm_function_body(&text, "__locus_lam_0");
+        let sum_body = llvm_function_body_containing(
+            &text,
+            &[
+                "locus_gc_scalar_fields_ptr",
+                "%loop.acc",
+                "add i64 %loop.acc",
+            ],
+        );
         assert!(sum_body.contains("locus_gc_scalar_fields_ptr"), "{text}");
         assert!(
             !sum_body.contains("locus_gc_array_get_scalar_bytes"),
@@ -1369,22 +1479,74 @@ let out = alloc 0 256 0x3000 0x04 in
     }
 
     #[test]
-    fn accumulator_loop_rejects_gc_in_steps_for_now() {
-        let err = run("loop i = 0 while i < 2 do (let t = (i, i) in i + 1) else i").unwrap_err();
-        assert!(
-            err.contains("must not allocate or produce handles"),
-            "got: {err}"
+    fn accumulator_loop_allows_allocation_in_scalar_steps() {
+        assert_eq!(
+            run("loop i = 0 while i < 2 do (let t = (i, i) in i + 1) else i").unwrap(),
+            2
+        );
+        assert_eq!(
+            run("loop i = 0 while (let t = (i, i) in i < 2) do i + 1 else i").unwrap(),
+            2
         );
     }
 
     #[test]
-    fn accumulator_loop_rejects_row_pure_handle_reads_in_steps_for_now() {
-        let err = run("let p = (1, (2, 3)) in \
-             loop i = 0 while i < 2 do (let (x, q) = p in i + 1) else i")
-        .unwrap_err();
-        assert!(
-            err.contains("must not allocate or produce handles"),
-            "row-pure pointer projection in a loop step should be rejected for now, got: {err}"
+    fn accumulator_loop_allows_temporary_handles_in_scalar_steps() {
+        assert_eq!(
+            run("let p = (1, (2, 3)) in \
+                 loop i = 0 while i < 2 do (let (x, q) = p in i + x) else i")
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            run(r#"loop i = 0, total = 0 while i < 3 do
+                     i + 1,
+                     (let s = string_repeat "x" (i + 1) in total + string_len s)
+                   else total"#)
+            .unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn accumulator_loop_allows_handle_accumulators() {
+        assert_eq!(
+            run("loop xs = [1], i = 0 while i < 3 do [1, 2], i + 1 else len xs").unwrap(),
+            2
+        );
+        assert_eq!(
+            run(
+                r#"loop s = "", i = 0 while i < 4 do string_append s "x", i + 1 else string_len s"#
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            run(r#"let s = loop s = "", i = 0 while i < 3 do
+                     string_append s "x",
+                     i + 1
+                   else s in string_len s"#)
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            run(r#"let idloop = fn s: String =>
+                     loop t = s, i = 0 while i < 1 do t, i + 1 else t
+                   in string_len (idloop "abc")"#)
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn accumulator_loop_handle_steps_remain_parallel() {
+        assert_eq!(
+            run(r#"loop s = "a", seen = 0 while seen < 1 do
+                     string_append s "b",
+                     string_len s
+                   else seen"#)
+            .unwrap(),
+            1
         );
     }
 
@@ -1464,12 +1626,11 @@ let out = alloc 0 256 0x3000 0x04 in
     }
 
     #[test]
-    fn wide_strings_reach_win32_through_closures() {
+    fn managed_strings_reach_stdlib_through_closures() {
         // A String flows through a closure unchanged, then out to a Win32 …W API
-        // (there is no console runtime now — output is the `writeln` prelude).
+        // (there is no console runtime now — output is the `console_writeln` prelude).
         // lstrlenW counts UTF-16 code units.
-        let through = r#"let wlen = extern "lstrlenW" : Ptr -> I32 in
-                         let id = fn x: String => x in wlen (id "world")"#;
+        let through = r#"let id = fn x: String => x in string_len (id "world")"#;
         assert_eq!(
             run(through).unwrap(),
             5,
@@ -1477,38 +1638,204 @@ let out = alloc 0 256 0x3000 0x04 in
         );
         // 🎉 (U+1F389) is a surrogate PAIR — 2 UTF-16 units; proves the wide
         // representation spans the full 21-bit range, not just ASCII/BMP.
-        let emoji = "let wlen = extern \"lstrlenW\" : Ptr -> I32 in wlen \"\u{1f389}\"";
+        let emoji = "string_len \"\u{1f389}\"";
         assert_eq!(run(emoji).unwrap(), 2, "surrogate pair = 2 units");
     }
 
     #[test]
-    fn jits_a_wide_string_into_win32() {
-        // A wide Locus `Str` passed straight to a Win32 …W API: lstrlenW counts
-        // the UTF-16 code units. Proves `Str` is LPCWSTR-shaped — a string reaches
-        // a `Ptr` parameter with no conversion (the Str→Ptr boundary coercion).
-        let s = r#"let wlen = extern "lstrlenW" : Ptr -> I32 in wlen "hello""#;
-        assert_eq!(run(s).unwrap(), 5, "lstrlenW(\"hello\") = 5 wide units");
+    fn managed_string_search_helpers_run() {
+        assert_eq!(
+            run(r#"if string_starts_with "hello" "he" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_ends_with "hello" "lo" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(run(r#"string_find_from "banana" "na" 3"#).unwrap(), 4);
+        assert_eq!(run(r#"string_last_find "banana" "na""#).unwrap(), 4);
+        assert_eq!(run(r#"string_count "aaaa" "aa""#).unwrap(), 2);
+        assert_eq!(run(r#"string_find_from "abc" "" 9"#).unwrap(), 3);
+        assert_eq!(run(r#"string_last_find "abc" """#).unwrap(), 3);
+        assert_eq!(
+            run(r#"if string_contains_at "banana" "nan" 2 then 1 else 0"#).unwrap(),
+            1
+        );
     }
 
     #[test]
-    fn jits_writeln_from_the_prelude() {
-        // Output is now ordinary Locus — `writeln` (the prelude, readable over
+    fn managed_string_allocating_helpers_run() {
+        assert_eq!(run("string_len (string_empty ())").unwrap(), 0);
+        assert_eq!(
+            run(r#"if string_equals (string_singleton 65) "A" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_slice "abcdef" 2 3) "cde" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_slice "abc" (0 - 2) 2) "ab" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_take "abcdef" 2) "ab" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_drop "abcdef" 4) "ef" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_append "ab" "cd") "abcd" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_repeat "ab" 3) "ababab" then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(run(r#"string_len (string_repeat "x" (0 - 1))"#).unwrap(), 0);
+    }
+
+    #[test]
+    fn agent_text_channel_runs_through_runtime_session() {
+        let src = r#"let answer = agent_ask_text "move?" in
+                    let _ = agent_tell_text answer in
+                    if string_equals answer "d3" then string_len answer else 0"#;
+        let (value, transcript) = run_agent_text(src, vec!["d3".into()]).unwrap();
+        assert_eq!(value, 2);
+        assert_eq!(transcript.remaining_responses, 0);
+        assert_eq!(
+            transcript.events,
+            vec![
+                crate::runtime::AgentEvent::Ask {
+                    prompt: "move?".into(),
+                    response: "d3".into(),
+                    used_default: false,
+                },
+                crate::runtime::AgentEvent::Tell { text: "d3".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn hard_othello_agent_replay_survives_two_black_replies() {
+        let src = include_str!("../../examples/othello_for_agents_hard.locus");
+        let (value, transcript) = run_agent_text(src, vec!["2,3".into(), "2,1".into()]).unwrap();
+        assert!(
+            transcript.events.len() > 50,
+            "expected a multi-turn transcript, got {:?}",
+            transcript.events
+        );
+        assert!(value > 0, "encoded score should be positive");
+    }
+
+    #[test]
+    fn minesweeper_agent_replay_survives_safe_reveals() {
+        let src = include_str!("../../examples/minesweeper_for_agents.locus");
+        let (value, transcript) = run_agent_text(
+            src,
+            vec!["5,5".into(), "5,3".into(), "0,0".into(), "flag 0,1".into()],
+        )
+        .unwrap();
+        assert!(
+            transcript.events.len() > 40,
+            "expected a multi-turn transcript, got {:?}",
+            transcript.events
+        );
+        assert!(
+            transcript
+                .events
+                .iter()
+                .any(|event| matches!(event, crate::runtime::AgentEvent::Ask { .. })),
+            "expected at least one agent ask"
+        );
+        assert!(
+            transcript.events.iter().any(|event| matches!(
+                event,
+                crate::runtime::AgentEvent::Tell { text }
+                    if text.contains("status: mines=")
+                        && text.contains("unflagged_hidden=")
+                        && text.contains("safe_remaining=")
+            )),
+            "expected status text to include agent-useful mine/hidden/safe counts"
+        );
+        assert!(value > 0, "safe replay should not hit a mine");
+    }
+
+    #[test]
+    fn mastermind_agent_replay_solves_with_duplicate_feedback() {
+        let src = include_str!("../../examples/mastermind_for_agents.locus");
+        let (value, transcript) = run_agent_text(src, vec!["1234".into(), "5325".into()]).unwrap();
+        assert_eq!(value, 1002, "expected solve on turn two");
+        assert_eq!(transcript.remaining_responses, 0);
+        assert!(
+            transcript.events.iter().any(|event| matches!(
+                event,
+                crate::runtime::AgentEvent::Tell { text }
+                    if text == "feedback: guess=1234 exact=0 misplaced=2 remaining=7"
+            )),
+            "expected duplicate-aware feedback for the exploratory guess"
+        );
+        assert!(
+            transcript.events.iter().any(|event| matches!(
+                event,
+                crate::runtime::AgentEvent::Tell { text }
+                    if text == "solved in 2 turns. secret=5325"
+            )),
+            "expected final solved tell with deterministic secret"
+        );
+    }
+
+    #[test]
+    fn managed_string_traits_run() {
+        assert_eq!(run(r#"if string_eq "a" "a" then 1 else 0"#).unwrap(), 1);
+        assert_eq!(
+            run(r#"if string_ordering "a" "b" < 0 then 1 else 0"#).unwrap(),
+            1
+        );
+        assert_eq!(
+            run(r#"if string_equals (string_show "hi") "hi" then 1 else 0"#).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn managed_strings_do_not_pass_as_raw_ptrs() {
+        // A Locus `String` is a managed UTF-16 array handle, not an LPCWSTR.
+        // Boundary code must copy it into a raw buffer before passing `Ptr`.
+        let s = r#"let wlen = extern "lstrlenW" : Ptr -> I32 in wlen "hello""#;
+        assert!(run(s).is_err(), "String should not coerce to Ptr");
+    }
+
+    #[test]
+    fn jits_console_writeln_from_the_prelude() {
+        // Output is now ordinary Locus — `console_writeln` (the prelude, readable over
         // Win32), grafted in by `program`. No native console: it JITs and runs,
         // writing to stdout, and yields Unit.
         assert_eq!(
-            run(r#"writeln "hello from JIT""#).unwrap(),
+            run(r#"console_writeln "hello from JIT""#).unwrap(),
             0,
-            "writeln : String -> Unit"
+            "console_writeln : String -> Unit"
         );
     }
 
     #[test]
-    fn jits_writeln_float_from_the_prelude() {
+    fn jits_console_write_float_from_the_prelude() {
         assert_eq!(
-            run("writelnFloat (1.5 + 2.25)").unwrap(),
+            run("console_write_float (1.5 + 2.25)").unwrap(),
             0,
-            "writelnFloat : Float -> Unit"
+            "console_write_float : Float -> Unit"
         );
+    }
+
+    #[test]
+    fn jits_monotonic_clock_service() {
+        let src = "let start = clock_ticks () in \
+                   let freq = clock_frequency () in \
+                   let elapsed = elapsed_ticks start in \
+                   if 0 < freq then (if elapsed < 0 then 0 else 1) else 0";
+        assert_eq!(run(src).unwrap(), 1, "Time service resolves through Win32");
     }
 
     #[test]
@@ -2193,18 +2520,18 @@ let out = alloc 0 256 0x3000 0x04 in
     #[test]
     fn staging_composes_with_effects() {
         // δ's object direction: a `quote` of an effectful computation keeps the
-        // effect (winapi, from writeln) INSIDE the Code — `Code[Unit ! {winapi}]`
+        // effect (winapi, from console_writeln) INSIDE the Code — `Code[Unit ! {winapi}]`
         // — so the generated code performs it at runtime. (Both print as a side
-        // effect and yield writeln's Unit = 0.)
+        // effect and yield console_writeln's Unit = 0.)
         assert_eq!(
-            run(r#"${ quote(writeln "generated") }"#).unwrap(),
+            run(r#"${ quote(console_writeln "generated") }"#).unwrap(),
             0,
             "effect rides in staged code"
         );
         // staging chooses WHICH effectful code at compile time (branches share the
         // row, so the Code types match).
         let choose = r#"${ let level = 2 in
-                           if level == 2 then quote(writeln "verbose") else quote(writeln "quiet") }"#;
+                           if level == 2 then quote(console_writeln "verbose") else quote(console_writeln "quiet") }"#;
         assert_eq!(
             run(choose).unwrap(),
             0,
@@ -2225,7 +2552,7 @@ let out = alloc 0 256 0x3000 0x04 in
         // an EFFECTFUL base shared: 5 + 5 = 10, and the base (and its print) runs
         // ONCE — the difference LLVM can't optimize away (no dedup of side effects).
         let shared =
-            r#"${ let r = genlet(quote(let u = writeln "x" in 5)) in quote(${r} + ${r}) }"#;
+            r#"${ let r = genlet(quote(let u = console_writeln "x" in 5)) in quote(${r} + ${r}) }"#;
         assert_eq!(run(shared).unwrap(), 10, "shared effectful base, 5 + 5");
     }
 
@@ -2250,6 +2577,17 @@ let out = alloc 0 256 0x3000 0x04 in
             run(src).unwrap(),
             42,
             "declare + perform + handle a user effect"
+        );
+    }
+
+    #[test]
+    fn jits_effect_and_handler_sugar() {
+        let src = "effect ask : Unit -> Int in \
+                   handle (ask() + 1) with { ask(_) -> 41 }";
+        assert_eq!(
+            run(src).unwrap(),
+            42,
+            "operation-call sugar performs, handler-arm sugar resumes"
         );
     }
 
@@ -2307,7 +2645,22 @@ let out = alloc 0 256 0x3000 0x04 in
     }
 
     #[test]
+    fn runs_expected_comparison_operators() {
+        assert_eq!(run("if 2 <= 2 then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if 3 > 2 then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if 3 >= 3 then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if 2 != 3 then 1 else 0").unwrap(), 1);
+        assert_eq!(run("if 2 >= 3 then 0 else 1").unwrap(), 1);
+        assert_eq!(run("if 1.5 <= 2.0 then 1 else 0").unwrap(), 1);
+    }
+
+    #[test]
     fn runs_array_and_num_helpers() {
+        // array_make_int allocates a runtime-sized Int array with all slots initialized.
+        assert_eq!(
+            run("let a = array_make_int 3 5 in let _ = a[1] <- 9 in a[0] + a[1] + a[2]").unwrap(),
+            19
+        );
         // array_fill writes every cell; read one back.
         assert_eq!(
             run("let a = [0, 0, 0] in let _ = array_fill_int a 7 in a[1]").unwrap(),
@@ -2325,6 +2678,33 @@ let out = alloc 0 256 0x3000 0x04 in
         assert_eq!(run("abs 5").unwrap(), 5);
         assert_eq!(run("max 3 7").unwrap(), 7);
         assert_eq!(run("min 3 7").unwrap(), 3);
+    }
+
+    #[test]
+    fn runs_random_helpers() {
+        assert_eq!(run("random_next_seed 12345").unwrap(), 595905495);
+        assert_eq!(
+            run("let (roll, seed2) = random_between 1 6 12345 in roll * 1000 + (seed2 % 1000)")
+                .unwrap(),
+            4495
+        );
+        assert_eq!(
+            run("let (roll, _seed2) = random_between 6 1 12345 in roll").unwrap(),
+            4
+        );
+        assert_eq!(
+            run("let (flag, seed2) = random_bool 12345 in if flag then 0 else seed2 % 1000")
+                .unwrap(),
+            495
+        );
+        assert_eq!(
+            run("let (ok, _seed2) = random_chance 1 2 12345 in if ok then 1 else 0").unwrap(),
+            0
+        );
+        assert_eq!(
+            run("let (ok, _seed2) = random_chance 2 2 12345 in if ok then 1 else 0").unwrap(),
+            1
+        );
     }
 
     #[test]

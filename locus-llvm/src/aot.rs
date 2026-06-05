@@ -7,7 +7,7 @@
 //! supplies the CRT entry (`main`, which calls the program's `__locus_main`) and
 //! the closure allocator `locus_alloc` — the same one the JIT binds as an
 //! absolute symbol, resolved here at **link** time. (Output is not here: it is
-//! the Locus `writeln` prelude over Win32.) Model: NewBF's `aot.rs`.
+//! the Locus `console_writeln` prelude over Win32.) Model: NewBF's `aot.rs`.
 
 use std::path::Path;
 use std::sync::Once;
@@ -105,12 +105,28 @@ pub fn emit_object(ir: &Ir, path: &Path, always_gc: bool) -> Result<(), String> 
 /// handlers, the `mem` accessor — compiled to. Same module the JIT and AOT use,
 /// run through the `TargetMachine` with `FileType::Assembly` instead of `Object`.
 pub fn emit_asm(ir: &Ir) -> Result<String, String> {
+    emit_asm_inner(ir, false)
+}
+
+/// Like [`emit_asm`], but runs the **`-O2` IR pipeline** ([`run_opt_pipeline`]) first —
+/// the assembly the shipped `.exe` actually carries. Plain [`emit_asm`] is the honest
+/// *lowering* view (what the front end emits); this is the *optimized* view (what runs).
+/// Useful for perf inspection — e.g. confirming a `let mut` slot is promoted to a
+/// register (mem2reg), with no memory traffic.
+pub fn emit_asm_opt(ir: &Ir) -> Result<String, String> {
+    emit_asm_inner(ir, true)
+}
+
+fn emit_asm_inner(ir: &Ir, optimize: bool) -> Result<String, String> {
     let ctx = Context::create();
     // The asm dump neither links nor runs, so the gc policy is irrelevant here.
     let module = emit_module(&ctx, ir, false)?;
     let (tm, triple) = host_target_machine()?;
     module.set_triple(&triple);
     module.set_data_layout(&tm.get_target_data().get_data_layout());
+    if optimize {
+        run_opt_pipeline(&module, &tm)?;
+    }
     let buf = tm
         .write_to_memory_buffer(&module, FileType::Assembly)
         .map_err(|e| e.to_string())?;
@@ -121,7 +137,7 @@ pub fn emit_asm(ir: &Ir) -> Result<String, String> {
 /// The C runtime, linked alongside the program. It provides the CRT entry
 /// `main` (which runs the program and uses its `i64` result as the exit code)
 /// and the closure allocator `locus_alloc`. Output is no longer here — it is the
-/// Locus `writeln` prelude (readable over Win32). No headers — `malloc` is
+/// Locus `console_writeln` prelude (readable over Win32). No headers — `malloc` is
 /// declared directly, so `cl.exe` needs no `%INCLUDE%`.
 // The CRT entry: runs the program and uses its `i64` result as the exit code.
 const CRT_MAIN: &str = "\
@@ -353,6 +369,18 @@ fn locate_runtime_staticlib() -> Result<std::path::PathBuf, String> {
         dir.join("..").join("locus_rt.lib"),
     ] {
         if cand.exists() {
+            // Guard the **stale staticlib** footgun. `locus-rt` is
+            // `crate-type = ["staticlib","rlib"]`, but a *transitive dependency*
+            // build (what `cargo test`/`cargo build -p locus-llvm` does) only
+            // refreshes the **rlib** — only an explicit `cargo build -p locus-rt`
+            // regenerates the **`.lib`**. So a `.lib` predating a runtime change
+            // links against an old symbol set and the AOT link dies with a cryptic
+            // `LNK2019` on whatever shim was added since (e.g. a new
+            // `locus_string_from_utf16`). In a source tree, turn that into a clear,
+            // actionable error instead of an afternoon of phantom-chasing.
+            if let Some(stale) = runtime_staticlib_stale(&cand) {
+                return Err(stale);
+            }
             return Ok(cand);
         }
     }
@@ -361,6 +389,53 @@ fn locate_runtime_staticlib() -> Result<std::path::PathBuf, String> {
          `cargo build -p locus-rt`"
             .to_string(),
     )
+}
+
+/// `Some(message)` if `lib` is **older than the `locus-rt` sources** (so it would
+/// miss runtime symbols added since it was built); else `None`. Only fires in a
+/// source tree — a shipped compiler has no `locus-rt/src` to compare against, so
+/// the guard no-ops. Conservative by design: it flags any source-newer-than-`.lib`
+/// (even a comment edit) — the fix is one cheap `cargo build -p locus-rt`, which
+/// beats a silent `LNK2019`.
+fn runtime_staticlib_stale(lib: &Path) -> Option<String> {
+    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("locus-rt")
+        .join("src");
+    if !src_dir.exists() {
+        return None; // shipped compiler — nothing to compare against
+    }
+    let lib_mtime = lib.metadata().and_then(|m| m.modified()).ok()?;
+    let newest_src = newest_rs_mtime(&src_dir)?;
+    (newest_src > lib_mtime).then(|| {
+        format!(
+            "locus_rt.lib at {} is STALE — newer `locus-rt/src` exists. `cargo test` \
+             refreshes locus-rt's rlib but NOT its staticlib (`.lib`), so the AOT link \
+             would miss a runtime symbol added since the `.lib` was built (a cryptic \
+             LNK2019). Rebuild it: `cargo build -p locus-rt`.",
+            lib.display()
+        )
+    })
+}
+
+/// The newest modification time among `*.rs` files under `dir` (recursively), or
+/// `None` if there are none / it can't be read.
+fn newest_rs_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let t = if path.is_dir() {
+            newest_rs_mtime(&path)
+        } else if path.extension().and_then(|x| x.to_str()) == Some("rs") {
+            entry.metadata().and_then(|m| m.modified()).ok()
+        } else {
+            None
+        };
+        if let Some(t) = t {
+            newest = Some(newest.map_or(t, |n| n.max(t)));
+        }
+    }
+    newest
 }
 
 #[cfg(test)]
@@ -373,7 +448,7 @@ mod tests {
             .name("aot-ir-of".into())
             .stack_size(locus::PIPELINE_STACK_BYTES)
             .spawn(move || {
-                let term = locus::program(&src).unwrap(); // grafts the prelude (e.g. `writeln`)
+                let term = locus::program(&src).unwrap(); // grafts the prelude (e.g. `console_writeln`)
                 let tree =
                     locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term).unwrap();
                 locus::lower(&locus::stage_reduce(&tree).unwrap())
@@ -399,10 +474,16 @@ mod tests {
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
-    fn a_writeln_program_prints_from_the_shipped_exe() {
-        // Output is the Locus `writeln` prelude over Win32 — no native console.
+    fn a_console_writeln_program_prints_from_the_shipped_exe() {
+        // Output is the Locus `console_writeln` prelude over Win32 — no native console.
         let exe = std::env::temp_dir().join(format!("locus_aot_wln_{}.exe", std::process::id()));
-        build_exe(&ir_of(r#"writeln "from the exe""#), &exe, &[], false).expect("build exe");
+        build_exe(
+            &ir_of(r#"console_writeln "from the exe""#),
+            &exe,
+            &[],
+            false,
+        )
+        .expect("build exe");
         let out = std::process::Command::new(&exe).output().expect("run exe");
         assert!(out.status.success(), "exe ran");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -552,7 +633,8 @@ mod tests {
         // scope). The packed load/op/store survive optimization (the GC payload
         // accessors are opaque, so the round-trip cannot fold away), so a correct
         // exit code proves a real bounds-checked SIMD load/add/store ran AOT.
-        let exe = std::env::temp_dir().join(format!("locus_aot_veckern_{}.exe", std::process::id()));
+        let exe =
+            std::env::temp_dir().join(format!("locus_aot_veckern_{}.exe", std::process::id()));
         build_exe(
             &ir_of(
                 "let a = [toFloat32 1.0, toFloat32 2.0, toFloat32 3.0, toFloat32 4.0, \
@@ -1046,6 +1128,9 @@ mod tests {
         }
         fn ir_has(ir: &I, sym: &str) -> bool {
             match ir {
+                I::Block { binds, comp, .. } => {
+                    binds.iter().any(|b| comp_has(&b.comp, sym)) || comp_has(comp, sym)
+                }
                 I::Let { comp, rest, .. } => comp_has(comp, sym) || ir_has(rest, sym),
                 I::Ret { comp, .. } => comp_has(comp, sym),
             }

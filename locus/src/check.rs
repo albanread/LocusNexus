@@ -1182,6 +1182,57 @@ mod tests {
     }
 
     #[test]
+    fn integer_remainder_surface_typechecks_but_is_pure() {
+        let e = Term::Bin(BinOp::Mod, Box::new(Term::Int(7)), Box::new(Term::Int(3)));
+        let (t, r) = at0(&e).unwrap();
+        assert_eq!(t, Type::Int);
+        assert!(r.is_pure());
+
+        let f = Term::Bin(
+            BinOp::Mod,
+            Box::new(Term::Float(7.0f64.to_bits())),
+            Box::new(Term::Float(3.0f64.to_bits())),
+        );
+        assert!(matches!(
+            at0(&f),
+            Err(TypeErr::Mismatch {
+                expected: Type::Int,
+                found: Type::Float
+            })
+        ));
+    }
+
+    #[test]
+    fn bool_negation_surface_typechecks_but_is_pure() {
+        let (t, r) = infer_src("~true").unwrap();
+        assert_eq!(t, Type::Bool);
+        assert!(r.is_pure());
+
+        assert!(matches!(
+            infer_src("~1"),
+            Err(TypeErr::Mismatch {
+                expected: Type::Bool,
+                found: Type::Int
+            })
+        ));
+    }
+
+    #[test]
+    fn endloop_surface_typechecks_as_unit() {
+        let (t, r) = infer_src("loop i = 0 while i < 3 do i + 1 endloop").unwrap();
+        assert_eq!(t, Type::Unit);
+        assert!(r.is_pure());
+    }
+
+    #[test]
+    fn loop_return_surface_typechecks_as_result() {
+        let (t, r) =
+            infer_src("loop i = 0, acc = 0 while i < 3 do i + 1, acc + i return acc").unwrap();
+        assert_eq!(t, Type::Int);
+        assert!(r.is_pure());
+    }
+
+    #[test]
     fn explicit_numeric_conversions_typecheck() {
         let (t, r) = at0(&Term::Cast(CastOp::ToFloat, Box::new(Term::Int(7)))).unwrap();
         assert_eq!(t, Type::Float);
@@ -1812,7 +1863,11 @@ mod tests {
             ("let r = { a = 1 } in r.b", "RN-E0212", "record.no-field"),
             ("len 1", "RN-E0213", "array.not-an-array"),
             ("Nope", "RN-E0220", "sum.unknown-constructor"),
-            ("loop a = 1, b = 2 while true do a + 1 else a", "RN-E0228", "loop.step-arity"),
+            (
+                "loop a = 1, b = 2 while true do a + 1 else a",
+                "RN-E0228",
+                "loop.step-arity",
+            ),
             (r#"extern "GetStdHandle""#, "RN-E0401", "extern.bare"),
         ];
         for (src, code, slug) in cases {

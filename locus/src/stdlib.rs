@@ -34,7 +34,7 @@
 use std::collections::HashSet;
 
 use crate::parse::{parse_module, ParseErr};
-use crate::syntax::{ModuleDecl, Term};
+use crate::syntax::{BlockItem, ModuleDecl, Term};
 
 pub type ModuleSource = (u8, &'static str, &'static str);
 
@@ -46,8 +46,18 @@ pub type ModuleSource = (u8, &'static str, &'static str);
 const WINDOWS_MODULES: &[ModuleSource] = &[
     (0, "winapi", include_str!("stdlib/winapi.locus")), // raw Win32 — closest to world
     (0, "crt", include_str!("stdlib/crt.locus")),       // raw UCRT math — boundary layer
-    (1, "console", include_str!("stdlib/console.locus")), // writeln, over winapi
-    (1, "math", include_str!("stdlib/math.locus")),     // sin/cos/pow/… over crt_*
+    (0, "stringrt", include_str!("stdlib/stringrt.locus")),
+    (0, "arrayrt", include_str!("stdlib/arrayrt.locus")),
+    (0, "agentrt", include_str!("stdlib/agentrt.locus")),
+    (1, "console", include_str!("stdlib/console.locus")), // console services over winapi
+    (1, "docsfs", include_str!("stdlib/docsfs.locus")),   // Documents-only FS service
+    (1, "locusenv", include_str!("stdlib/locusenv.locus")), // read-only LOCUS_* env service
+    (1, "time", include_str!("stdlib/time.locus")),       // monotonic timing service
+    (1, "db", include_str!("stdlib/db.locus")),           // mock DB service over WinCred
+    (1, "agent", include_str!("stdlib/agent.locus")),     // MCP/agent ask/tell service
+    (1, "string", include_str!("stdlib/string.locus")),   // UTF-16 string helpers
+    (1, "math", include_str!("stdlib/math.locus")),       // sin/cos/pow/… over crt_*
+    (1, "random", include_str!("stdlib/random.locus")),   // deterministic seed-threaded PRNG
     (1, "order", include_str!("stdlib/order.locus")), // min_by/max_by; uses num's Ordering, so grafts INNER of num (earlier = inner)
     (1, "num", include_str!("stdlib/num.locus")),     // pure Int / Ordering helpers
     (1, "bool", include_str!("stdlib/bool.locus")),   // boolean logic combinators
@@ -61,8 +71,17 @@ const WINDOWS_MODULES: &[ModuleSource] = &[
 const LINUX_MODULES: &[ModuleSource] = &[
     (0, "libc", include_str!("stdlib/linux/libc.locus")),
     (0, "libm", include_str!("stdlib/linux/libm.locus")),
+    (0, "stringrt", include_str!("stdlib/stringrt.locus")),
+    (0, "arrayrt", include_str!("stdlib/arrayrt.locus")),
+    (0, "agentrt", include_str!("stdlib/agentrt.locus")),
     (1, "console", include_str!("stdlib/linux/console.locus")),
+    (1, "docsfs", include_str!("stdlib/linux/docsfs.locus")),
+    (1, "locusenv", include_str!("stdlib/linux/locusenv.locus")),
+    (1, "time", include_str!("stdlib/linux/time.locus")),
+    (1, "agent", include_str!("stdlib/agent.locus")),
+    (1, "string", include_str!("stdlib/string.locus")),
     (1, "math", include_str!("stdlib/linux/math.locus")),
+    (1, "random", include_str!("stdlib/random.locus")),
     (1, "order", include_str!("stdlib/order.locus")),
     (1, "num", include_str!("stdlib/num.locus")),
     (1, "bool", include_str!("stdlib/bool.locus")),
@@ -153,26 +172,36 @@ pub fn program_with_stdlib(
     // entry + user module bodies — plus already-included stdlib modules), so a
     // higher layer pulls in the lower layers it depends on. Trigger on real
     // identifier uses only: `code_only` blanks comments + string literals first
-    // (a bare `writeln "pow"` must not drag in the math/crt modules).
+    // (a bare `console_writeln "pow"` must not drag in the math/crt modules).
     let active_user = code_only(src);
+    let parsed_modules: Vec<(u8, ModuleDecl, &'static str)> = modules
+        .iter()
+        .map(|(layer, _, msrc)| {
+            (
+                *layer,
+                parse_module(msrc).expect("a bundled stdlib module must parse"),
+                *msrc,
+            )
+        })
+        .collect();
     let mut active_modules = String::new();
     let mut included = vec![false; modules.len()];
     let mut changed = true;
     while changed {
         changed = false;
-        for (i, (_, _, msrc)) in modules.iter().enumerate() {
+        for (i, (_, decl, msrc)) in parsed_modules.iter().enumerate() {
             if included[i] {
                 continue;
             }
-            let names = bound_names(
-                &parse_module(msrc)
-                    .expect("a bundled stdlib module must parse")
-                    .body,
-            );
-            if names.iter().any(|n| {
-                mentions_word(&active_modules, n)
-                    || (!user_bound.contains(n) && mentions_word(&active_user, n))
-            }) {
+            let transitive_names = bound_names(&decl.body);
+            let user_trigger_names = exposed_names(decl);
+            let mentioned_by_included = transitive_names
+                .iter()
+                .any(|n| mentions_word(&active_modules, n));
+            let mentioned_by_user = user_trigger_names
+                .iter()
+                .any(|n| !user_bound.contains(n) && mentions_word(&active_user, n));
+            if mentioned_by_included || mentioned_by_user {
                 included[i] = true;
                 active_modules.push_str(msrc);
                 changed = true;
@@ -193,10 +222,17 @@ pub fn program_with_stdlib(
     let mut order: Vec<usize> = (0..modules.len()).filter(|&i| included[i]).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(modules[i].0));
     for i in order {
-        let decl = parse_module(modules[i].2).expect("a bundled stdlib module must parse");
+        let decl = parsed_modules[i].1.clone();
         result = graft_in(decl.body, result, Some(&decl.name));
     }
     Ok((result, user_modules))
+}
+
+fn exposed_names(m: &ModuleDecl) -> HashSet<String> {
+    match &m.exposing {
+        Some(names) => names.iter().cloned().collect(),
+        None => bound_names(&m.body),
+    }
 }
 
 /// The first **mint** anywhere in `t`, if any — the capability detector, as a
@@ -279,6 +315,7 @@ pub fn first_mint(t: &Term) -> Option<String> {
         } => go(arr).or_else(|| go(idx)).or_else(|| go(value)),
         Record(fields) => fields.iter().find_map(|(_, e)| go(e)),
         Effect { body, .. } | TypeDef { body, .. } => go(body),
+        Block(items, body) => items.iter().find_map(first_mint_item).or_else(|| go(body)),
         // A `trait`/`instance` declaration mints nothing itself; the first mint, if
         // any, is in an instance method body or the grafted decl body.
         Trait { body, .. } => go(body),
@@ -292,6 +329,17 @@ pub fn first_mint(t: &Term) -> Option<String> {
         Match { scrutinee, arms } => {
             go(scrutinee).or_else(|| arms.iter().find_map(|arm| go(&arm.body)))
         }
+    }
+}
+
+fn first_mint_item(item: &BlockItem) -> Option<String> {
+    match item {
+        BlockItem::Let(_, e)
+        | BlockItem::LetRec(_, _, e)
+        | BlockItem::LetMut(_, e)
+        | BlockItem::LetTuple(_, e) => first_mint(e),
+        BlockItem::Instance { methods, .. } => methods.iter().find_map(|m| first_mint(&m.body)),
+        BlockItem::Effect { .. } | BlockItem::TypeDef { .. } | BlockItem::Trait { .. } => None,
     }
 }
 
@@ -320,7 +368,7 @@ fn mentions_word(src: &str, name: &str) -> bool {
 /// Blank out comment text and string-literal bodies in `src` — replacing them with
 /// spaces, so length and line structure are preserved — leaving only real code for
 /// the stdlib-trigger scan. A name inside a `-- comment` or a `"string literal"`
-/// must NOT pull in a module (`writeln "pow"` is a log line, not a math call).
+/// must NOT pull in a module (`console_writeln "pow"` is a log line, not a math call).
 fn code_only(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -370,7 +418,42 @@ pub(crate) fn bound_names(t: &Term) -> HashSet<String> {
                 names.insert(n.clone());
                 cur = body;
             }
+            Term::Block(items, body) => {
+                for item in items {
+                    match item {
+                        BlockItem::Let(n, _)
+                        | BlockItem::LetRec(n, _, _)
+                        | BlockItem::LetMut(n, _) => {
+                            names.insert(n.clone());
+                        }
+                        BlockItem::LetTuple(tuple_names, _) => {
+                            names.extend(tuple_names.iter().cloned());
+                        }
+                        BlockItem::TypeDef { name, variants, .. } => {
+                            names.insert(name.clone());
+                            for (ctor, _) in variants {
+                                names.insert(ctor.clone());
+                            }
+                        }
+                        BlockItem::Trait { methods, .. } => {
+                            for m in methods {
+                                names.insert(m.name.clone());
+                            }
+                        }
+                        BlockItem::Effect { .. } | BlockItem::Instance { .. } => {}
+                    }
+                }
+                cur = body;
+            }
             Term::LetRec(n, _, _, body) => {
+                names.insert(n.clone());
+                cur = body;
+            }
+            Term::LetTuple(tuple_names, _, body) => {
+                names.extend(tuple_names.iter().cloned());
+                cur = body;
+            }
+            Term::LetMut(n, _, body) => {
                 names.insert(n.clone());
                 cur = body;
             }
@@ -420,67 +503,103 @@ pub(crate) fn bound_names(t: &Term) -> HashSet<String> {
 /// leaving the stamps empty so the orphan check is a no-op (nothing can be an
 /// orphan without a module structure).
 fn graft_in(module: Term, user: Term, home: Option<&str>) -> Term {
-    let stamp = |m: Option<String>| m.or_else(|| home.map(|s| s.to_string()));
-    match module {
-        Term::Let(n, e, body) => Term::Let(n, e, Box::new(graft_in(*body, user, home))),
-        Term::LetRec(n, ty, e, body) => {
-            Term::LetRec(n, ty, e, Box::new(graft_in(*body, user, home)))
-        }
-        Term::TypeDef {
-            name,
-            params,
-            variants,
-            module: m,
-            body,
-        } => Term::TypeDef {
-            name,
-            params,
-            variants,
-            module: stamp(m),
-            body: Box::new(graft_in(*body, user, home)),
-        },
-        // `trait`/`instance` declarations thread their body like `type`/`let`, so a
-        // module declaring them grafts the app inside their scope (traits v1).
-        Term::Trait {
-            name,
-            param,
-            supers,
-            methods,
-            module: m,
-            body,
-        } => Term::Trait {
-            name,
-            param,
-            supers,
-            methods,
-            module: stamp(m),
-            body: Box::new(graft_in(*body, user, home)),
-        },
-        Term::Instance {
-            trait_name,
-            head,
-            requires,
-            methods,
-            module: m,
-            body,
-        } => Term::Instance {
-            trait_name,
-            head,
-            requires,
-            methods,
-            module: stamp(m),
-            body: Box::new(graft_in(*body, user, home)),
-        },
+    let (items, tail) = peel_block_items(module, home);
+    let body = match tail {
         Term::Handle(scrutinee, handler) => {
             Term::Handle(Box::new(graft_in(*scrutinee, user, home)), handler)
         }
         _ => user, // the placeholder body (`()`)
+    };
+    if items.is_empty() {
+        body
+    } else {
+        Term::Block(items, Box::new(body))
+    }
+}
+
+fn peel_block_items(mut term: Term, home: Option<&str>) -> (Vec<BlockItem>, Term) {
+    let stamp = |m: Option<String>| m.or_else(|| home.map(|s| s.to_string()));
+    let mut items = Vec::new();
+    loop {
+        match term {
+            Term::Let(n, e, body) => {
+                items.push(BlockItem::Let(n, *e));
+                term = *body;
+            }
+            Term::LetRec(n, ty, e, body) => {
+                items.push(BlockItem::LetRec(n, ty, *e));
+                term = *body;
+            }
+            Term::LetMut(n, e, body) => {
+                items.push(BlockItem::LetMut(n, *e));
+                term = *body;
+            }
+            Term::LetTuple(names, e, body) => {
+                items.push(BlockItem::LetTuple(names, *e));
+                term = *body;
+            }
+            Term::Effect { name, ops, body } => {
+                items.push(BlockItem::Effect { name, ops });
+                term = *body;
+            }
+            Term::TypeDef {
+                name,
+                params,
+                variants,
+                module,
+                body,
+            } => {
+                items.push(BlockItem::TypeDef {
+                    name,
+                    params,
+                    variants,
+                    module: stamp(module),
+                });
+                term = *body;
+            }
+            Term::Trait {
+                name,
+                param,
+                supers,
+                methods,
+                module,
+                body,
+            } => {
+                items.push(BlockItem::Trait {
+                    name,
+                    param,
+                    supers,
+                    methods,
+                    module: stamp(module),
+                });
+                term = *body;
+            }
+            Term::Instance {
+                trait_name,
+                head,
+                requires,
+                methods,
+                module,
+                body,
+            } => {
+                items.push(BlockItem::Instance {
+                    trait_name,
+                    head,
+                    requires,
+                    methods,
+                    module: stamp(module),
+                });
+                term = *body;
+            }
+            other => return (items, other),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::check::TypeErr;
     use crate::parse::parse;
     use crate::{elaborate, Ctx, Sig};
 
@@ -507,6 +626,22 @@ mod tests {
             .expect("stdlib type-check worker panicked")
     }
 
+    fn linux_ty_of(src: &str) -> Judgment {
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .name("linux-stdlib-ty-of".into())
+            .stack_size(crate::PIPELINE_STACK_BYTES)
+            .spawn(move || {
+                let term = linux_program(&src).unwrap();
+                let t = elaborate(&crate::prelude::sig(), &Ctx::new(), 0, &term).unwrap();
+                let crate::Typed { ty, row, .. } = t;
+                Judgment { ty, row }
+            })
+            .expect("spawn linux stdlib type-check worker")
+            .join()
+            .expect("linux stdlib type-check worker panicked")
+    }
+
     fn named(name: &str, args: Vec<crate::syntax::Type>) -> crate::syntax::Type {
         crate::syntax::Type::Named(name.into(), args)
     }
@@ -521,7 +656,33 @@ mod tests {
                     v.push(n.clone());
                     cur = body;
                 }
+                Term::Block(items, body) => {
+                    for item in items {
+                        match item {
+                            BlockItem::Let(n, _)
+                            | BlockItem::LetRec(n, _, _)
+                            | BlockItem::LetMut(n, _) => v.push(n.clone()),
+                            BlockItem::LetTuple(names, _) => v.extend(names.iter().cloned()),
+                            BlockItem::TypeDef { name, .. } => v.push(name.clone()),
+                            BlockItem::Trait { methods, .. } => {
+                                for m in methods {
+                                    v.push(m.name.clone());
+                                }
+                            }
+                            BlockItem::Effect { .. } | BlockItem::Instance { .. } => {}
+                        }
+                    }
+                    cur = body;
+                }
                 Term::LetRec(n, _, _, body) => {
+                    v.push(n.clone());
+                    cur = body;
+                }
+                Term::LetTuple(names, _, body) => {
+                    v.extend(names.iter().cloned());
+                    cur = body;
+                }
+                Term::LetMut(n, _, body) => {
                     v.push(n.clone());
                     cur = body;
                 }
@@ -529,6 +690,7 @@ mod tests {
                     v.push(name.clone());
                     cur = body;
                 }
+                Term::Effect { body, .. } => cur = body,
                 Term::Handle(scrutinee, _) => cur = scrutinee,
                 _ => break,
             }
@@ -536,13 +698,42 @@ mod tests {
         v
     }
 
-    /// The console layer SEALS winapi: `writeln` performs `console`, the layer's
+    #[test]
+    fn stdlib_graft_compacts_long_declaration_spines() {
+        let term = program("clock_millis ()").unwrap();
+        let shape = crate::stackdiag::term_shape(&term);
+        assert!(
+            shape.max_binding_spine > 20,
+            "fixture should pull a substantial stdlib spine: {shape:?}"
+        );
+        assert!(
+            shape.max_depth < shape.max_binding_spine,
+            "grafting should keep declaration count as block width, not recursive depth: {shape:?}"
+        );
+    }
+
+    #[test]
+    fn typed_stdlib_graft_preserves_compact_declaration_blocks() {
+        let term = program("clock_millis ()").unwrap();
+        let typed = elaborate(&crate::prelude::sig(), &Ctx::new(), 0, &term).unwrap();
+        let shape = crate::stackdiag::typed_shape(&typed);
+        assert!(
+            shape.max_binding_spine > 20,
+            "fixture should still include a substantial typed stdlib spine: {shape:?}"
+        );
+        assert!(
+            shape.max_depth < shape.max_binding_spine,
+            "typed stdlib declarations should remain block width, not recursive depth: {shape:?}"
+        );
+    }
+
+    /// The console layer SEALS winapi: `console_writeln` performs `console`, the layer's
     /// handler discharges it via the Win32 calls. So the whole program performs
     /// `{winapi}` (handled by the world) and `console` is GONE from the row —
     /// the app demanded `{console}`, never `{winapi}`.
     #[test]
     fn console_layer_seals_winapi() {
-        let t = ty_of(r#"writeln "hi""#);
+        let t = ty_of(r#"console_writeln "hi""#);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
         assert!(
             labels.iter().any(|l| l == "winapi"),
@@ -558,7 +749,7 @@ mod tests {
     /// fixed runtime edge while FP extern ABI work is still open.
     #[test]
     fn float_console_helper_resolves() {
-        let t = ty_of("writelnFloat 1.5");
+        let t = ty_of("console_write_float 1.5");
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
         assert_eq!(t.ty, crate::syntax::Type::Unit);
         assert!(
@@ -574,7 +765,8 @@ mod tests {
         // Short math names (`pow`, `log`, `sin`, `exp`) inside a string literal or a
         // `--` comment must NOT pull in the math/crt modules (and spuriously demand
         // ucrtbase.dll). `code_only` blanks strings + comments before the trigger.
-        let order = chain_order(&program("writeln \"pow log sin\" -- exp cos tan").unwrap());
+        let order =
+            chain_order(&program("console_writeln \"pow log sin\" -- exp cos tan").unwrap());
         assert!(
             !order
                 .iter()
@@ -618,14 +810,14 @@ mod tests {
 
     #[test]
     fn winapi_layer_is_outermost() {
-        let order = chain_order(&program(r#"writeln "x""#).unwrap());
+        let order = chain_order(&program(r#"console_writeln "x""#).unwrap());
         let winapi = order
             .iter()
-            .position(|n| n == "getstdhandle")
+            .position(|n| n == "win_GetStdHandle")
             .expect("winapi grafted");
         let console = order
             .iter()
-            .position(|n| n == "writeln")
+            .position(|n| n == "console_writeln")
             .expect("console grafted");
         assert!(
             winapi < console,
@@ -635,7 +827,7 @@ mod tests {
 
     #[test]
     fn linux_console_layer_uses_libc_not_winapi() {
-        let order = chain_order(&linux_program(r#"writeln "x""#).unwrap());
+        let order = chain_order(&linux_program(r#"console_writeln "x""#).unwrap());
         let libc = order
             .iter()
             .position(|n| n == "libc_write")
@@ -646,7 +838,7 @@ mod tests {
         );
         let console = order
             .iter()
-            .position(|n| n == "writeln")
+            .position(|n| n == "console_writeln")
             .expect("console grafted");
         assert!(
             !order.iter().any(|n| n == "getstdhandle"),
@@ -658,11 +850,341 @@ mod tests {
         );
     }
 
+    #[test]
+    fn time_service_seals_windows_clock_effects() {
+        let t = ty_of("let start = clock_ticks () in (elapsed_millis start) + (ticks_to_micros 0)");
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "winapi"),
+            "Windows timing bottoms out in winapi: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "mem"),
+            "Windows timing uses private boundary scratch memory: {labels:?}"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l == "clock_ticks" || l == "clock_frequency"),
+            "service-level timing effects should be discharged: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn linux_time_service_seals_libc_clock_effects() {
+        let t = linux_ty_of(
+            "let start = clock_ticks () in (elapsed_millis start) + (clock_frequency ())",
+        );
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "libc"),
+            "Linux timing bottoms out in libc: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "mem"),
+            "Linux timing uses private boundary scratch memory: {labels:?}"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l == "clock_ticks" || l == "clock_frequency"),
+            "service-level timing effects should be discharged: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn time_service_grafts_winapi_outermost() {
+        let order = chain_order(&program("clock_ticks ()").unwrap());
+        let qpc = order
+            .iter()
+            .position(|n| n == "win_QueryPerformanceCounter")
+            .expect("Windows performance counter boundary grafted");
+        let clock_ticks = order
+            .iter()
+            .position(|n| n == "clock_ticks")
+            .expect("public time service grafted");
+        assert!(
+            qpc < clock_ticks,
+            "winapi timing boundary must wrap the public time service: {order:?}"
+        );
+    }
+
+    #[test]
+    fn linux_time_service_uses_libc_not_winapi() {
+        let order = chain_order(&linux_program("clock_ticks ()").unwrap());
+        let libc_clock = order
+            .iter()
+            .position(|n| n == "libc_clock_gettime")
+            .expect("Linux clock_gettime boundary grafted");
+        let clock_ticks = order
+            .iter()
+            .position(|n| n == "clock_ticks")
+            .expect("public time service grafted");
+        assert!(
+            !order.iter().any(|n| n == "win_QueryPerformanceCounter"),
+            "Linux stdlib must not graft the Windows clock boundary: {order:?}"
+        );
+        assert!(
+            libc_clock < clock_ticks,
+            "Linux libc timing boundary must wrap the public time service: {order:?}"
+        );
+    }
+
+    #[test]
+    fn agent_text_service_grafts_and_tracks_agent_effect() {
+        let t = ty_of(
+            r#"let answer = agent_ask_text "move?" in
+               let _ = agent_tell_text answer in
+               string_len answer"#,
+        );
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "agent"),
+            "Agent service must leave the host-channel capability visible: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "agent_ask_text materializes a managed String: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "winapi"),
+            "Agent service is runtime-hosted, not Win32-backed: {labels:?}"
+        );
+
+        let order = chain_order(&program(r#"agent_ask_text "move?""#).unwrap());
+        assert!(
+            order.iter().any(|n| n == "locus_agent_ask_utf8"),
+            "AgentRt boundary should be pulled in: {order:?}"
+        );
+        assert!(
+            order.iter().any(|n| n == "locus_string_from_utf8"),
+            "Agent should reuse StringRt to materialize responses: {order:?}"
+        );
+        assert!(
+            order.iter().any(|n| n == "agent_ask_text"),
+            "public Agent service should be grafted: {order:?}"
+        );
+    }
+
+    #[test]
+    fn linux_agent_text_service_is_the_same_surface() {
+        let t = linux_ty_of(r#"string_len (agent_ask_text "move?")"#);
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "agent"),
+            "Linux Agent service should use the same host-channel label: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "Linux Agent service also materializes managed strings: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "libc"),
+            "Agent service should not depend on libc: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn linux_docsfs_service_is_home_pinned_and_uses_libc() {
+        let t = linux_ty_of(r#"docs_write_text "note.txt" "hello""#);
+        assert_eq!(t.ty, crate::syntax::Type::Unit);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "libc"),
+            "Linux DocsFs bottoms out in libc: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "mem"),
+            "Linux DocsFs uses private boundary scratch memory: {labels:?}"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|l| l == "docsfs_write" || l == "docsfs_append" || l == "docsfs_read"),
+            "DocsFs service effects should be discharged: {labels:?}"
+        );
+
+        let order = chain_order(&linux_program(r#"docs_exists "note.txt""#).unwrap());
+        let getenv = order
+            .iter()
+            .position(|n| n == "libc_getenv")
+            .expect("Linux DocsFs should read HOME through libc");
+        let exists = order
+            .iter()
+            .position(|n| n == "docs_exists")
+            .expect("public DocsFs service grafted");
+        assert!(
+            order.iter().any(|n| n == "libc_home_documents_path"),
+            "DocsFs should build the pinned $HOME/Documents path: {order:?}"
+        );
+        assert!(
+            !order.iter().any(|n| n == "win_CreateFileW"),
+            "Linux DocsFs must not graft the Windows file boundary: {order:?}"
+        );
+        assert!(
+            getenv < exists,
+            "libc HOME lookup must wrap public DocsFs: {order:?}"
+        );
+    }
+
+    #[test]
+    fn linux_locusenv_service_uses_closed_keys_over_libc() {
+        let t =
+            linux_ty_of("match locus_env_get LocusHome with | None => 0 | Some(s) => string_len s");
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "libc"),
+            "Linux LocusEnv bottoms out in libc getenv: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "locus_env_get"),
+            "LocusEnv service effect should be discharged: {labels:?}"
+        );
+
+        let order = chain_order(&linux_program("locus_env_get LocusHome").unwrap());
+        let getenv = order
+            .iter()
+            .position(|n| n == "libc_getenv")
+            .expect("Linux LocusEnv should read via libc getenv");
+        let service = order
+            .iter()
+            .position(|n| n == "locus_env_get")
+            .expect("public LocusEnv service grafted");
+        assert!(
+            !order.iter().any(|n| n == "win_GetEnvironmentVariableW"),
+            "Linux LocusEnv must not graft the Windows env boundary: {order:?}"
+        );
+        assert!(
+            getenv < service,
+            "libc getenv boundary must wrap public LocusEnv: {order:?}"
+        );
+    }
+
+    #[test]
+    fn db_mock_service_consumes_wincred_without_exposing_secret() {
+        let t = ty_of(r#"if db_mock_connect "test.api.key" then 1 else 0"#);
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "winapi"),
+            "Db mock bottoms out in visible WinAPI calls: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "mem"),
+            "Db mock uses private boundary scratch memory: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "Db mock materializes the private credential String today: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "db_mock_connect_op"),
+            "Db mock service effect should be discharged: {labels:?}"
+        );
+
+        let order = chain_order(&program(r#"db_mock_health_check "test.api.key""#).unwrap());
+        let cred_read = order
+            .iter()
+            .position(|n| n == "win_CredReadW")
+            .expect("CredReadW boundary grafted");
+        let service = order
+            .iter()
+            .position(|n| n == "db_mock_connect")
+            .expect("public Db mock service grafted");
+        assert!(
+            order.iter().any(|n| n == "win_cred_target_name"),
+            "Db mock should construct the pinned secure/credentials target: {order:?}"
+        );
+        assert!(
+            cred_read < service,
+            "CredReadW boundary must wrap public Db mock: {order:?}"
+        );
+    }
+
+    #[test]
+    fn wincred_secret_read_is_not_a_public_service() {
+        let err = std::thread::Builder::new()
+            .name("wincred-direct-absent".into())
+            .stack_size(crate::PIPELINE_STACK_BYTES)
+            .spawn(|| {
+                let term = program(r#"wincred_get "test.api.key""#).unwrap();
+                elaborate(&crate::prelude::sig(), &Ctx::new(), 0, &term).unwrap_err()
+            })
+            .expect("spawn wincred direct absence worker")
+            .join()
+            .expect("wincred direct absence worker panicked");
+        assert_eq!(err, TypeErr::Unbound("wincred_get".into()));
+    }
+
+    #[test]
+    fn linux_stdlib_does_not_publish_db_mock() {
+        let err = std::thread::Builder::new()
+            .name("linux-db-mock-absent".into())
+            .stack_size(crate::PIPELINE_STACK_BYTES)
+            .spawn(|| {
+                let term = linux_program(r#"db_mock_connect "test.api.key""#).unwrap();
+                elaborate(&crate::prelude::sig(), &Ctx::new(), 0, &term).unwrap_err()
+            })
+            .expect("spawn linux db mock absence worker")
+            .join()
+            .expect("linux db mock absence worker panicked");
+        assert_eq!(err, TypeErr::Unbound("db_mock_connect".into()));
+    }
+
     /// A `num` helper resolves through the library.
     #[test]
     fn num_helpers_resolve() {
         assert_eq!(ty_of("abs (0 - 5)").ty, crate::syntax::Type::Int);
         assert_eq!(ty_of("max 3 4").ty, crate::syntax::Type::Int);
+    }
+
+    /// Random is a shared layer-1 service with a deterministic seed-threaded core:
+    /// scalar seed stepping is pure, while pair-returning draws expose tuple
+    /// allocation as `gc`.
+    #[test]
+    fn random_helpers_resolve_on_windows_and_linux() {
+        let scalar = ty_of("random_next_seed 12345");
+        assert_eq!(scalar.ty, crate::syntax::Type::Int);
+        let scalar_labels: Vec<String> = scalar.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            !scalar_labels.iter().any(|l| l == "gc"),
+            "scalar seed stepping should not allocate: {scalar_labels:?}"
+        );
+
+        let roll = ty_of("let (value, seed2) = random_between 1 6 12345 in (value, seed2)");
+        assert_eq!(
+            roll.ty,
+            crate::syntax::Type::Tuple(vec![crate::syntax::Type::Int, crate::syntax::Type::Int,])
+        );
+        let roll_labels: Vec<String> = roll.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            roll_labels.iter().any(|l| l == "gc"),
+            "pair-returning random helpers allocate tuples: {roll_labels:?}"
+        );
+
+        assert_eq!(
+            ty_of("let (ok, seed2) = random_chance 1 2 12345 in if ok then seed2 else 0").ty,
+            crate::syntax::Type::Int
+        );
+
+        let linux_roll =
+            linux_ty_of("let (value, seed2) = random_between 10 20 12345 in value + seed2");
+        assert_eq!(linux_roll.ty, crate::syntax::Type::Int);
+
+        let order = chain_order(&program("random_next_seed 12345").unwrap());
+        assert!(
+            order.iter().any(|n| n == "random_next_seed"),
+            "random module should graft when used: {order:?}"
+        );
+        assert!(
+            !order.iter().any(|n| n == "crt_pow" || n == "libm_pow"),
+            "random should not pull platform math boundaries: {order:?}"
+        );
     }
 
     /// A stdlib SUM TYPE grafts: `compare` returns `Ordering`, matched here.
@@ -676,6 +1198,37 @@ mod tests {
     /// stay monomorphic so Int and Float callers land on the unboxed layouts.
     #[test]
     fn scalar_array_stdlib_helpers_graft() {
+        let new_int = ty_of("array_make_int 4 9");
+        assert_eq!(
+            new_int.ty,
+            crate::syntax::Type::Array(Box::new(crate::syntax::Type::Int))
+        );
+        let labels: Vec<String> = new_int.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "array_make_int should expose allocation as gc: {labels:?}"
+        );
+        let order = chain_order(&program("array_make_int 4 9").unwrap());
+        assert!(
+            order.iter().any(|n| n == "locus_array_new_int"),
+            "ArrayRt boundary should be pulled in: {order:?}"
+        );
+        assert!(
+            order.iter().any(|n| n == "array_make_int"),
+            "public Array service should be grafted: {order:?}"
+        );
+        assert_eq!(
+            ty_of("array_make_int 4 9").ty,
+            crate::syntax::Type::Array(Box::new(crate::syntax::Type::Int))
+        );
+        assert_eq!(
+            ty_of("array_make_int 4 9").ty,
+            crate::syntax::Type::Array(Box::new(crate::syntax::Type::Int))
+        );
+        assert_eq!(
+            ty_of("let a = array_make 4 9 in a[1]").ty,
+            crate::syntax::Type::Int
+        );
         assert_eq!(
             ty_of("array_sum_int ([1, 2, 3])").ty,
             crate::syntax::Type::Int
@@ -1002,7 +1555,7 @@ mod tests {
         assert!(first_mint(&raw).unwrap().contains("poke"));
         // …but the safe array accessor and ordinary effects are not.
         assert_eq!(first_mint(&parse("let a = [1, 2] in a[0]").unwrap()), None);
-        assert_eq!(first_mint(&parse(r#"writeln "hi""#).unwrap()), None);
+        assert_eq!(first_mint(&parse(r#"console_writeln "hi""#).unwrap()), None);
     }
 
     /// Minting (`extern` / raw memory) is **boundary-EXCLUSIVE**: every embedded
@@ -1045,12 +1598,12 @@ mod tests {
 
     #[test]
     fn a_user_module_pulls_in_the_stdlib_and_the_seal_holds_through_it() {
-        // A user module body naming `writeln` pulls in `console` — and the
+        // A user module body naming `console_writeln` pulls in `console` — and the
         // console module's handler wraps the user module too, so `console` is
         // discharged into `winapi`: the seal holds *through* the user-module
         // layer (winapi present, console gone — just like app-level code).
         let t = ty_of(
-            "module Greet at app = let hi = fn u: Unit => writeln \"hi\" in () \
+            "module Greet at app = let hi = fn u: Unit => console_writeln \"hi\" in () \
              hi ()",
         );
         assert_eq!(t.ty, crate::syntax::Type::Unit);

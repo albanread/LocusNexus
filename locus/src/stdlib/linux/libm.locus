@@ -1,4 +1,4 @@
-module Libm at boundary mints (libm) =
+module Libm at boundary mints (libm) exposing () =
 -- stdlib LAYER 0: libm boundary for Linux.
 
 let libm_sin   = extern "sin"   : Float -> Float in

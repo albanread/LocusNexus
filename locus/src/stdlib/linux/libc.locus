@@ -1,9 +1,214 @@
-module Libc at boundary mints (libc) =
+module Libc at boundary mints (libc) exposing () =
 -- stdlib LAYER 0: libc/POSIX boundary for Linux.
 --
 -- Only this layer names raw libc symbols. Services wrap these bindings and seal
 -- the `libc` label before app code sees a stable service API.
 
 let libc_malloc = extern "malloc" : Int -> Ptr in
+let libc_alloc = extern "malloc" : Int -> Int in
 let libc_write  = extern "write"  : I32 -> Ptr -> Int -> Int in
+let libc_clock_gettime = extern "clock_gettime" : I32 -> Ptr -> I32 in
+let libc_getenv = extern "getenv" : Ptr -> Int in
+let libc_strlen = extern "strlen" : Ptr -> Int in
+let libc_open = extern "open" : Ptr -> I32 -> U32 -> I32 in
+let libc_read = extern "read" : I32 -> Ptr -> Int -> Int in
+let libc_close = extern "close" : I32 -> I32 in
+let libc_lseek = extern "lseek" : I32 -> Int -> I32 -> Int in
+let libc_access = extern "access" : Ptr -> I32 -> I32 in
+
+let libc_clock_ticks = fn u: Unit =>
+  let ts = libc_alloc 16 in
+  let ok = libc_clock_gettime 1 ts in
+  if ok == 0 then (peek64 ts * 1000000000) + peek64 (ts + 8) else 0
+in
+
+let libc_clock_frequency = fn u: Unit =>
+  1000000000
+in
+
+let libc_utf8z = fn s: String =>
+  let units = len s in
+  let out = libc_alloc ((units * 4) + 1) in
+  let n =
+    loop i = 0, j = 0 while i < units do
+      (let unit = s[i] in
+       if unit < 0xD800 then i + 1
+       else if unit < 0xDC00 then (if (i + 1) < units then i + 2 else i + 1)
+       else i + 1),
+      (let unit = s[i] in
+       if unit < 0x80 then
+         (let _ = poke8 (out + j) unit in
+          j + 1)
+       else if unit < 0x800 then
+         (let _ = poke8 (out + j) (0xC0 | (unit >> 6)) in
+          let _ = poke8 (out + j + 1) (0x80 | (unit & 0x3F)) in
+          j + 2)
+       else if unit < 0xD800 then
+         (let _ = poke8 (out + j) (0xE0 | (unit >> 12)) in
+          let _ = poke8 (out + j + 1) (0x80 | ((unit >> 6) & 0x3F)) in
+          let _ = poke8 (out + j + 2) (0x80 | (unit & 0x3F)) in
+          j + 3)
+       else if unit < 0xDC00 then
+         (if (i + 1) < units then
+            (let lo = s[i + 1] in
+             let cp = 0x10000 + ((unit - 0xD800) << 10) + (lo - 0xDC00) in
+             let _ = poke8 (out + j) (0xF0 | (cp >> 18)) in
+             let _ = poke8 (out + j + 1) (0x80 | ((cp >> 12) & 0x3F)) in
+             let _ = poke8 (out + j + 2) (0x80 | ((cp >> 6) & 0x3F)) in
+             let _ = poke8 (out + j + 3) (0x80 | (cp & 0x3F)) in
+             j + 4)
+          else
+            (let _ = poke8 (out + j) (0xE0 | (unit >> 12)) in
+             let _ = poke8 (out + j + 1) (0x80 | ((unit >> 6) & 0x3F)) in
+             let _ = poke8 (out + j + 2) (0x80 | (unit & 0x3F)) in
+             j + 3))
+       else
+         (let _ = poke8 (out + j) (0xE0 | (unit >> 12)) in
+          let _ = poke8 (out + j + 1) (0x80 | ((unit >> 6) & 0x3F)) in
+          let _ = poke8 (out + j + 2) (0x80 | (unit & 0x3F)) in
+          j + 3))
+    else
+      j
+  in
+  let _ = poke8 (out + n) 0 in
+  out
+in
+
+let libc_copy_bytes = fn dst: Int => fn off: Int => fn src: Int => fn count: Int =>
+  loop i = 0 while i < count do
+    (let _ = poke8 (dst + off + i) (peek8 (src + i)) in
+     i + 1)
+  else
+    off + i
+in
+
+let libc_name_chars_safe = fn name: String =>
+  loop i = 0, ok = true while i < len name do
+    i + 1,
+    if ok then
+      let ch = name[i] in
+      if ch == 0 then
+        false
+      else if ch == 47 then
+        false
+      else if ch == 58 then
+        false
+      else if ch == 92 then
+        false
+      else
+        true
+    else
+      false
+  else
+    ok
+in
+
+let libc_name_safe = fn name: String =>
+  let n = len name in
+  if n == 0 then
+    false
+  else if n == 1 then
+    if name[0] == 46 then false else libc_name_chars_safe name
+  else if n == 2 then
+    if name[0] == 46 then
+      if name[1] == 46 then false else libc_name_chars_safe name
+    else
+      libc_name_chars_safe name
+  else
+    libc_name_chars_safe name
+in
+
+let libc_home_documents_path = fn name: String =>
+  if libc_name_safe name then
+    let home = libc_getenv (libc_utf8z "HOME") in
+    if home == 0 then
+      0
+    else
+      let home_len = libc_strlen home in
+      let docs = libc_utf8z "/Documents/" in
+      let docs_len = libc_strlen docs in
+      let raw_name = libc_utf8z name in
+      let name_len = libc_strlen raw_name in
+      let total = home_len + docs_len + name_len + 1 in
+      if 32766 < total then
+        0
+      else
+        let path = libc_alloc total in
+        let off1 = libc_copy_bytes path 0 home home_len in
+        let off2 = libc_copy_bytes path off1 docs docs_len in
+        let off3 = libc_copy_bytes path off2 raw_name name_len in
+        let _ = poke8 (path + off3) 0 in
+        path
+  else
+    0
+in
+
+let libc_docs_exists = fn name: String =>
+  let path = libc_home_documents_path name in
+  if path == 0 then
+    false
+  else
+    (libc_access path 0) == 0
+in
+
+let libc_docs_write = fn name: String => fn text: String => fn flags: Int =>
+  let path = libc_home_documents_path name in
+  if path == 0 then
+    0
+  else
+    let fd = libc_open path flags 384 in
+    if fd < 0 then
+      0
+    else
+      let buf = libc_utf8z text in
+      let bytes = libc_strlen buf in
+      let written = libc_write fd buf bytes in
+      let _ = libc_close fd in
+      if written < 0 then 0 else 1
+in
+
+let libc_docs_read_ok = fn name: String =>
+  if libc_docs_exists name then 1 else 0
+in
+
+let libc_docs_read_text = fn name: String =>
+  let path = libc_home_documents_path name in
+  if path == 0 then
+    locus_string_from_utf8 0 0
+  else
+    let fd = libc_open path 0 0 in
+    if fd < 0 then
+      locus_string_from_utf8 0 0
+    else
+      let bytes = libc_lseek fd 0 2 in
+      if bytes < 0 then
+        (let _ = libc_close fd in
+         locus_string_from_utf8 0 0)
+      else if 2147483646 < bytes then
+        (let _ = libc_close fd in
+         locus_string_from_utf8 0 0)
+      else
+        let _ = libc_lseek fd 0 0 in
+        let buf = libc_alloc (bytes + 1) in
+        let n = libc_read fd buf bytes in
+        let _ = libc_close fd in
+        if n < 0 then
+          locus_string_from_utf8 0 0
+        else
+          locus_string_from_utf8 buf n
+in
+
+let libc_locus_env_get_ok = fn name: String =>
+  let p = libc_getenv (libc_utf8z name) in
+  if p == 0 then 0 else 1
+in
+
+let libc_locus_env_get_text = fn name: String =>
+  let p = libc_getenv (libc_utf8z name) in
+  if p == 0 then
+    locus_string_from_utf8 0 0
+  else
+    locus_string_from_utf8 p (libc_strlen p)
+in
+
 ()

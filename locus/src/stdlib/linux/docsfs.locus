@@ -1,0 +1,33 @@
+module DocsFs at services seals (libc, mem) exposing
+  (docs_read_text, docs_write_text, docs_append_text, docs_exists) =
+-- Controlled filesystem example: all operations are pinned to
+-- $HOME/Documents, and the boundary rejects names that contain navigation.
+
+effect docsfs_read : String -> Option[String] in
+effect docsfs_write : (String, String) -> Unit in
+effect docsfs_append : (String, String) -> Unit in
+effect docsfs_exists : String -> Bool in
+
+handle
+  do {
+    let docs_read_text = fn name: String => docsfs_read name;
+    let docs_write_text = fn name: String => fn text: String => docsfs_write (name, text);
+    let docs_append_text = fn name: String => fn text: String => docsfs_append (name, text);
+    let docs_exists = fn name: String => docsfs_exists name;
+  }
+with {
+  docsfs_read(name) ->
+    if (libc_docs_read_ok name) == 0 then
+      None
+    else
+      Some(libc_docs_read_text name) ;
+  docsfs_write(args) -> do {
+    let (name, text) = args;
+    let _ = libc_docs_write name text 577;
+  } ;
+  docsfs_append(args) -> do {
+    let (name, text) = args;
+    let _ = libc_docs_write name text 1089;
+  } ;
+  docsfs_exists(name) -> libc_docs_exists name
+}

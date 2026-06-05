@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use crate::check::Stage;
-use crate::sema::{Node, Typed, TypedHandler};
+use crate::sema::{Node, Typed, TypedBlockItem, TypedHandler};
 use crate::syntax::{
     BinOp, CastOp, ExternAbi, FloatMathOp, Label, MaskReduceOp, MemWidth, Row, Type, ValueLayout,
     VectorShape,
@@ -190,7 +190,7 @@ pub enum Comp {
     /// `if c then <block> else <block>` — the condition is already an atom.
     If(Atom, Box<Ir>, Box<Ir>),
     /// Structured accumulator loop:
-    /// `loop x = init, ... while <cond> do <next_x>, ... else <result>`.
+    /// `loop x = init, ... while <cond> do <next_x>, ... return <result>`.
     Loop {
         vars: Vec<LoopVar>,
         cond: Box<Ir>,
@@ -312,9 +312,30 @@ pub enum Comp {
     RefSet(Atom, Atom, ValueLayout),
 }
 
+/// One ANF binding in evaluation order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IrBind {
+    pub name: String,
+    /// The binding's value type. Codegen uses this together with `layout`
+    /// when packing unboxed closure captures.
+    pub ty: Type,
+    /// Storage layout for this binding's value. Codegen uses this for typed
+    /// closure-capture layout.
+    pub layout: ValueLayout,
+    pub row: Row,
+    pub comp: Comp,
+}
+
 /// An ANF block: a sequence of `let`-bindings ending in a tail computation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ir {
+    /// Flat block form used by the normal lowerer. `binds` are in evaluation
+    /// order and the block ends in `comp` with tail row `row`.
+    Block {
+        binds: Vec<IrBind>,
+        row: Row,
+        comp: Comp,
+    },
     /// `let name = <comp>  (! row)  in <rest>`.
     Let {
         name: String,
@@ -477,13 +498,7 @@ fn collect_spine<'a>(e: &'a Typed, out: &mut Vec<&'a Typed>) -> &'a Typed {
 }
 
 /// One prerequisite binding accumulated while normalizing a block.
-struct Bind {
-    name: String,
-    ty: Type,
-    layout: ValueLayout,
-    row: Row,
-    comp: Comp,
-}
+type Bind = IrBind;
 
 /// The normalizer — just a fresh-name counter. (Pure structural transform;
 /// no context needed, since sema already resolved everything.)
@@ -549,18 +564,11 @@ impl Lower {
     fn block(&mut self, e: &Typed) -> Ir {
         let mut binds = Vec::new();
         let (tail, row) = self.comp(e, &mut binds);
-        let mut ir = Ir::Ret { row, comp: tail };
-        for b in binds.into_iter().rev() {
-            ir = Ir::Let {
-                name: b.name,
-                ty: b.ty,
-                layout: b.layout,
-                row: b.row,
-                comp: b.comp,
-                rest: Box::new(ir),
-            };
+        Ir::Block {
+            binds,
+            row,
+            comp: tail,
         }
-        ir
     }
 
     /// The Ir block for one `match` arm: bind each field of the matched
@@ -582,18 +590,11 @@ impl Lower {
             });
         }
         let (tail, row) = self.comp(&arm.body, &mut binds);
-        let mut ir = Ir::Ret { row, comp: tail };
-        for b in binds.into_iter().rev() {
-            ir = Ir::Let {
-                name: b.name,
-                ty: b.ty,
-                layout: b.layout,
-                row: b.row,
-                comp: b.comp,
-                rest: Box::new(ir),
-            };
+        Ir::Block {
+            binds,
+            row,
+            comp: tail,
         }
-        ir
     }
 
     /// Normalize `e` to a single `Comp`, appending any prerequisite bindings
@@ -1176,6 +1177,80 @@ impl Lower {
                 return self.comp(body, binds);
             }
 
+            // A typed block is the same sequential binding list as the old nested
+            // `Let` spine, but already flat in sema. Lower each binding into the
+            // ANF bind list in order, then use the tail body's computation.
+            Node::Block { items, body } => {
+                let mut mutable_scope = Vec::new();
+                for item in items {
+                    match item {
+                        TypedBlockItem::Let { name, bound } => {
+                            if let Node::Var(x) = &bound.node {
+                                if let Some(entry) = self.externs.get(x).cloned() {
+                                    self.externs.insert(name.clone(), entry);
+                                    continue;
+                                }
+                            }
+                            let (cb, rb) = self.comp(bound, binds);
+                            if let Node::Extern(sym, abi) = &bound.node {
+                                self.externs
+                                    .insert(name.clone(), (sym.clone(), abi.clone()));
+                            }
+                            binds.push(Bind {
+                                name: name.clone(),
+                                ty: bound.ty.clone(),
+                                layout: storage_layout_or_panic(&bound.ty),
+                                row: rb,
+                                comp: cb,
+                            });
+                        }
+                        TypedBlockItem::LetMut { name, bound } => {
+                            let init = self.atom(bound, binds);
+                            binds.push(Bind {
+                                name: self.fresh(),
+                                ty: Type::Unit,
+                                layout: ValueLayout::scalar_cell(),
+                                row: Row::pure(),
+                                comp: Comp::SlotInit(name.clone(), init),
+                            });
+                            if self.mut_slots.insert(name.clone()) {
+                                mutable_scope.push(name.clone());
+                            }
+                        }
+                        TypedBlockItem::LetTuple { names, bound, .. } => {
+                            let elem_tys: Vec<_> = match &bound.ty {
+                                crate::syntax::Type::Tuple(ts) => ts.clone(),
+                                crate::syntax::Type::Var(v) => {
+                                    unreachable!("let-tuple on an un-zonked type variable {v:?}")
+                                }
+                                _ => unreachable!("let-tuple on a non-tuple (sema checked)"),
+                            };
+                            let tup = self.atom(bound, binds);
+                            for (i, name) in names.iter().enumerate() {
+                                let (slot, layout) = field_layout(&elem_tys, i);
+                                binds.push(Bind {
+                                    name: name.clone(),
+                                    ty: elem_tys[i].clone(),
+                                    layout,
+                                    row: Row::pure(),
+                                    comp: Comp::Proj {
+                                        tup: tup.clone(),
+                                        slot,
+                                        layout,
+                                        ty: elem_tys[i].clone(),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+                let out = self.comp(body, binds);
+                for name in mutable_scope {
+                    self.mut_slots.remove(&name);
+                }
+                return out;
+            }
+
             // `let mut name = bound in body` — a non-escaping scalar mutable
             // local (mutability v1). Lower `bound` to an atom, allocate a stack
             // slot for `name` (a `SlotInit` bind: codegen does the `alloca` +
@@ -1351,6 +1426,18 @@ impl Ir {
 
 fn write_ir(s: &mut String, ir: &Ir, depth: usize) {
     match ir {
+        Ir::Block { binds, row, comp } => {
+            for bind in binds {
+                write_comp(
+                    s,
+                    &format!("let {} = ", bind.name),
+                    &bind.row,
+                    &bind.comp,
+                    depth,
+                );
+            }
+            write_comp(s, "", row, comp, depth);
+        }
         Ir::Let {
             name,
             ty: _,
@@ -1436,7 +1523,9 @@ fn write_comp(s: &mut String, prefix: &str, row: &Row, comp: &Comp, depth: usize
         Comp::VectorSplat { shape, value, .. } => {
             line(format!("splat{} {}", shape.name(), atom_str(value)))
         }
-        Comp::VectorLoad { shape, arr, idx, .. } => line(format!(
+        Comp::VectorLoad {
+            shape, arr, idx, ..
+        } => line(format!(
             "load{}({}, {})",
             shape.name(),
             atom_str(arr),
@@ -1584,7 +1673,7 @@ fn write_comp(s: &mut String, prefix: &str, row: &Row, comp: &Comp, depth: usize
             for step in steps {
                 write_ir(s, step, depth + 1);
             }
-            s.push_str(&format!("{pad}else\n"));
+            s.push_str(&format!("{pad}return\n"));
             write_ir(s, result, depth + 1);
         }
         Comp::Lam { param, body, .. } => {
@@ -1703,13 +1792,13 @@ mod tests {
     #[test]
     fn accumulator_loop_lowers_to_loop_ir() {
         let txt = ir_text(
-            "loop i = 0, acc = 0 while i < 10 do i + 1, acc + i else acc",
+            "loop i = 0, acc = 0 while i < 10 do i + 1, acc + i return acc",
             0,
         );
         assert!(txt.contains("loop i = 0, acc = 0"), "got:\n{txt}");
         assert!(txt.contains("while"), "got:\n{txt}");
         assert!(txt.contains("do"), "got:\n{txt}");
-        assert!(txt.contains("else"), "got:\n{txt}");
+        assert!(txt.contains("return"), "got:\n{txt}");
     }
 
     #[test]

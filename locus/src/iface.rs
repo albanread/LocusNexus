@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use crate::check::{Binding, Ctx, Scheme};
-use crate::sema::{elaborate, Node, Typed};
+use crate::sema::{elaborate, Node, Typed, TypedBlockItem};
 use crate::syntax::{Label, Layer, ModuleDecl, Term, Type, ValueLayout};
 
 /// The **ABI / representation version** (§6): the uniform-cell + handle
@@ -519,6 +519,14 @@ fn binding_bounds(t: &Typed, out: &mut std::collections::HashMap<String, Typed>)
             out.entry(name.clone()).or_insert_with(|| (**bound).clone());
             binding_bounds(body, out);
         }
+        Node::Block { items, body } => {
+            for item in items {
+                if let TypedBlockItem::Let { name, bound } = item {
+                    out.entry(name.clone()).or_insert_with(|| bound.clone());
+                }
+            }
+            binding_bounds(body, out);
+        }
         Node::LetTuple(_, _, body) => binding_bounds(body, out),
         Node::Handle { scrutinee, .. } => binding_bounds(scrutinee, out),
         Node::LetMut { body, .. } => binding_bounds(body, out),
@@ -536,6 +544,14 @@ fn binding_types(t: &Typed, out: &mut std::collections::HashMap<String, Type>) {
     match &t.node {
         Node::Let { name, bound, body } => {
             out.entry(name.clone()).or_insert_with(|| bound.ty.clone());
+            binding_types(body, out);
+        }
+        Node::Block { items, body } => {
+            for item in items {
+                if let TypedBlockItem::Let { name, bound } = item {
+                    out.entry(name.clone()).or_insert_with(|| bound.ty.clone());
+                }
+            }
             binding_types(body, out);
         }
         Node::LetTuple(_, _, body) => binding_types(body, out),
@@ -559,6 +575,29 @@ fn collect_type_defs(body: &Term) -> Vec<(String, Vec<String>, TypeDefKind)> {
             Term::LetRec(_, _, _, b) => cur = b,
             Term::LetTuple(_, _, b) => cur = b,
             Term::LetMut(_, _, b) => cur = b,
+            Term::Block(items, b) => {
+                for item in items {
+                    if let crate::syntax::BlockItem::TypeDef {
+                        name,
+                        params,
+                        variants,
+                        ..
+                    } = item
+                    {
+                        let variants: Vec<SumVariant> = variants
+                            .iter()
+                            .enumerate()
+                            .map(|(tag, (ctor, fields))| SumVariant {
+                                tag: tag as i64,
+                                ctor: ctor.clone(),
+                                fields: fields.clone(),
+                            })
+                            .collect();
+                        out.push((name.clone(), params.clone(), TypeDefKind::Sum(variants)));
+                    }
+                }
+                cur = b;
+            }
             Term::Trait { body: b, .. } | Term::Instance { body: b, .. } => cur = b,
             Term::Effect { body: b, .. } => cur = b,
             Term::Handle(scrutinee, _) => cur = scrutinee,

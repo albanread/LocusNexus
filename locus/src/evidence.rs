@@ -171,6 +171,12 @@ pub fn analyze(ir: &Ir) -> Report {
 
 fn walk(ir: &Ir, ev: &[Ev], sites: &mut Vec<Site>) {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            for bind in binds {
+                walk_comp(&bind.comp, ev, sites);
+            }
+            walk_comp(comp, ev, sites);
+        }
         Ir::Let { comp, rest, .. } => {
             walk_comp(comp, ev, sites);
             walk(rest, ev, sites);
@@ -340,6 +346,13 @@ pub fn clause_shape(resume: &str, body: &Ir) -> Shape {
 /// inner binder of the same name only ever *raises* the count — safe).
 fn count_var(name: &str, ir: &Ir) -> usize {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            binds
+                .iter()
+                .map(|bind| count_var_comp(name, &bind.comp))
+                .sum::<usize>()
+                + count_var_comp(name, comp)
+        }
         Ir::Let { comp, rest, .. } => count_var_comp(name, comp) + count_var(name, rest),
         Ir::Ret { comp, .. } => count_var_comp(name, comp),
     }
@@ -430,6 +443,7 @@ fn count_var_comp(name: &str, c: &Comp) -> usize {
 fn is_tail_resume(name: &str, body: &Ir) -> bool {
     fn tail(ir: &Ir) -> &Comp {
         match ir {
+            Ir::Block { comp, .. } => comp,
             Ir::Let { rest, .. } => tail(rest),
             Ir::Ret { comp, .. } => comp,
         }

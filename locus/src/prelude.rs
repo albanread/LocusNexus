@@ -46,7 +46,7 @@ pub fn op_label(name: &str) -> Label {
 /// types, i.e. the ABIs of the prelowered runtime functions. Loaded by the CLI
 /// so a program can call the natives without declaring them.
 ///
-/// (`writeln`/`print` are intended as stdlib sugar over `perform console`;
+/// (`console_writeln`/`print` are intended as stdlib sugar over `perform console`;
 /// that surface belongs in the in-language library, not hard-coded here.)
 pub fn sig() -> Sig {
     Sig::from([

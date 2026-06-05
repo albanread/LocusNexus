@@ -1,29 +1,57 @@
-module Console at services seals (winapi) =
--- stdlib LAYER 1: console — the `console` capability, SEALING winapi.
---
--- `writeln` performs the `console` effect (it does not name `winapi`). THIS
--- handler discharges `console` by doing the real Win32 output with the layer-0
--- imports (in scope from further out). So only this layer demands `{winapi}`; the
--- app's row says `{console}`, never `{winapi}` — the capability seal: the app
--- cannot reach the boundary, only the console capability can. Replace the handler
--- with a different `console` clause (a test double, a GUI, a log) and the app is
--- unchanged.
---
--- `writeln` is defined INSIDE the handler's scrutinee, so its `perform console`
--- is lowered with this handler in scope — the tail clause inlines at the perform
--- site (no reified continuation), even inside `writeln`'s lifted body.
+module Console at services seals (winapi, mem) exposing
+  (console_write, console_writeln, console_write_char, console_read_char, console_read_line,
+   console_clear_screen, console_set_cursor, console_write_at, console_screen_size,
+   console_write_float) =
+-- stdlib LAYER 1: controlled console service over the hidden Windows boundary.
+
+effect console_write_op : String -> Unit in
+effect console_writeln_op : String -> Unit in
+effect console_write_char_op : Int -> Unit in
+effect console_read_char_op : Unit -> Int in
+effect console_read_line_op : Unit -> String in
+effect console_clear_screen_op : Unit -> Unit in
+effect console_set_cursor_op : (Int, Int) -> Unit in
+effect console_write_at_op : (Int, Int, String) -> Unit in
+effect console_screen_size_op : Unit -> (Int, Int) in
 
 handle
-  (let writeln = fn s: String => perform console s in
-   let writelnFloat = fn x: Float => perform console_float x in
-   ())                                                  -- placeholder: the app program
+  do {
+    let console_write = fn s: String => console_write_op s;
+    let console_writeln = fn s: String => console_writeln_op s;
+    let console_write_char = fn ch: Int => console_write_char_op ch;
+    let console_read_char = fn u: Unit => console_read_char_op u;
+    let console_read_line = fn u: Unit => console_read_line_op u;
+    let console_clear_screen = fn u: Unit => console_clear_screen_op u;
+    let console_set_cursor = fn x: Int => fn y: Int => console_set_cursor_op (x, y);
+    let console_write_at = fn x: Int => fn y: Int => fn s: String => console_write_at_op (x, y, s);
+    let console_screen_size = fn u: Unit => console_screen_size_op u;
+    let console_write_float = fn x: Float => console_float x;
+  }
 with {
-  console(s) =>
-    let out  = getstdhandle (0 - 11) in                 -- STD_OUTPUT_HANDLE = -11
-    let data = virtualalloc 0 4096 12288 4 in           -- 4 KiB: MEM_COMMIT|RESERVE, PAGE_READWRITE
-    let cnt  = virtualalloc 0 8 12288 4 in              -- a DWORD for lpNumberOfBytesWritten
-    let n    = widetoutf8 65001 0 s (0 - 1) data 4096 0 0 in  -- CP_UTF8, NUL-terminated
-    let ok   = writefile out data (n - 1) cnt 0 in      -- emit n-1 bytes (drop the NUL)
-    resume () ;
-  return(x) => x
+  console_write_op(s) -> do {
+    let _ = win_write_console s;
+  } ;
+  console_writeln_op(s) -> do {
+    let _ = win_write_console s;
+    let _ = win_write_unit 13;
+    let _ = win_write_unit 10;
+  } ;
+  console_write_char_op(ch) -> do {
+    let _ = win_write_unit ch;
+  } ;
+  console_read_char_op(u) -> win_read_unit () ;
+  console_read_line_op(u) -> win_read_line () ;
+  console_clear_screen_op(u) -> do {
+    let _ = win_clear_screen ();
+  } ;
+  console_set_cursor_op(pos) -> do {
+    let (x, y) = pos;
+    let _ = win_set_cursor x y;
+  } ;
+  console_write_at_op(args) -> do {
+    let (x, y, s) = args;
+    let _ = win_set_cursor x y;
+    let _ = win_write_console s;
+  } ;
+  console_screen_size_op(u) -> ((win_console_width ()), (win_console_height ()))
 }

@@ -11,7 +11,8 @@
 
 use std::collections::BTreeMap;
 
-use locus::{Handler, OpClause, Return, Row, Term, Type};
+use locus::syntax::InstanceMethod;
+use locus::{BlockItem, Handler, OpClause, Return, Row, Term, Type};
 use locus_winapi::{FunctionInfo, TypeRef};
 
 /// `symbol → dll` for every Win32 function a program demands.
@@ -100,6 +101,37 @@ fn bx(t: Term) -> Box<Term> {
     Box::new(t)
 }
 
+fn walk_block_item(item: BlockItem, d: &mut Demanded) -> Result<BlockItem, String> {
+    Ok(match item {
+        BlockItem::Let(n, e) => BlockItem::Let(n, walk(e, d)?),
+        BlockItem::LetRec(n, ty, e) => BlockItem::LetRec(n, ty, walk(e, d)?),
+        BlockItem::LetMut(n, e) => BlockItem::LetMut(n, walk(e, d)?),
+        BlockItem::LetTuple(names, e) => BlockItem::LetTuple(names, walk(e, d)?),
+        BlockItem::Instance {
+            trait_name,
+            head,
+            requires,
+            methods,
+            module,
+        } => BlockItem::Instance {
+            trait_name,
+            head,
+            requires,
+            methods: methods
+                .into_iter()
+                .map(|m| {
+                    Ok::<_, String>(InstanceMethod {
+                        name: m.name,
+                        body: walk(m.body, d)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            module,
+        },
+        BlockItem::Effect { .. } | BlockItem::TypeDef { .. } | BlockItem::Trait { .. } => item,
+    })
+}
+
 fn walk(t: Term, d: &mut Demanded) -> Result<Term, String> {
     use Term::*;
     Ok(match t {
@@ -132,6 +164,13 @@ fn walk(t: Term, d: &mut Demanded) -> Result<Term, String> {
         // a DLL — pass it through untouched (no oracle lookup, no demanded DLL).
         ExternAsm(sym, ty) => ExternAsm(sym, ty),
         Let(n, e, b) => Let(n, bx(walk(*e, d)?), bx(walk(*b, d)?)),
+        Block(items, body) => Block(
+            items
+                .into_iter()
+                .map(|item| walk_block_item(item, d))
+                .collect::<Result<Vec<_>, _>>()?,
+            bx(walk(*body, d)?),
+        ),
         LetRec(n, ty, e, b) => LetRec(n, ty, bx(walk(*e, d)?), bx(walk(*b, d)?)),
         Lam(p, ty, b) => Lam(p, ty, bx(walk(*b, d)?)),
         App(f, a) => App(bx(walk(*f, d)?), bx(walk(*a, d)?)),
@@ -220,6 +259,28 @@ mod tests {
     }
 
     #[test]
+    fn resolves_bare_extern_inside_compacted_block() {
+        let term = Term::Block(
+            vec![BlockItem::Let(
+                "getStdHandle".into(),
+                Term::Extern("GetStdHandle".into(), None, None),
+            )],
+            Box::new(Term::Var("getStdHandle".into())),
+        );
+        let (resolved, demanded) = resolve(term).unwrap();
+        assert_eq!(
+            demanded.get("GetStdHandle").map(String::as_str),
+            Some("kernel32.dll")
+        );
+        let Term::Block(items, _) = resolved else {
+            panic!("expected compacted block");
+        };
+        let BlockItem::Let(_, Term::Extern(_, Some(_), _)) = &items[0] else {
+            panic!("expected filled extern in block, got {items:?}");
+        };
+    }
+
+    #[test]
     fn an_unknown_symbol_is_an_error() {
         let term = locus::parse(r#"extern "NoSuchWin32Fn""#).unwrap();
         assert!(resolve(term).is_err());
@@ -234,6 +295,36 @@ mod tests {
             demanded.get("pow").map(String::as_str),
             Some("ucrtbase.dll"),
             "an explicit CRT math extern demands the UCRT, not the Win32 oracle"
+        );
+    }
+
+    #[test]
+    fn explicit_wincred_externs_demand_advapi32() {
+        assert_eq!(
+            locus_winapi::find_function_any_dll("CredReadW").map(|f| f.dll.as_str()),
+            Some("advapi32.dll"),
+            "CredReadW should come from the WinAPI corpus"
+        );
+        assert_eq!(
+            locus_winapi::find_function_any_dll("CredFree").map(|f| f.dll.as_str()),
+            Some("advapi32.dll"),
+            "CredFree should come from the WinAPI corpus"
+        );
+        let term = locus::parse(
+            r#"let read = extern "CredReadW" : Ptr -> U32 -> U32 -> Ptr -> I32 in
+               let free = extern "CredFree" : Ptr -> Unit in
+               let _ = free 0 in
+               read 0 1 0 0"#,
+        )
+        .unwrap();
+        let (_t, demanded) = resolve(term).unwrap();
+        assert_eq!(
+            demanded.get("CredReadW").map(String::as_str),
+            Some("advapi32.dll")
+        );
+        assert_eq!(
+            demanded.get("CredFree").map(String::as_str),
+            Some("advapi32.dll")
         );
     }
 

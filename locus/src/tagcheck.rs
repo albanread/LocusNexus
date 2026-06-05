@@ -62,6 +62,7 @@
 //! no-ops *by construction* (the binder's / lambda codomain's type **is** the
 //! value's type — slot equals value, no boundary). See the per-arm notes below.
 
+use crate::sema::TypedBlockItem;
 use crate::sema::{MatchArmT, Node, Typed, TypedHandler};
 use crate::syntax::{Coercion, Type};
 use crate::unify;
@@ -253,6 +254,16 @@ fn visit(t: &Typed) -> Result<(), TagError> {
         // `Let` row is a no-op until generic let-stored values exist). Visit both.
         Node::Let { bound, body, .. } | Node::LetTuple(_, bound, body) => {
             visit(bound)?;
+            visit(body)
+        }
+        Node::Block { items, body } => {
+            for item in items {
+                match item {
+                    TypedBlockItem::Let { bound, .. }
+                    | TypedBlockItem::LetMut { bound, .. }
+                    | TypedBlockItem::LetTuple { bound, .. } => visit(bound)?,
+                }
+            }
             visit(body)
         }
 

@@ -12,16 +12,27 @@
 //!           | "let" "rec" id ":" type "=" expr "in" expr
 //!           | "fn" id (":" type)? "=>" expr
 //!           | "extern" string ":" type
-//!           | "handle" expr "with" "{" opclause* "return" "(" id ")" "=>" expr "}"
+//!           | "handle" expr "with" "{" opclause* returnclause? "}"
 //!           | "if" expr "then" expr "else" expr
-//!           | cmp
-//!   opclause := id "(" id ")" "=>" expr ";"        -- op(arg) => body ; (`resume` is in scope)
-//!   cmp    := add (("==" | "<") add)?               -- comparison, non-chaining → Bool
+//!           | "case" expr "of" ("|" expr "=>" expr)+ "|" "_" "=>" expr
+//!           | "cond" ("|" expr "=>" expr)+ "|" "_" "=>" expr
+//!           | "do" "{" dostmt* expr? "}"
+//!           | "loop" id "=" expr ("," id "=" expr)* "while" expr "do" expr ("," expr)* ("return" expr | "else" expr | "endloop")
+//!           | logic
+//!   opclause := id "(" id ")" ("=>" expr | "->" expr) ";"?
+//!   returnclause := "return" "(" id ")" "=>" expr
+//!   dostmt := "let" id "=" expr ";" | expr ";"
+//!   logic := logic_or                               -- short-circuit Bool sugar
+//!   logic_or  := logic_and ("||" logic_and)*
+//!   logic_and := cmp ("&&" cmp)*
+//!   cmp    := bitor (("==" | "!=" | "<" | "<=" | ">" | ">=") bitor)?
+//!                                                        -- comparison, non-chaining → Bool
 //!   add    := mul (("+" | "+%" | "+?" | "-" | "-%" | "-?") mul)*
 //!                                                        -- additive, left-assoc
-//!   mul    := app (("*" | "*%" | "*?") app)*        -- multiplicative, left-assoc
+//!   mul    := app (("*" | "*%" | "*?" | "/" | "%") app)*
+//!                                                        -- multiplicative, left-assoc
 //!   app    := atom atom*                            -- application, left-assoc
-//!   atom   := int | string | "true" | "false" | "(" ")" | "(" expr ")" | id
+//!   atom   := int | string | "true" | "false" | "~" atom | "(" ")" | "(" expr ")" | id
 //!           | "perform" id atom | "quote" "(" expr ")" | "${" expr "}"
 //!           | "genlet" "(" expr ")" | "letloc" "{" expr "}"
 //!           | "sqrt" atom | "fma" "(" expr "," expr "," expr ")"
@@ -58,6 +69,7 @@ pub fn parse(src: &str) -> Result<Term, ParseErr> {
         toks,
         pos: 0,
         bar_is_arm: false,
+        sugar_id: 0,
         row_vars: HashMap::new(),
         current_mint: None,
     };
@@ -80,6 +92,7 @@ pub fn parse_program(src: &str) -> Result<ProgramSource, ParseErr> {
         toks,
         pos: 0,
         bar_is_arm: false,
+        sugar_id: 0,
         row_vars: HashMap::new(),
         current_mint: None,
     };
@@ -117,6 +130,7 @@ pub fn parse_module(src: &str) -> Result<ModuleDecl, ParseErr> {
         toks,
         pos: 0,
         bar_is_arm: false,
+        sugar_id: 0,
         row_vars: HashMap::new(),
         current_mint: None,
     };
@@ -142,6 +156,7 @@ pub fn type_from_text(src: &str) -> Result<Type, ParseErr> {
         toks,
         pos: 0,
         bar_is_arm: false,
+        sugar_id: 0,
         row_vars: HashMap::new(),
         current_mint: None,
     };
@@ -163,6 +178,7 @@ pub fn label_from_text(src: &str) -> Result<Label, ParseErr> {
         toks,
         pos: 0,
         bar_is_arm: false,
+        sugar_id: 0,
         row_vars: HashMap::new(),
         current_mint: None,
     };
@@ -197,7 +213,11 @@ enum Tok {
     Bang,  // !  (a type's latent effect row: `A -> B ! {mem}`)
     Eq,
     EqEq,         // ==
+    Ne,           // !=
     Lt,           // <
+    Le,           // <=
+    Gt,           // >
+    Ge,           // >=
     Plus,         // +
     PlusWrap,     // +%
     PlusChecked,  // +?
@@ -208,6 +228,10 @@ enum Tok {
     StarWrap,     // *%
     StarChecked,  // *?
     Slash,        // /
+    Percent,      // %
+    AndAnd,       // &&
+    OrOr,         // ||
+    Tilde,        // ~
     Amp,          // &
     Bar,          // |
     Caret,        // ^
@@ -281,6 +305,10 @@ fn tokenize(src: &str) -> Result<Vec<(Tok, Span)>, ParseErr> {
                 i += 1;
                 Tok::Dot
             }
+            '!' if b.get(i + 1) == Some(&b'=') => {
+                i += 2;
+                Tok::Ne
+            }
             '!' => {
                 i += 1;
                 Tok::Bang
@@ -348,6 +376,10 @@ fn tokenize(src: &str) -> Result<Vec<(Tok, Span)>, ParseErr> {
                 i += 1;
                 Tok::Slash
             }
+            '%' => {
+                i += 1;
+                Tok::Percent
+            }
             '<' if b.get(i + 1) == Some(&b'<') => {
                 i += 2;
                 Tok::Shl
@@ -356,21 +388,45 @@ fn tokenize(src: &str) -> Result<Vec<(Tok, Span)>, ParseErr> {
                 i += 2;
                 Tok::LArrow
             }
+            '<' if b.get(i + 1) == Some(&b'=') => {
+                i += 2;
+                Tok::Le
+            }
             '<' => {
                 i += 1;
                 Tok::Lt
+            }
+            '>' if b.get(i + 1) == Some(&b'=') => {
+                i += 2;
+                Tok::Ge
             }
             '>' if b.get(i + 1) == Some(&b'>') => {
                 i += 2;
                 Tok::Shr
             }
+            '>' => {
+                i += 1;
+                Tok::Gt
+            }
+            '&' if b.get(i + 1) == Some(&b'&') => {
+                i += 2;
+                Tok::AndAnd
+            }
             '&' => {
                 i += 1;
                 Tok::Amp
             }
+            '|' if b.get(i + 1) == Some(&b'|') => {
+                i += 2;
+                Tok::OrOr
+            }
             '|' => {
                 i += 1;
                 Tok::Bar
+            }
+            '~' => {
+                i += 1;
+                Tok::Tilde
             }
             '^' => {
                 i += 1;
@@ -526,6 +582,10 @@ struct Parser {
     /// `bitor` leaves it for the arm loop. Cleared inside `(`/`[`/`{` (where a
     /// `|` is unambiguously bitwise). Set only while parsing a match-arm body.
     bar_is_arm: bool,
+    /// Parser-only counter for hygienic sugar binders. The generated names contain
+    /// a control character the lexer cannot produce, so user code cannot capture
+    /// or shadow them.
+    sugar_id: usize,
     /// Parser-only row variable names seen in annotation rows. The resulting
     /// placeholder ids are rewritten to real unification vars in sema.
     row_vars: HashMap<String, RowVarId>,
@@ -533,6 +593,14 @@ struct Parser {
     /// (`mints (L)`), stamped onto each `extern` so sema injects `L` rather than
     /// the default `winapi`. `None` outside a minting module (⟹ `winapi`).
     current_mint: Option<Label>,
+}
+
+enum DoItem {
+    Let(String, Term),
+    LetMut(String, Term),
+    LetRec(String, Type, Term),
+    LetTuple(Vec<String>, Term),
+    Expr(String, Term),
 }
 
 /// The canonical effect [`Label`] for a name written in a type's effect row
@@ -547,7 +615,9 @@ fn row_label(name: &str) -> Label {
         // (native residuals, `is_native`), not user effects, so a service may
         // *seal* them. A new boundary provider adds its label to this list (the
         // one place a name is designated a raw power).
-        "mem" | "winapi" | "crt" | "libc" | "libm" | "asm" => Label::World(name.to_string()),
+        "mem" | "winapi" | "crt" | "libc" | "libm" | "asm" | "agent" => {
+            Label::World(name.to_string())
+        }
         other => crate::prelude::op_label(other),
     }
 }
@@ -566,9 +636,13 @@ fn is_stop_word(s: &str) -> bool {
             | "if"
             | "then"
             | "else"
+            | "endloop"
             | "loop"
             | "while"
             | "do"
+            | "case"
+            | "of"
+            | "cond"
             | "extern"
             | "type"
             | "match"
@@ -625,6 +699,177 @@ impl Parser {
             }
             _ => Err(self.err(format!("expected an identifier, found {:?}", self.peek()))),
         }
+    }
+
+    fn fresh_sugar_name(&mut self, label: &str) -> String {
+        let id = self.sugar_id;
+        self.sugar_id += 1;
+        format!("\u{1}{label}#{id}")
+    }
+
+    fn is_wild_arm(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(s)) if s == "_")
+    }
+
+    fn arm_body(&mut self) -> Result<Term, ParseErr> {
+        let saved = self.bar_is_arm;
+        self.bar_is_arm = true;
+        let body = self.expr();
+        self.bar_is_arm = saved;
+        body
+    }
+
+    fn nest_if_arms(arms: Vec<(Term, Term)>, default: Term) -> Term {
+        arms.into_iter().rev().fold(default, |els, (cond, body)| {
+            Term::If(Box::new(cond), Box::new(body), Box::new(els))
+        })
+    }
+
+    fn parse_cond_sugar(&mut self) -> Result<Term, ParseErr> {
+        self.eat_kw("cond")?;
+        let mut arms = Vec::new();
+        let mut default = None;
+        let mut saw_arm = false;
+        while self.peek() == Some(&Tok::Bar) {
+            self.bump();
+            saw_arm = true;
+            if default.is_some() {
+                return Err(self.err("`cond` default `_` arm must be last"));
+            }
+            if self.is_wild_arm() {
+                self.bump();
+                self.eat(&Tok::FatArrow)?;
+                default = Some(self.arm_body()?);
+            } else {
+                let pred = self.expr()?;
+                self.eat(&Tok::FatArrow)?;
+                let body = self.arm_body()?;
+                arms.push((pred, body));
+            }
+        }
+        if !saw_arm {
+            return Err(self.err("`cond` expects at least one `| predicate => expr` arm"));
+        }
+        let default = default.ok_or_else(|| self.err("`cond` requires a final `_` default arm"))?;
+        Ok(Self::nest_if_arms(arms, default))
+    }
+
+    fn parse_case_sugar(&mut self) -> Result<Term, ParseErr> {
+        self.eat_kw("case")?;
+        let scrutinee = self.expr()?;
+        self.eat_kw("of")?;
+        let tmp = self.fresh_sugar_name("case");
+        let mut arms = Vec::new();
+        let mut default = None;
+        let mut saw_arm = false;
+        while self.peek() == Some(&Tok::Bar) {
+            self.bump();
+            saw_arm = true;
+            if default.is_some() {
+                return Err(self.err("`case` default `_` arm must be last"));
+            }
+            if self.is_wild_arm() {
+                self.bump();
+                self.eat(&Tok::FatArrow)?;
+                default = Some(self.arm_body()?);
+            } else {
+                let key = self.expr()?;
+                self.eat(&Tok::FatArrow)?;
+                let body = self.arm_body()?;
+                let cond = Term::Bin(BinOp::Eq, Box::new(Term::Var(tmp.clone())), Box::new(key));
+                arms.push((cond, body));
+            }
+        }
+        if !saw_arm {
+            return Err(self.err("`case` expects at least one `| value => expr` arm"));
+        }
+        let default = default.ok_or_else(|| self.err("`case` requires a final `_` default arm"))?;
+        Ok(Term::Let(
+            tmp,
+            Box::new(scrutinee),
+            Box::new(Self::nest_if_arms(arms, default)),
+        ))
+    }
+
+    fn nest_do_items(items: Vec<DoItem>, tail: Term) -> Term {
+        items.into_iter().rev().fold(tail, |body, item| match item {
+            DoItem::Let(name, value) => Term::Let(name, Box::new(value), Box::new(body)),
+            DoItem::LetMut(name, value) => Term::LetMut(name, Box::new(value), Box::new(body)),
+            DoItem::LetRec(name, ty, value) => {
+                Term::LetRec(name, ty, Box::new(value), Box::new(body))
+            }
+            DoItem::LetTuple(names, value) => {
+                Term::LetTuple(names, Box::new(value), Box::new(body))
+            }
+            DoItem::Expr(name, value) => Term::Let(name, Box::new(value), Box::new(body)),
+        })
+    }
+
+    fn parse_do_let_item(&mut self) -> Result<DoItem, ParseErr> {
+        self.eat_kw("let")?;
+        if self.is_kw("mut") {
+            self.eat_kw("mut")?;
+            let name = self.ident()?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            Ok(DoItem::LetMut(name, value))
+        } else if self.is_kw("rec") {
+            self.eat_kw("rec")?;
+            let name = self.ident()?;
+            self.eat(&Tok::Colon)?;
+            let ty = self.ty()?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            Ok(DoItem::LetRec(name, ty, value))
+        } else if self.peek() == Some(&Tok::LParen) {
+            self.bump();
+            let mut names = vec![self.ident()?];
+            while self.peek() == Some(&Tok::Comma) {
+                self.bump();
+                names.push(self.ident()?);
+            }
+            self.eat(&Tok::RParen)?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            Ok(DoItem::LetTuple(names, value))
+        } else {
+            let name = self.ident()?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            Ok(DoItem::Let(name, value))
+        }
+    }
+
+    fn parse_do_sugar(&mut self) -> Result<Term, ParseErr> {
+        self.eat_kw("do")?;
+        self.eat(&Tok::LBrace)?;
+        let mut items = Vec::new();
+        let mut tail = None;
+        while self.peek() != Some(&Tok::RBrace) {
+            if self.is_kw("let") {
+                items.push(self.parse_do_let_item()?);
+                if self.peek() == Some(&Tok::Semi) {
+                    self.bump();
+                    continue;
+                }
+                if self.peek() == Some(&Tok::RBrace) {
+                    break;
+                }
+                return Err(self.err("expected `;` after `do` block let statement"));
+            }
+
+            let value = self.expr()?;
+            if self.peek() == Some(&Tok::Semi) {
+                self.bump();
+                let name = self.fresh_sugar_name("do");
+                items.push(DoItem::Expr(name, value));
+            } else {
+                tail = Some(value);
+                break;
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Self::nest_do_items(items, tail.unwrap_or(Term::Unit)))
     }
 
     fn effect_label(&mut self) -> Result<Label, ParseErr> {
@@ -907,6 +1152,39 @@ impl Parser {
                 body: Box::new(body),
             });
         }
+        if self.is_kw("effect") {
+            self.eat_kw("effect")?;
+            let name = self.ident()?;
+            let ops = if self.peek() == Some(&Tok::LBrace) {
+                self.bump();
+                let mut ops = Vec::new();
+                while self.peek() != Some(&Tok::RBrace) {
+                    ops.push(self.op_decl()?);
+                    if self.peek() == Some(&Tok::Semi) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                ops
+            } else {
+                self.eat(&Tok::Colon)?;
+                let (param, result) = self.op_sig()?;
+                vec![OpDecl {
+                    op: name.clone(),
+                    param,
+                    result,
+                }]
+            };
+            self.eat_kw("in")?;
+            let body = self.module_body()?;
+            return Ok(Term::Effect {
+                name,
+                ops,
+                body: Box::new(body),
+            });
+        }
         if self.is_kw("trait") {
             let (name, param, supers, methods) = self.trait_decl_head()?;
             self.eat_kw("in")?;
@@ -1027,6 +1305,12 @@ impl Parser {
             self.eat_kw("else")?;
             let els = self.expr()?;
             Ok(Term::If(Box::new(cond), Box::new(then), Box::new(els)))
+        } else if self.is_kw("case") {
+            self.parse_case_sugar()
+        } else if self.is_kw("cond") {
+            self.parse_cond_sugar()
+        } else if self.is_kw("do") {
+            self.parse_do_sugar()
         } else if self.is_kw("loop") {
             self.eat_kw("loop")?;
             let mut vars = Vec::new();
@@ -1053,8 +1337,18 @@ impl Parser {
                     break;
                 }
             }
-            self.eat_kw("else")?;
-            let result = self.expr()?;
+            let result = if self.is_kw("return") {
+                self.eat_kw("return")?;
+                self.expr()?
+            } else if self.is_kw("else") {
+                self.eat_kw("else")?;
+                self.expr()?
+            } else if self.is_kw("endloop") {
+                self.eat_kw("endloop")?;
+                Term::Unit
+            } else {
+                return Err(self.err("expected `return`, `else`, or `endloop` after loop steps"));
+            };
             Ok(Term::Loop {
                 vars,
                 cond: Box::new(cond),
@@ -1115,10 +1409,7 @@ impl Parser {
                 // Parse the arm body with `|` as the arm separator (so the body
                 // doesn't swallow the next arm); a bitwise `|` in the body must be
                 // parenthesised.
-                let saved = self.bar_is_arm;
-                self.bar_is_arm = true;
-                let body = self.expr()?;
-                self.bar_is_arm = saved;
+                let body = self.arm_body()?;
                 arms.push(MatchArm { pat, body });
             }
             Ok(Term::Match {
@@ -1193,23 +1484,50 @@ impl Parser {
                 body: Box::new(body),
             })
         } else {
-            self.cmp()
+            self.logic_or()
         }
     }
 
     // Precedence ladder, loosest → tightest:
-    //   cmp (== <) → bitor (| ^) → bitand (&) → add (+ -) → shift (<< >>)
+    //   cmp (== != < <= > >=) → bitor (| ^) → bitand (&) → add (+ -) → shift (<< >>)
     //   → mul (*) → app
     // Comparison is the LOOSEST (so `a & b == c` is `(a & b) == c`, not C's
     // footgun `a & (b == c)`); bitwise binds looser than arithmetic; shifts sit
     // just under multiply (so `x << 2 + 1` is `(x << 2) + 1`).
 
-    /// Comparison `bitor (("==" | "<") bitor)?` — non-chaining, yields `Bool`.
+    /// Logical OR `logic_and ("||" logic_and)*`, short-circuiting.
+    fn logic_or(&mut self) -> Result<Term, ParseErr> {
+        let mut lhs = self.logic_and()?;
+        while self.peek() == Some(&Tok::OrOr) {
+            self.bump();
+            let rhs = self.logic_and()?;
+            lhs = Term::If(Box::new(lhs), Box::new(Term::Bool(true)), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    /// Logical AND `cmp ("&&" cmp)*`, short-circuiting.
+    fn logic_and(&mut self) -> Result<Term, ParseErr> {
+        let mut lhs = self.cmp()?;
+        while self.peek() == Some(&Tok::AndAnd) {
+            self.bump();
+            let rhs = self.cmp()?;
+            lhs = Term::If(Box::new(lhs), Box::new(rhs), Box::new(Term::Bool(false)));
+        }
+        Ok(lhs)
+    }
+
+    /// Comparison `bitor (("==" | "!=" | "<" | "<=" | ">" | ">=") bitor)?`
+    /// — non-chaining, yields `Bool`.
     fn cmp(&mut self) -> Result<Term, ParseErr> {
         let lhs = self.bitor()?;
         let op = match self.peek() {
             Some(Tok::EqEq) => BinOp::Eq,
+            Some(Tok::Ne) => BinOp::Ne,
             Some(Tok::Lt) => BinOp::Lt,
+            Some(Tok::Le) => BinOp::Le,
+            Some(Tok::Gt) => BinOp::Gt,
+            Some(Tok::Ge) => BinOp::Ge,
             _ => return Ok(lhs),
         };
         self.bump();
@@ -1282,7 +1600,7 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// Multiplicative `app (("*" | "*%" | "*?" | "/") app)*`.
+    /// Multiplicative `app (("*" | "*%" | "*?" | "/" | "%") app)*`.
     fn mul(&mut self) -> Result<Term, ParseErr> {
         let mut lhs = self.app()?;
         loop {
@@ -1291,6 +1609,7 @@ impl Parser {
                 Some(Tok::StarWrap) => BinOp::MulWrap,
                 Some(Tok::StarChecked) => BinOp::MulChecked,
                 Some(Tok::Slash) => BinOp::Div,
+                Some(Tok::Percent) => BinOp::Mod,
                 _ => break,
             };
             self.bump();
@@ -1306,14 +1625,28 @@ impl Parser {
         self.eat_kw("with")?;
         self.eat(&Tok::LBrace)?;
         let mut ops = Vec::new();
-        while !self.is_kw("return") {
+        while !self.is_kw("return") && self.peek() != Some(&Tok::RBrace) {
             let op = self.ident()?;
             self.eat(&Tok::LParen)?;
             let arg = self.ident()?;
             self.eat(&Tok::RParen)?;
-            self.eat(&Tok::FatArrow)?;
-            let body = self.expr()?;
-            self.eat(&Tok::Semi)?;
+            let body = match self.peek() {
+                Some(Tok::FatArrow) => {
+                    self.bump();
+                    self.expr()?
+                }
+                Some(Tok::Arrow) => {
+                    self.bump();
+                    let value = self.expr()?;
+                    Term::App(Box::new(Term::Var("resume".into())), Box::new(value))
+                }
+                _ => return Err(self.err("expected `=>` or `->` in handler arm")),
+            };
+            if self.peek() == Some(&Tok::Semi) {
+                self.bump();
+            } else if !self.is_kw("return") && self.peek() != Some(&Tok::RBrace) {
+                return Err(self.err("expected `;` between handler arms"));
+            }
             ops.push(OpClause {
                 // Same canonicalisation as `perform`, so a `console(s) => …`
                 // clause discharges a `perform console …`.
@@ -1323,22 +1656,28 @@ impl Parser {
                 body: Box::new(body),
             });
         }
-        self.eat_kw("return")?;
-        self.eat(&Tok::LParen)?;
-        let var = self.ident()?;
-        self.eat(&Tok::RParen)?;
-        self.eat(&Tok::FatArrow)?;
-        let rbody = self.expr()?;
+        let ret = if self.is_kw("return") {
+            self.eat_kw("return")?;
+            self.eat(&Tok::LParen)?;
+            let var = self.ident()?;
+            self.eat(&Tok::RParen)?;
+            self.eat(&Tok::FatArrow)?;
+            let rbody = self.expr()?;
+            Return {
+                var,
+                body: Box::new(rbody),
+            }
+        } else {
+            let var = self.fresh_sugar_name("return");
+            Return {
+                var: var.clone(),
+                body: Box::new(Term::Var(var)),
+            }
+        };
         self.eat(&Tok::RBrace)?;
         Ok(Term::Handle(
             Box::new(scrutinee),
-            Box::new(Handler {
-                ops,
-                ret: Return {
-                    var,
-                    body: Box::new(rbody),
-                },
-            }),
+            Box::new(Handler { ops, ret }),
         ))
     }
 
@@ -1357,6 +1696,9 @@ impl Parser {
             | Some(Tok::Float(_))
             | Some(Tok::Str(_))
             | Some(Tok::LParen)
+            // `~b` is Bool negation sugar, kept away from the effect-row `!`
+            // spelling. It heads an atom so `~b && c` is `(~b) && c`.
+            | Some(Tok::Tilde)
             // A leading `!` heads a deref atom (`f !r` = `f (!r)`); unambiguous in
             // expression position (the type-row `!` only follows `->` in a type).
             | Some(Tok::Bang)
@@ -1522,6 +1864,17 @@ impl Parser {
                 let e = self.expr()?;
                 self.eat(&Tok::RBrace)?;
                 Ok(Term::Splice(Box::new(e)))
+            }
+            // `~b` — Bool negation sugar. It lowers to `if b then false else true`
+            // so core Locus and effect inference stay unchanged.
+            Some(Tok::Tilde) => {
+                self.bump();
+                let cond = self.atom()?;
+                Ok(Term::If(
+                    Box::new(cond),
+                    Box::new(Term::Bool(false)),
+                    Box::new(Term::Bool(true)),
+                ))
             }
             // `!r` — dereference (read) a `Ref[T]` heap cell (`docs/mutability.md`
             // §1). A prefix `!` over an atom: `!r + 1` is `(!r) + 1`, `!a[i]` is
@@ -2143,6 +2496,22 @@ mod tests {
             parse("a < b").unwrap(),
             Term::Bin(BinOp::Lt, _, _)
         ));
+        assert!(matches!(
+            parse("a <= b").unwrap(),
+            Term::Bin(BinOp::Le, _, _)
+        ));
+        assert!(matches!(
+            parse("a > b").unwrap(),
+            Term::Bin(BinOp::Gt, _, _)
+        ));
+        assert!(matches!(
+            parse("a >= b").unwrap(),
+            Term::Bin(BinOp::Ge, _, _)
+        ));
+        assert!(matches!(
+            parse("a != b").unwrap(),
+            Term::Bin(BinOp::Ne, _, _)
+        ));
     }
 
     #[test]
@@ -2166,6 +2535,127 @@ mod tests {
     }
 
     #[test]
+    fn endloop_parses_as_unit_loop_result() {
+        let t = parse("loop i = 0 while i < 10 do i + 1 endloop").unwrap();
+        let Term::Loop { steps, result, .. } = t else {
+            panic!("expected loop")
+        };
+        assert_eq!(steps.len(), 1);
+        assert_eq!(*result, Term::Unit);
+    }
+
+    #[test]
+    fn loop_return_parses_as_loop_result() {
+        let t = parse("loop i = 0, acc = 0 while i < 10 do i + 1, acc + i return acc").unwrap();
+        let Term::Loop { steps, result, .. } = t else {
+            panic!("expected loop")
+        };
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(*result, Term::Var(ref x) if x == "acc"));
+    }
+
+    #[test]
+    fn case_sugar_desugars_to_let_and_ifs() {
+        let t = parse("case x + 1 of | 1 => 10 | 2 => 20 | _ => 30").unwrap();
+        let Term::Let(tmp, scrutinee, body) = t else {
+            panic!("case sugar should desugar to a let-bound scrutinee")
+        };
+        assert!(
+            tmp.starts_with('\u{1}'),
+            "generated binder should be hidden"
+        );
+        assert!(matches!(*scrutinee, Term::Bin(BinOp::Add, _, _)));
+
+        let Term::If(cond1, then1, else1) = *body else {
+            panic!("case sugar should desugar to nested ifs")
+        };
+        assert_eq!(*then1, Term::Int(10));
+        match *cond1 {
+            Term::Bin(BinOp::Eq, lhs, rhs) => {
+                assert_eq!(*lhs, Term::Var(tmp.clone()));
+                assert_eq!(*rhs, Term::Int(1));
+            }
+            other => panic!("first case condition should be equality, got {other:?}"),
+        }
+
+        let Term::If(cond2, then2, else2) = *else1 else {
+            panic!("second case arm should be the nested else")
+        };
+        assert_eq!(*then2, Term::Int(20));
+        assert_eq!(*else2, Term::Int(30));
+        match *cond2 {
+            Term::Bin(BinOp::Eq, lhs, rhs) => {
+                assert_eq!(*lhs, Term::Var(tmp));
+                assert_eq!(*rhs, Term::Int(2));
+            }
+            other => panic!("second case condition should be equality, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cond_sugar_desugars_to_ifs() {
+        let t = parse("cond | x < 0 => 1 | x == 0 => 2 | _ => 3").unwrap();
+        let Term::If(cond1, then1, else1) = t else {
+            panic!("cond sugar should desugar to nested ifs")
+        };
+        assert!(matches!(*cond1, Term::Bin(BinOp::Lt, _, _)));
+        assert_eq!(*then1, Term::Int(1));
+        let Term::If(cond2, then2, else2) = *else1 else {
+            panic!("second cond arm should be the nested else")
+        };
+        assert!(matches!(*cond2, Term::Bin(BinOp::Eq, _, _)));
+        assert_eq!(*then2, Term::Int(2));
+        assert_eq!(*else2, Term::Int(3));
+    }
+
+    #[test]
+    fn case_and_cond_require_final_defaults() {
+        let err = parse("case x of | 1 => 2").unwrap_err();
+        assert!(err.msg.contains("default"), "got: {}", err.msg);
+        let err = parse("cond | true => 1").unwrap_err();
+        assert!(err.msg.contains("default"), "got: {}", err.msg);
+        let err = parse("case x of | _ => 1 | 2 => 3").unwrap_err();
+        assert!(err.msg.contains("must be last"), "got: {}", err.msg);
+    }
+
+    #[test]
+    fn do_sugar_desugars_to_nested_lets() {
+        let t = parse("do { let x = 1; let y = x + 1; y }").unwrap();
+        let Term::Let(x, x_value, body) = t else {
+            panic!("first do binding should become a let")
+        };
+        assert_eq!(x, "x");
+        assert_eq!(*x_value, Term::Int(1));
+
+        let Term::Let(y, y_value, body) = *body else {
+            panic!("second do binding should become a nested let")
+        };
+        assert_eq!(y, "y");
+        assert!(matches!(*y_value, Term::Bin(BinOp::Add, _, _)));
+        assert_eq!(*body, Term::Var("y".into()));
+    }
+
+    #[test]
+    fn do_expression_statements_get_hidden_binders() {
+        let t = parse("do { 1 + 2; 4 }").unwrap();
+        let Term::Let(tmp, value, body) = t else {
+            panic!("do expression statement should become a hidden let")
+        };
+        assert!(tmp.starts_with('\u{1}'));
+        assert!(matches!(*value, Term::Bin(BinOp::Add, _, _)));
+        assert_eq!(*body, Term::Int(4));
+    }
+
+    #[test]
+    fn empty_do_block_is_unit() {
+        assert_eq!(parse("do {}").unwrap(), Term::Unit);
+        assert_eq!(
+            parse("do { let x = 1; }").unwrap(),
+            Term::Let("x".into(), Box::new(Term::Int(1)), Box::new(Term::Unit))
+        );
+    }
+
+    #[test]
     fn overflow_operator_spellings_parse() {
         assert!(matches!(
             parse("1 +% 2").unwrap(),
@@ -2182,6 +2672,60 @@ mod tests {
         assert!(matches!(
             parse("1 +? 2 *% 3").unwrap(),
             Term::Bin(BinOp::AddChecked, _, _)
+        ));
+    }
+
+    #[test]
+    fn modulo_operator_parses_at_multiplicative_precedence() {
+        assert!(matches!(
+            parse("7 % 3").unwrap(),
+            Term::Bin(BinOp::Mod, _, _)
+        ));
+        assert!(matches!(
+            parse("1 + 7 % 3").unwrap(),
+            Term::Bin(BinOp::Add, _, _)
+        ));
+        assert!(matches!(
+            parse("7 % 3 * 2").unwrap(),
+            Term::Bin(BinOp::Mul, _, _)
+        ));
+    }
+
+    #[test]
+    fn logical_connectives_parse_as_short_circuit_sugar() {
+        let and = parse("a && b").unwrap();
+        assert!(matches!(
+            and,
+            Term::If(_, _, ref else_branch) if **else_branch == Term::Bool(false)
+        ));
+
+        let or = parse("a || b").unwrap();
+        assert!(matches!(
+            or,
+            Term::If(_, ref then_branch, _) if **then_branch == Term::Bool(true)
+        ));
+
+        let cmp_and = parse("a < b && c < d").unwrap();
+        assert!(matches!(
+            cmp_and,
+            Term::If(ref cond, _, _) if matches!(**cond, Term::Bin(BinOp::Lt, _, _))
+        ));
+    }
+
+    #[test]
+    fn tilde_parses_as_bool_negation_sugar() {
+        let not = parse("~flag").unwrap();
+        assert!(matches!(
+            not,
+            Term::If(_, ref then_branch, ref else_branch)
+                if **then_branch == Term::Bool(false) && **else_branch == Term::Bool(true)
+        ));
+
+        let combined = parse("~flag && other").unwrap();
+        assert!(matches!(
+            combined,
+            Term::If(ref cond, _, ref else_branch)
+                if matches!(**cond, Term::If(_, _, _)) && **else_branch == Term::Bool(false)
         ));
     }
 
@@ -2632,6 +3176,42 @@ mod tests {
     // ── the whole point: parse → check ──────────────────────────────────
 
     #[test]
+    fn handle_resuming_arm_sugar_parses_to_resume_call() {
+        let t = parse("handle ask() with { ask(_) -> 41 }").unwrap();
+        let Term::Handle(scrutinee, handler) = t else {
+            panic!("expected handle")
+        };
+        assert_eq!(
+            *scrutinee,
+            Term::App(Box::new(Term::Var("ask".into())), Box::new(Term::Unit))
+        );
+        assert_eq!(handler.ops.len(), 1);
+        let op = &handler.ops[0];
+        assert_eq!(op.op, user("ask"));
+        assert_eq!(op.arg, "_");
+        assert_eq!(
+            *op.body,
+            Term::App(
+                Box::new(Term::Var("resume".into())),
+                Box::new(Term::Int(41))
+            )
+        );
+        assert!(handler.ret.var.starts_with('\u{1}'));
+        assert_eq!(*handler.ret.body, Term::Var(handler.ret.var.clone()));
+    }
+
+    #[test]
+    fn explicit_handler_form_still_parses() {
+        let src = "handle perform ask () with { ask(x) => resume x ; return(y) => y }";
+        let Term::Handle(_, handler) = parse(src).unwrap() else {
+            panic!("expected handle")
+        };
+        assert_eq!(handler.ops.len(), 1);
+        assert_eq!(handler.ops[0].arg, "x");
+        assert_eq!(handler.ret.var, "y");
+    }
+
+    #[test]
     fn parse_then_check_a_pure_program() {
         let t = parse("let id = fn x: Int => x in id 1").unwrap();
         let (ty, row) = infer(&Sig::new(), &Ctx::new(), 0, &t).unwrap();
@@ -2645,6 +3225,14 @@ mod tests {
         let (_ty, row) = infer(&Sig::new(), &Ctx::new(), 0, &t).unwrap();
         // `fs` is a native (World) effect.
         assert_eq!(row, Row::single(world("fs")));
+    }
+
+    #[test]
+    fn parse_then_check_do_block_preserves_effect_rows() {
+        let t = parse("effect log : Unit -> Unit in do { log(); 7 }").unwrap();
+        let (ty, row) = infer(&Sig::new(), &Ctx::new(), 0, &t).unwrap();
+        assert_eq!(ty, Type::Int);
+        assert_eq!(row, Row::single(user("log")));
     }
 
     #[test]
@@ -2712,11 +3300,11 @@ mod tests {
     #[test]
     fn a_module_header_with_layer_seals_and_exposing_parses() {
         let p = parse_program(
-            "module Console at services seals (winapi) exposing (writeln, writelnFloat) = \
-               let writeln = fn s: String => perform console s in \
+            "module Console at services seals (winapi) exposing (console_writeln, console_write_float) = \
+               let console_writeln = fn s: String => perform console s in \
                () \
              import Console \
-             writeln \"hi\"",
+             console_writeln \"hi\"",
         )
         .unwrap();
         assert_eq!(p.modules.len(), 1);
@@ -2726,16 +3314,19 @@ mod tests {
         assert_eq!(m.seals, vec![world("winapi")]);
         assert_eq!(
             m.exposing,
-            Some(vec!["writeln".to_string(), "writelnFloat".to_string()])
+            Some(vec![
+                "console_writeln".to_string(),
+                "console_write_float".to_string()
+            ])
         );
         // The body is the let-chain ending in `()`.
-        assert!(matches!(m.body, Term::Let(ref n, _, _) if n == "writeln"));
+        assert!(matches!(m.body, Term::Let(ref n, _, _) if n == "console_writeln"));
         assert_eq!(p.imports, vec!["Console".to_string()]);
         // The entry is what follows the last decl — not absorbed into the body.
         assert_eq!(
             p.entry,
             Term::App(
-                Box::new(Term::Var("writeln".into())),
+                Box::new(Term::Var("console_writeln".into())),
                 Box::new(Term::Str("hi".into()))
             )
         );
@@ -2764,8 +3355,8 @@ mod tests {
     fn a_handler_wrap_module_body_parses() {
         // The seal pattern: the body is a `handle … with { … }`, ending at `}`.
         let p = parse_program(
-            "module Console at services seals (winapi) exposing (writeln) = \
-               handle (let writeln = fn s: String => perform console s in ()) \
+            "module Console at services seals (winapi) exposing (console_writeln) = \
+               handle (let console_writeln = fn s: String => perform console s in ()) \
                with { console(s) => resume () ; return(x) => x } \
              0",
         )
@@ -2917,6 +3508,7 @@ mod tests {
             toks,
             pos: 0,
             bar_is_arm: false,
+            sugar_id: 0,
             row_vars: HashMap::new(),
             current_mint: None,
         };
@@ -2942,6 +3534,7 @@ mod tests {
             toks,
             pos: 0,
             bar_is_arm: false,
+            sugar_id: 0,
             row_vars: HashMap::new(),
             current_mint: None,
         };
@@ -2959,6 +3552,7 @@ mod tests {
             toks,
             pos: 0,
             bar_is_arm: false,
+            sugar_id: 0,
             row_vars: HashMap::new(),
             current_mint: None,
         };

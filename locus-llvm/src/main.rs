@@ -13,9 +13,15 @@
 //! ANF IR, then hand it to the backend.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "mcp")]
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+#[cfg(feature = "mcp")]
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+#[cfg(feature = "mcp")]
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
 locusc — the Locus compiler (JIT + AOT)
@@ -27,11 +33,29 @@ USAGE:
   locusc asm     FILE [-o OUT.s] dump the generated x86-64 assembly
   locusc effects FILE [--json]   print FILE's effect manifest (what it touches);
                                  --json emits a stable, diffable manifest for CI
+  locusc help [TOPIC] [--human]   discover language syntax, operation, and services
+  locusc help search QUERY [--human]
+                                search syntax/services/examples/reminders
+  locusc help service NAME [--human]
+                                show a service/module/function help card
+  locusc help services [--human] list published services
   locusc republish [DIR]         write the embedded stdlib to DIR for review
+  locusc mcp                     serve the agent-facing MCP protocol over stdio
+  locusc mcp-call COMMAND ...    call the MCP server once and print JSON
   locusc --help
+
+OPTIONS:
+  --trace-stack-usage            print compiler tree-depth / spine metrics to stderr
 
 `run`'s exit code is the program's i64 result; effects print as they execute.
 `asm` writes to stdout unless `-o` is given — the same code the .exe contains.
+
+FOR AGENTS:
+  locusc help agent               start here (JSON by default)
+  locusc help search \"loop string\"
+  locusc help service Agent
+  locusc help remind loops --human
+  locusc mcp-call run --source \"let x = 40 in x + 2\"
 
 Minting (`extern`, raw memory) is a `boundary`-only capability: app code may not
 name it — every command rejects an app-level mint (`RN-E0402`). The platform team
@@ -41,13 +65,22 @@ mints in `boundary` modules (baked in) and authorizes user ones via `locus.toml
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let code = match dispatch(&args) {
-        Ok(c) => c,
-        Err(msg) => {
-            eprintln!("locusc: {msg}");
-            2
-        }
-    };
+    let code = std::thread::Builder::new()
+        .name("locusc-main".into())
+        .stack_size(locus::PIPELINE_STACK_BYTES)
+        .spawn(move || match dispatch(&args) {
+            Ok(c) => c,
+            Err(msg) => {
+                eprintln!("locusc: {msg}");
+                2
+            }
+        })
+        .expect("spawn locusc worker")
+        .join()
+        .unwrap_or_else(|_| {
+            eprintln!("locusc: internal error (worker panicked)");
+            101
+        });
     process::exit(code);
 }
 
@@ -57,14 +90,415 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
         Some("build") => cmd_build(&args[1..]),
         Some("asm") => cmd_asm(&args[1..]),
         Some("effects") => cmd_effects(&args[1..]),
+        Some("help") => cmd_help(&args[1..]),
         Some("republish") => cmd_republish(&args[1..]),
+        Some("mcp") => cmd_mcp(&args[1..]),
+        Some("mcp-call") => cmd_mcp_call(&args[1..]),
+        Some("worker") => cmd_worker(&args[1..]),
         None | Some("--help") | Some("-h") => {
             print!("{USAGE}");
             Ok(0)
         }
         Some(other) => Err(format!(
-            "unknown command `{other}` (try `run`, `build`, `asm`, `effects`, `republish`, `--help`)"
+            "unknown command `{other}` (try `run`, `build`, `asm`, `effects`, `help`, `republish`, `mcp`, `mcp-call`, `--help`)"
         )),
+    }
+}
+
+fn cmd_help(args: &[String]) -> Result<i32, String> {
+    let (human, words) = parse_help_args(args);
+    if words.is_empty() || matches!(words[0].as_str(), "overview" | "index") {
+        println!(
+            "{}",
+            if human {
+                locus::help::overview_text()
+            } else {
+                locus::help::overview_json()
+            }
+        );
+        return Ok(0);
+    }
+
+    match words[0].as_str() {
+        "agent" => print_help_card("agent.start", human),
+        "search" => {
+            let query = words[1..].join(" ");
+            if query.trim().is_empty() {
+                return Err("usage: locusc help search QUERY [--human]".into());
+            }
+            let hits = locus::help::search(&query, 8);
+            println!(
+                "{}",
+                if human {
+                    locus::help::search_text(&query, &hits)
+                } else {
+                    locus::help::search_json(&query, &hits)
+                }
+            );
+            Ok(0)
+        }
+        "topic" => {
+            let id = words
+                .get(1)
+                .ok_or("usage: locusc help topic TOPIC [--human]")?;
+            print_help_card(id, human)
+        }
+        "service" => {
+            let name = words
+                .get(1)
+                .ok_or("usage: locusc help service NAME [--human]")?;
+            let Some(card) = locus::help::service(name) else {
+                return Err(format!(
+                    "unknown service `{name}` (try `locusc help search {name}`)"
+                ));
+            };
+            println!(
+                "{}",
+                if human {
+                    locus::help::card_text(card)
+                } else {
+                    locus::help::card_json(card)
+                }
+            );
+            Ok(0)
+        }
+        "services" => {
+            println!(
+                "{}",
+                if human {
+                    locus::help::services_text()
+                } else {
+                    locus::help::services_json()
+                }
+            );
+            Ok(0)
+        }
+        "remind" => {
+            let topic = words
+                .get(1)
+                .ok_or("usage: locusc help remind TOPIC [--human]")?;
+            println!(
+                "{}",
+                if human {
+                    locus::help::remind_text(topic)
+                } else {
+                    locus::help::remind_json(topic)
+                }
+            );
+            Ok(0)
+        }
+        other => {
+            if let Some(card) = locus::help::find(other) {
+                println!(
+                    "{}",
+                    if human {
+                        locus::help::card_text(card)
+                    } else {
+                        locus::help::card_json(card)
+                    }
+                );
+            } else {
+                let query = words.join(" ");
+                let hits = locus::help::search(&query, 8);
+                println!(
+                    "{}",
+                    if human {
+                        locus::help::search_text(&query, &hits)
+                    } else {
+                        locus::help::search_json(&query, &hits)
+                    }
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn parse_help_args(args: &[String]) -> (bool, Vec<String>) {
+    let mut human = false;
+    let mut words = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--human" => human = true,
+            "--json" => {}
+            _ => words.push(arg.clone()),
+        }
+    }
+    (human, words)
+}
+
+fn print_help_card(id: &str, human: bool) -> Result<i32, String> {
+    let Some(card) = locus::help::find(id) else {
+        return Err(format!(
+            "unknown help topic `{id}` (try `locusc help search {id}`)"
+        ));
+    };
+    println!(
+        "{}",
+        if human {
+            locus::help::card_text(card)
+        } else {
+            locus::help::card_json(card)
+        }
+    );
+    Ok(0)
+}
+
+#[cfg(feature = "mcp")]
+fn cmd_worker(args: &[String]) -> Result<i32, String> {
+    if !args.is_empty() {
+        return Err("usage: locusc worker".into());
+    }
+    locus_llvm::mcp::worker_blocking_stdio()
+}
+
+#[cfg(not(feature = "mcp"))]
+fn cmd_worker(_args: &[String]) -> Result<i32, String> {
+    Err("`locusc worker` is available when locus-llvm is built with `--features mcp`".into())
+}
+
+#[cfg(feature = "mcp")]
+fn cmd_mcp(args: &[String]) -> Result<i32, String> {
+    if !args.is_empty() {
+        return Err("usage: locusc mcp".into());
+    }
+    locus_llvm::mcp::serve_blocking_stdio()
+}
+
+#[cfg(not(feature = "mcp"))]
+fn cmd_mcp(_args: &[String]) -> Result<i32, String> {
+    Err("`locusc mcp` is available when locus-llvm is built with `--features mcp`".into())
+}
+
+const MCP_CALL_USAGE: &str = "\
+usage:
+  locusc mcp-call tools
+  locusc mcp-call call TOOL [JSON_ARGS]
+  locusc mcp-call help_overview
+  locusc mcp-call help_search QUERY [LIMIT]
+  locusc mcp-call help_topic ID
+  locusc mcp-call help_service NAME
+  locusc mcp-call help_remind TOPIC
+  locusc mcp-call check (--file PATH | --source SOURCE)
+  locusc mcp-call run (--file PATH | --source SOURCE)
+  locusc mcp-call ir (--file PATH | --source SOURCE)
+  locusc mcp-call effects (--file PATH | --source SOURCE)";
+
+#[cfg(feature = "mcp")]
+fn cmd_mcp_call(args: &[String]) -> Result<i32, String> {
+    use serde_json::{json, Value};
+
+    let (tool, arguments, list_tools) = mcp_call_target(args)?;
+    let mut child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .arg("mcp")
+        .current_dir(std::env::current_dir().map_err(|e| e.to_string())?)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("starting MCP server: {e}"))?;
+
+    let mut stdin = child.stdin.take().ok_or("MCP server stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("MCP server stdout unavailable")?;
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut next_id = 1_i64;
+
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": next_id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "locusc-mcp-call", "version": env!("CARGO_PKG_VERSION") }
+        }
+    });
+    mcp_send(&mut stdin, &init)?;
+    let _ = mcp_recv_id(&mut reader, next_id)?;
+    next_id += 1;
+    mcp_send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+    )?;
+
+    let request = if list_tools {
+        json!({"jsonrpc": "2.0", "id": next_id, "method": "tools/list", "params": {}})
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": next_id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        })
+    };
+    mcp_send(&mut stdin, &request)?;
+    let result = mcp_recv_id(&mut reader, next_id);
+    drop(stdin);
+    drop(reader);
+    let _ = wait_or_terminate_child(&mut child, Duration::from_secs(2));
+    let result = result?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+    );
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(if is_error { 1 } else { 0 })
+}
+
+#[cfg(feature = "mcp")]
+fn wait_or_terminate_child(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return child.wait().map_err(|e| e.to_string());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(feature = "mcp"))]
+fn cmd_mcp_call(_args: &[String]) -> Result<i32, String> {
+    Err("`locusc mcp-call` is available when locus-llvm is built with `--features mcp`".into())
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_call_target(args: &[String]) -> Result<(String, serde_json::Value, bool), String> {
+    use serde_json::json;
+
+    let Some(cmd) = args.first().map(String::as_str) else {
+        return Err(MCP_CALL_USAGE.into());
+    };
+    let rest = &args[1..];
+    match cmd {
+        "tools" => Ok((String::new(), json!({}), true)),
+        "call" => {
+            let name = rest
+                .first()
+                .ok_or_else(|| format!("call requires TOOL [JSON_ARGS]\n{MCP_CALL_USAGE}"))?;
+            let raw = rest.get(1).map(String::as_str).unwrap_or("{}");
+            let arguments = serde_json::from_str(raw)
+                .map_err(|e| format!("invalid JSON_ARGS for `{name}`: {e}"))?;
+            Ok((mcp_tool_alias(name), arguments, false))
+        }
+        "help_overview" => Ok(("help_overview".into(), json!({}), false)),
+        "help_search" => {
+            let query = rest
+                .first()
+                .ok_or_else(|| format!("help_search requires QUERY [LIMIT]\n{MCP_CALL_USAGE}"))?;
+            let limit = rest.get(1).map(|n| {
+                n.parse::<usize>()
+                    .map_err(|e| format!("invalid help_search LIMIT `{n}`: {e}"))
+            });
+            let mut arguments = json!({ "query": query });
+            if let Some(limit) = limit {
+                arguments["limit"] = json!(limit?);
+            }
+            Ok(("help_search".into(), arguments, false))
+        }
+        "help_topic" => {
+            let id = only_arg(cmd, rest)?;
+            Ok(("help_topic".into(), json!({ "id": id }), false))
+        }
+        "help_service" => {
+            let name = only_arg(cmd, rest)?;
+            Ok(("help_service".into(), json!({ "name": name }), false))
+        }
+        "help_remind" => {
+            let topic = only_arg(cmd, rest)?;
+            Ok(("help_remind".into(), json!({ "topic": topic }), false))
+        }
+        "check" | "run" | "effects" | "ir" | "asm" => Ok((
+            mcp_tool_alias(cmd),
+            mcp_source_args(rest).map_err(|e| format!("{e}\n{MCP_CALL_USAGE}"))?,
+            false,
+        )),
+        other => Err(format!(
+            "unknown mcp-call command `{other}`\n{MCP_CALL_USAGE}"
+        )),
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn only_arg<'a>(cmd: &str, args: &'a [String]) -> Result<&'a str, String> {
+    if args.len() == 1 {
+        Ok(&args[0])
+    } else {
+        Err(format!(
+            "{cmd} requires exactly one argument\n{MCP_CALL_USAGE}"
+        ))
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_source_args(args: &[String]) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+
+    if args.len() != 2 {
+        return Err("expected --file PATH or --source SOURCE".into());
+    }
+    match args[0].as_str() {
+        "--file" => Ok(json!({ "file": args[1] })),
+        "--source" => Ok(json!({ "source": args[1] })),
+        other => Err(format!("expected --file or --source, got `{other}`")),
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_tool_alias(name: &str) -> String {
+    match name {
+        "ir" => "emit_ir",
+        "asm" => "emit_asm",
+        other => other,
+    }
+    .to_string()
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_send(stdin: &mut process::ChildStdin, value: &serde_json::Value) -> Result<(), String> {
+    let line = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    writeln!(stdin, "{line}").map_err(|e| format!("writing MCP request: {e}"))?;
+    stdin
+        .flush()
+        .map_err(|e| format!("flushing MCP request: {e}"))
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_recv_id(reader: &mut impl BufRead, id: i64) -> Result<serde_json::Value, String> {
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("reading MCP response: {e}"))?;
+        if n == 0 {
+            return Err("MCP server closed stdout".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("invalid MCP JSON: {e}: {line}"))?;
+        if value.get("id").and_then(serde_json::Value::as_i64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(format!(
+                "MCP error: {}",
+                serde_json::to_string_pretty(error).unwrap_or_else(|_| error.to_string())
+            ));
+        }
+        return value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("MCP response missing result: {value}"));
     }
 }
 
@@ -150,13 +584,31 @@ fn guard_layer2(src: &str, authorized: &HashSet<String>) -> Result<(), String> {
 }
 
 /// Front end: source → ANF IR + the demanded Win32 DLLs. `program` grafts the
-/// prelude (e.g. `writeln`); the resolver fills bare `extern "Sym"` from the
+/// prelude (e.g. `console_writeln`); the resolver fills bare `extern "Sym"` from the
 /// Win32 oracle and collects the DLLs the AOT linker will need.
-fn to_ir(src: &str) -> Result<(locus::Ir, locus_llvm::winapi_resolve::Demanded), String> {
+fn to_ir(
+    src: &str,
+    trace_stack: bool,
+) -> Result<(locus::Ir, locus_llvm::winapi_resolve::Demanded), String> {
+    if trace_stack {
+        trace_stack_header("locusc");
+        if let Ok(program) = locus::parse_program(src) {
+            trace_shape("user source", locus::program_source_shape(&program));
+        }
+    }
     let (term, user_modules) = locus::program_with_modules(src).map_err(|e| e.msg)?;
+    if trace_stack {
+        trace_shape("stdlib-grafted term", locus::term_shape(&term));
+    }
     let (term, demanded) = locus_llvm::winapi_resolve::resolve(term)?;
+    if trace_stack {
+        trace_shape("winapi-resolved term", locus::term_shape(&term));
+    }
     let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
         .map_err(|e| e.to_string())?;
+    if trace_stack {
+        trace_shape("typed tree", locus::typed_shape(&tree));
+    }
     // Enforce each module's `seals (…)` clause over the elaborated exports (S4):
     // no exposed binding may carry a sealed label. Covers the included stdlib
     // services (e.g. Console seals winapi) and the user modules.
@@ -165,10 +617,37 @@ fn to_ir(src: &str) -> Result<(locus::Ir, locus_llvm::winapi_resolve::Demanded),
     locus::check_module_seals(&all_modules, &tree).map_err(|e| e.to_string())?;
     // Run the generators (staging) at compile time, leaving residual object code.
     let tree = locus::stage_reduce(&tree)?;
+    if trace_stack {
+        trace_shape("stage-reduced tree", locus::typed_shape(&tree));
+    }
     if tree.has_unknown_layout() {
         return Err(locus::TypeErr::RepresentationPolymorphicLayout.to_string());
     }
-    Ok((locus::lower(&tree), demanded))
+    let ir = locus::lower(&tree);
+    if trace_stack {
+        trace_shape("anf ir", locus::ir_shape(&ir));
+    }
+    Ok((ir, demanded))
+}
+
+fn trace_stack_header(tool: &str) {
+    let bytes = locus::PIPELINE_STACK_BYTES;
+    eprintln!(
+        "{tool} stack trace: configured pipeline stack = {} bytes ({} MiB)",
+        bytes,
+        bytes / (1024 * 1024)
+    );
+}
+
+fn trace_shape(label: &str, shape: locus::ShapeMetrics) {
+    eprintln!(
+        "  {label:<21} nodes={:<6} max_depth={:<5} binding_spine={:<5} app_spine={:<5} type_depth={}",
+        shape.nodes,
+        shape.max_depth,
+        shape.max_binding_spine,
+        shape.max_app_spine,
+        shape.max_type_depth
+    );
 }
 
 fn read(file: &str) -> Result<String, String> {
@@ -176,10 +655,18 @@ fn read(file: &str) -> Result<String, String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<i32, String> {
-    let file = args.first().ok_or("usage: locusc run FILE")?;
-    let src = read(file)?;
-    guard_layer2(&src, &read_boundary_manifest(Path::new(file)))?;
-    let (ir, apis) = to_ir(&src)?;
+    let mut file: Option<String> = None;
+    let mut trace_stack = false;
+    for a in args {
+        match a.as_str() {
+            "--trace-stack-usage" => trace_stack = true,
+            other => file = Some(other.to_string()),
+        }
+    }
+    let file = file.ok_or("usage: locusc run [--trace-stack-usage] FILE")?;
+    let src = read(&file)?;
+    guard_layer2(&src, &read_boundary_manifest(Path::new(&file)))?;
+    let (ir, apis) = to_ir(&src, trace_stack)?;
     // The program runs here — its effects execute and its i64 is the exit code.
     let result = locus_llvm::jit_run_i64(&ir, &apis)?;
     Ok(result as i32)
@@ -189,18 +676,21 @@ fn cmd_build(args: &[String]) -> Result<i32, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut always_gc = false;
+    let mut trace_stack = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = Some(it.next().ok_or("`-o` needs a path")?.clone()),
             "--always-gc" => always_gc = true,
+            "--trace-stack-usage" => trace_stack = true,
             other => file = Some(other.to_string()),
         }
     }
-    let file = file.ok_or("usage: locusc build FILE [-o EXE] [--always-gc]")?;
+    let file =
+        file.ok_or("usage: locusc build [--trace-stack-usage] FILE [-o EXE] [--always-gc]")?;
     let src = read(&file)?;
     guard_layer2(&src, &read_boundary_manifest(Path::new(&file)))?;
-    let (ir, apis) = to_ir(&src)?;
+    let (ir, apis) = to_ir(&src, trace_stack)?;
     let exe = out
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&file).with_extension("exe"));
@@ -217,18 +707,27 @@ fn cmd_build(args: &[String]) -> Result<i32, String> {
 fn cmd_asm(args: &[String]) -> Result<i32, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut optimize = false;
+    let mut trace_stack = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" => out = Some(it.next().ok_or("`-o` needs a path")?.clone()),
+            // The optimized view (what the `.exe` runs) vs the default lowering view.
+            "-O2" | "--opt" => optimize = true,
+            "--trace-stack-usage" => trace_stack = true,
             other => file = Some(other.to_string()),
         }
     }
-    let file = file.ok_or("usage: locusc asm FILE [-o OUT.s]")?;
+    let file = file.ok_or("usage: locusc asm [--trace-stack-usage] FILE [-O2] [-o OUT.s]")?;
     let src = read(&file)?;
     guard_layer2(&src, &read_boundary_manifest(Path::new(&file)))?;
-    let (ir, _apis) = to_ir(&src)?;
-    let asm = locus_llvm::emit_asm(&ir)?;
+    let (ir, _apis) = to_ir(&src, trace_stack)?;
+    let asm = if optimize {
+        locus_llvm::emit_asm_opt(&ir)?
+    } else {
+        locus_llvm::emit_asm(&ir)?
+    };
     match out {
         Some(path) => {
             std::fs::write(&path, &asm).map_err(|e| format!("writing `{path}`: {e}"))?;
@@ -342,19 +841,36 @@ fn category(l: &locus::Label) -> &'static str {
 fn cmd_effects(args: &[String]) -> Result<i32, String> {
     let mut file: Option<&str> = None;
     let mut json = false;
+    let mut trace_stack = false;
     for a in args {
         match a.as_str() {
             "--json" => json = true,
+            "--trace-stack-usage" => trace_stack = true,
             other => file = Some(other),
         }
     }
-    let file = file.ok_or("usage: locusc effects FILE [--json]")?;
+    let file = file.ok_or("usage: locusc effects [--trace-stack-usage] FILE [--json]")?;
     let src = read(file)?;
     guard_layer2(&src, &read_boundary_manifest(Path::new(file)))?;
+    if trace_stack {
+        trace_stack_header("locusc");
+        if let Ok(program) = locus::parse_program(&src) {
+            trace_shape("user source", locus::program_source_shape(&program));
+        }
+    }
     let term = locus::program(&src).map_err(|e| e.msg)?;
+    if trace_stack {
+        trace_shape("stdlib-grafted term", locus::term_shape(&term));
+    }
     let (term, _apis) = locus_llvm::winapi_resolve::resolve(term)?;
+    if trace_stack {
+        trace_shape("winapi-resolved term", locus::term_shape(&term));
+    }
     let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
         .map_err(|e| e.to_string())?;
+    if trace_stack {
+        trace_shape("typed tree", locus::typed_shape(&tree));
+    }
     // `labels()` walks a BTreeSet, so the order is sorted and stable — diffable.
     let labels: Vec<&locus::Label> = tree.row.labels().collect();
     let ty = tree.ty.to_string();

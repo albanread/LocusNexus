@@ -33,6 +33,9 @@ read_line   world     terminal input
 fs          world     filesystem access
 net         world     network access
 clock       world     wall-clock / time
+clock_ticks world     monotonic performance counter ticks
+clock_frequency world ticks per second for the monotonic performance counter
+agent      world     MCP/agent ask-response host channel
 
 # -- the heap and raw memory -------------------------------------------------
 mem         memory    raw memory — peek / poke / fill / copy

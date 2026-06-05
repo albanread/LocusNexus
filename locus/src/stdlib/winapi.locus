@@ -1,16 +1,571 @@
-module Winapi at boundary mints (winapi) =
--- stdlib LAYER 0: winapi — the raw Win32 imports. CLOSEST TO WORLD.
---
--- The kernel of the capability stack (world > winapi > console > ... > app):
--- only this layer names the Win32 boundary, so it is grafted OUTERMOST, nearest
--- the `world` that ultimately handles `winapi`. Higher layers build on these; the
--- app never names them directly. The final `()` is the placeholder body the
--- loader replaces with the rest of the program.
+module Winapi at boundary mints (winapi) exposing () =
+-- stdlib LAYER 0: raw Windows imports and private boundary helpers. Services
+-- call these helpers and seal `{winapi}`/`{mem}`; app code never gets a public
+-- memory, process, or arbitrary filesystem API.
 
-let getstdhandle = extern "GetStdHandle" : U32 -> Ptr in
-let virtualalloc = extern "VirtualAlloc" : Ptr -> Ptr -> U32 -> U32 -> Ptr in
-let widetoutf8   =
-  extern "WideCharToMultiByte" : U32 -> U32 -> Ptr -> I32 -> Ptr -> I32 -> Ptr -> Ptr -> I32 in
-let writefile    = extern "WriteFile" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in
+let win_GetStdHandle = extern "GetStdHandle" : U32 -> Int in
+let win_WriteConsoleW = extern "WriteConsoleW" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in
+let win_ReadConsoleW = extern "ReadConsoleW" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in
+let win_GetConsoleScreenBufferInfo = extern "GetConsoleScreenBufferInfo" : Ptr -> Ptr -> I32 in
+let win_SetConsoleCursorPosition = extern "SetConsoleCursorPosition" : Ptr -> U32 -> I32 in
+let win_FillConsoleOutputCharacterW = extern "FillConsoleOutputCharacterW" : Ptr -> U32 -> U32 -> U32 -> Ptr -> I32 in
+let win_FillConsoleOutputAttribute = extern "FillConsoleOutputAttribute" : Ptr -> U32 -> U32 -> U32 -> Ptr -> I32 in
+let win_QueryPerformanceCounter = extern "QueryPerformanceCounter" : Ptr -> I32 in
+let win_QueryPerformanceFrequency = extern "QueryPerformanceFrequency" : Ptr -> I32 in
+
+let win_VirtualAlloc = extern "VirtualAlloc" : Int -> Int -> U32 -> U32 -> Int in
+
+let win_GetEnvironmentVariableW = extern "GetEnvironmentVariableW" : Ptr -> Ptr -> U32 -> U32 in
+
+let win_CredReadW = extern "CredReadW" : Ptr -> U32 -> U32 -> Ptr -> I32 in
+let win_CredFree = extern "CredFree" : Ptr -> Unit in
+
+let win_CreateFileW = extern "CreateFileW" : Ptr -> U32 -> U32 -> Ptr -> U32 -> U32 -> Ptr -> Int in
+let win_ReadFile = extern "ReadFile" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in
+let win_WriteFile = extern "WriteFile" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in
+let win_CloseHandle = extern "CloseHandle" : Ptr -> I32 in
+let win_GetFileSizeEx = extern "GetFileSizeEx" : Ptr -> Ptr -> I32 in
+let win_GetFileAttributesW = extern "GetFileAttributesW" : Ptr -> U32 in
+
+let win_alloc = fn bytes: Int =>
+  win_VirtualAlloc 0 bytes 0x3000 0x04
+in
+
+let win_utf16z = fn s: String =>
+  let n = len s in
+  let buf = win_alloc ((n + 1) * 2) in
+  let _ =
+    loop i = 0 while i < n do
+      (let _ = poke16 (buf + (i * 2)) s[i] in
+       i + 1)
+    else
+      i
+  in
+  let _ = poke16 (buf + (n * 2)) 0 in
+  buf
+in
+
+let win_copy_string_to = fn dst: Int => fn off: Int => fn s: String =>
+  loop i = 0 while i < len s do
+    (let _ = poke16 (dst + ((off + i) * 2)) s[i] in
+     i + 1)
+  else
+    off + i
+in
+
+let win_copy_raw_to = fn dst: Int => fn off: Int => fn src: Int => fn count: Int =>
+  loop i = 0 while i < count do
+    (let _ = poke16 (dst + ((off + i) * 2)) (peek16 (src + (i * 2))) in
+     i + 1)
+  else
+    off + i
+in
+
+let win_poke_utf8_1 = fn buf: Int => fn j: Int => fn ch: Int =>
+  let _ = poke8 (buf + j) ch in
+  j + 1
+in
+
+let win_poke_utf8_2 = fn buf: Int => fn j: Int => fn ch: Int =>
+  let _ = poke8 (buf + j) (0xC0 | (ch >> 6)) in
+  let _ = poke8 (buf + j + 1) (0x80 | (ch & 0x3F)) in
+  j + 2
+in
+
+let win_poke_utf8_3 = fn buf: Int => fn j: Int => fn ch: Int =>
+  let _ = poke8 (buf + j) (0xE0 | (ch >> 12)) in
+  let _ = poke8 (buf + j + 1) (0x80 | ((ch >> 6) & 0x3F)) in
+  let _ = poke8 (buf + j + 2) (0x80 | (ch & 0x3F)) in
+  j + 3
+in
+
+let win_poke_utf8_4 = fn buf: Int => fn j: Int => fn ch: Int =>
+  let _ = poke8 (buf + j) (0xF0 | (ch >> 18)) in
+  let _ = poke8 (buf + j + 1) (0x80 | ((ch >> 12) & 0x3F)) in
+  let _ = poke8 (buf + j + 2) (0x80 | ((ch >> 6) & 0x3F)) in
+  let _ = poke8 (buf + j + 3) (0x80 | (ch & 0x3F)) in
+  j + 4
+in
+
+let win_poke_utf8_replacement = fn buf: Int => fn j: Int =>
+  let _ = poke8 (buf + j) 0xEF in
+  let _ = poke8 (buf + j + 1) 0xBF in
+  let _ = poke8 (buf + j + 2) 0xBD in
+  j + 3
+in
+
+let win_utf8_len = fn s: String =>
+  let n = len s in
+  loop i = 0, bytes = 0 while i < n do
+    if s[i] < 0xD800 then
+      i + 1
+    else if s[i] < 0xDC00 then
+      if i + 1 < n then
+        if s[i + 1] < 0xDC00 then i + 1 else (if s[i + 1] < 0xE000 then i + 2 else i + 1)
+      else
+        i + 1
+    else
+      i + 1,
+    bytes + (
+      if s[i] < 0x80 then
+        1
+      else if s[i] < 0x800 then
+        2
+      else if s[i] < 0xD800 then
+        3
+      else if s[i] < 0xDC00 then
+        if i + 1 < n then
+          if s[i + 1] < 0xDC00 then 3 else (if s[i + 1] < 0xE000 then 4 else 3)
+        else
+          3
+      else
+        3
+    )
+  else
+    bytes
+in
+
+let win_write_file_string = fn out: Int => fn s: String =>
+  let n = len s in
+  let bytes = win_utf8_len s in
+  let buf = win_alloc (if bytes == 0 then 1 else bytes) in
+  let _ =
+    loop i = 0, j = 0 while i < n do
+      let _ =
+        if s[i] < 0x80 then
+          poke8 (buf + j) s[i]
+        else if s[i] < 0x800 then
+          let ch = s[i] in
+          let _ = poke8 (buf + j) (0xC0 | (ch >> 6)) in
+          poke8 (buf + j + 1) (0x80 | (ch & 0x3F))
+        else if s[i] < 0xD800 then
+          let ch = s[i] in
+          let _ = poke8 (buf + j) (0xE0 | (ch >> 12)) in
+          let _ = poke8 (buf + j + 1) (0x80 | ((ch >> 6) & 0x3F)) in
+          poke8 (buf + j + 2) (0x80 | (ch & 0x3F))
+        else if s[i] < 0xDC00 then
+          if i + 1 < n then
+            let lo = s[i + 1] in
+            if lo < 0xDC00 then
+              let _ = poke8 (buf + j) 0xEF in
+              let _ = poke8 (buf + j + 1) 0xBF in
+              poke8 (buf + j + 2) 0xBD
+            else if lo < 0xE000 then
+              let ch = s[i] in
+              let code = 0x10000 + ((ch - 0xD800) << 10) + (lo - 0xDC00) in
+              let _ = poke8 (buf + j) (0xF0 | (code >> 18)) in
+              let _ = poke8 (buf + j + 1) (0x80 | ((code >> 12) & 0x3F)) in
+              let _ = poke8 (buf + j + 2) (0x80 | ((code >> 6) & 0x3F)) in
+              poke8 (buf + j + 3) (0x80 | (code & 0x3F))
+            else
+              let _ = poke8 (buf + j) 0xEF in
+              let _ = poke8 (buf + j + 1) 0xBF in
+              poke8 (buf + j + 2) 0xBD
+          else
+            let _ = poke8 (buf + j) 0xEF in
+            let _ = poke8 (buf + j + 1) 0xBF in
+            poke8 (buf + j + 2) 0xBD
+        else if s[i] < 0xE000 then
+          let _ = poke8 (buf + j) 0xEF in
+          let _ = poke8 (buf + j + 1) 0xBF in
+          poke8 (buf + j + 2) 0xBD
+        else
+          let ch = s[i] in
+          let _ = poke8 (buf + j) (0xE0 | (ch >> 12)) in
+          let _ = poke8 (buf + j + 1) (0x80 | ((ch >> 6) & 0x3F)) in
+          poke8 (buf + j + 2) (0x80 | (ch & 0x3F))
+      in
+      if s[i] < 0xD800 then
+        i + 1
+      else if s[i] < 0xDC00 then
+        if i + 1 < n then
+          if s[i + 1] < 0xDC00 then i + 1 else (if s[i + 1] < 0xE000 then i + 2 else i + 1)
+        else
+          i + 1
+      else
+        i + 1,
+      j + (
+        if s[i] < 0x80 then
+          1
+        else if s[i] < 0x800 then
+          2
+        else if s[i] < 0xD800 then
+          3
+        else if s[i] < 0xDC00 then
+          if i + 1 < n then
+            if s[i + 1] < 0xDC00 then 3 else (if s[i + 1] < 0xE000 then 4 else 3)
+          else
+            3
+        else
+          3
+      )
+    else
+      j
+  in
+  let written = win_alloc 8 in
+  let _ = win_WriteFile out buf bytes written 0 in
+  ()
+in
+
+let win_write_file_unit = fn out: Int => fn ch: Int =>
+  let bytes =
+    if ch < 0x80 then 1
+    else if ch < 0x800 then 2
+    else if ch < 0x10000 then 3
+    else 4
+  in
+  let buf = win_alloc bytes in
+  let _ =
+    if ch < 0x80 then
+      win_poke_utf8_1 buf 0 ch
+    else if ch < 0x800 then
+      win_poke_utf8_2 buf 0 ch
+    else if ch < 0x10000 then
+      win_poke_utf8_3 buf 0 ch
+    else
+      win_poke_utf8_4 buf 0 ch
+  in
+  let written = win_alloc 8 in
+  let _ = win_WriteFile out buf bytes written 0 in
+  ()
+in
+
+let win_write_console = fn s: String =>
+  let n = len s in
+  let buf = win_utf16z s in
+  let written = win_alloc 8 in
+  let out = win_GetStdHandle (0 - 11) in
+  let ok = win_WriteConsoleW out buf n written 0 in
+  let _ = if ok == 0 then win_write_file_string out s else () in
+  ()
+in
+
+let win_write_unit = fn ch: Int =>
+  let buf = win_alloc 4 in
+  let written = win_alloc 8 in
+  let out = win_GetStdHandle (0 - 11) in
+  let _ = poke16 buf ch in
+  let _ = poke16 (buf + 2) 0 in
+  let ok = win_WriteConsoleW out buf 1 written 0 in
+  let _ = if ok == 0 then win_write_file_unit out ch else () in
+  ()
+in
+
+let win_read_unit = fn u: Unit =>
+  let buf = win_alloc 4 in
+  let read = win_alloc 8 in
+  let inp = win_GetStdHandle (0 - 10) in
+  let _ = win_ReadConsoleW inp buf 1 read 0 in
+  peek16 buf
+in
+
+let win_read_line = fn u: Unit =>
+  let buf = win_alloc (32768 * 2) in
+  let read = win_alloc 8 in
+  let inp = win_GetStdHandle (0 - 10) in
+  let _ = win_ReadConsoleW inp buf 32767 read 0 in
+  let raw = peek32 read in
+  let no_lf =
+    if 0 < raw then
+      if (peek16 (buf + ((raw - 1) * 2)) == 10) then raw - 1 else raw
+    else
+      0
+  in
+  let units =
+    if 0 < no_lf then
+      if (peek16 (buf + ((no_lf - 1) * 2)) == 13) then no_lf - 1 else no_lf
+    else
+      0
+  in
+  locus_string_from_utf16 buf units
+in
+
+let win_coord = fn x: Int => fn y: Int =>
+  ((y & 0xFFFF) << 16) | (x & 0xFFFF)
+in
+
+let win_console_info = fn u: Unit =>
+  let info = win_alloc 32 in
+  let out = win_GetStdHandle (0 - 11) in
+  let ok = win_GetConsoleScreenBufferInfo out info in
+  if ok == 0 then 0 else info
+in
+
+let win_console_width = fn u: Unit =>
+  let info = win_console_info () in
+  if info == 0 then 0 else peek16 info
+in
+
+let win_console_height = fn u: Unit =>
+  let info = win_console_info () in
+  if info == 0 then 0 else peek16 (info + 2)
+in
+
+let win_set_cursor = fn x: Int => fn y: Int =>
+  let out = win_GetStdHandle (0 - 11) in
+  let _ = win_SetConsoleCursorPosition out (win_coord x y) in
+  ()
+in
+
+let win_clear_screen = fn u: Unit =>
+  let info = win_console_info () in
+  if info == 0 then
+    ()
+  else
+    let out = win_GetStdHandle (0 - 11) in
+    let written = win_alloc 8 in
+    let width = peek16 info in
+    let height = peek16 (info + 2) in
+    let cells = width * height in
+    let attr = peek16 (info + 8) in
+    let home = win_coord 0 0 in
+    let _ = win_FillConsoleOutputCharacterW out 32 cells home written in
+    let _ = win_FillConsoleOutputAttribute out attr cells home written in
+    let _ = win_SetConsoleCursorPosition out home in
+    ()
+in
+
+let win_clock_ticks = fn u: Unit =>
+  let ticks = win_alloc 8 in
+  let ok = win_QueryPerformanceCounter ticks in
+  if ok == 0 then 0 else peek64 ticks
+in
+
+let win_clock_frequency = fn u: Unit =>
+  let freq = win_alloc 8 in
+  let ok = win_QueryPerformanceFrequency freq in
+  if ok == 0 then 0 else peek64 freq
+in
+
+let win_name_chars_safe = fn name: String =>
+  loop i = 0, ok = true while i < len name do
+    i + 1,
+    if ok then
+      let ch = name[i] in
+      if ch == 0 then
+        false
+      else if ch == 47 then
+        false
+      else if ch == 58 then
+        false
+      else if ch == 92 then
+        false
+      else
+        true
+    else
+      false
+  else
+    ok
+in
+
+let win_name_safe = fn name: String =>
+  let n = len name in
+  if n == 0 then
+    false
+  else if n == 1 then
+    if name[0] == 46 then false else win_name_chars_safe name
+  else if n == 2 then
+    if name[0] == 46 then
+      if name[1] == 46 then false else win_name_chars_safe name
+    else
+      win_name_chars_safe name
+  else
+    win_name_chars_safe name
+in
+
+let win_env_to_buffer = fn key: String => fn dst: Int => fn units: Int =>
+  let keybuf = win_utf16z key in
+  win_GetEnvironmentVariableW keybuf dst units
+in
+
+let win_documents_path = fn name: String =>
+  if win_name_safe name then
+    let home = win_alloc (32768 * 2) in
+    let home_len = win_env_to_buffer "USERPROFILE" home 32767 in
+    if home_len == 0 then
+      0
+    else if 32766 < home_len then
+      0
+    else
+      let docs = "\\Documents\\" in
+      let total = home_len + len docs + len name + 1 in
+      let path = win_alloc (total * 2) in
+      let off1 = win_copy_raw_to path 0 home home_len in
+      let off2 = win_copy_string_to path off1 docs in
+      let off3 = win_copy_string_to path off2 name in
+      let _ = poke16 (path + (off3 * 2)) 0 in
+      path
+  else
+    0
+in
+
+let win_docs_exists = fn name: String =>
+  let path = win_documents_path name in
+  if path == 0 then
+    false
+  else
+    let attrs = win_GetFileAttributesW path in
+    if attrs == 0xFFFFFFFF then false else true
+in
+
+let win_docs_write = fn name: String => fn text: String => fn access: Int => fn disposition: Int =>
+  let path = win_documents_path name in
+  if path == 0 then
+    0
+  else
+    let h = win_CreateFileW path access 1 0 disposition 0x80 0 in
+    if h == (0 - 1) then
+      0
+    else
+      let bytes = (len text) * 2 in
+      let buf = win_utf16z text in
+      let written = win_alloc 8 in
+      let ok = win_WriteFile h buf bytes written 0 in
+      let _ = win_CloseHandle h in
+      ok
+in
+
+let win_docs_read_ok = fn name: String =>
+  if win_docs_exists name then 1 else 0
+in
+
+let win_docs_read_text = fn name: String =>
+  let path = win_documents_path name in
+  if path == 0 then
+    locus_string_from_utf16 0 0
+  else
+    let h = win_CreateFileW path 0x80000000 1 0 3 0x80 0 in
+    if h == (0 - 1) then
+      locus_string_from_utf16 0 0
+    else
+      let sizep = win_alloc 8 in
+      let size_ok = win_GetFileSizeEx h sizep in
+      if size_ok == 0 then
+        (let _ = win_CloseHandle h in
+         locus_string_from_utf16 0 0)
+      else
+        let bytes = peek64 sizep in
+        if 2147483646 < bytes then
+          (let _ = win_CloseHandle h in
+           locus_string_from_utf16 0 0)
+        else
+          let buf = win_alloc (bytes + 2) in
+          let readp = win_alloc 8 in
+          let ok = win_ReadFile h buf bytes readp 0 in
+          let _ = win_CloseHandle h in
+          if ok == 0 then
+            locus_string_from_utf16 0 0
+          else
+            locus_string_from_utf16 buf ((peek32 readp) / 2)
+in
+
+let win_locus_env_get_ok = fn name: String =>
+  let raw = win_utf16z name in
+  let buf = win_alloc (32768 * 2) in
+  let n = win_GetEnvironmentVariableW raw buf 32767 in
+  if n == 0 then
+    0
+  else if 32766 < n then
+    0
+  else
+    1
+in
+
+let win_locus_env_get_text = fn name: String =>
+  let raw = win_utf16z name in
+  let buf = win_alloc (32768 * 2) in
+  let n = win_GetEnvironmentVariableW raw buf 32767 in
+  if n == 0 then
+    locus_string_from_utf16 0 0
+  else if 32766 < n then
+    locus_string_from_utf16 0 0
+  else
+    locus_string_from_utf16 buf n
+in
+
+let win_cred_target_name = fn name: String =>
+  if win_name_safe name then
+    let root = "secure/credentials/" in
+    let total = len root + len name + 1 in
+    let target = win_alloc (total * 2) in
+    let off1 = win_copy_string_to target 0 root in
+    let off2 = win_copy_string_to target off1 name in
+    let _ = poke16 (target + (off2 * 2)) 0 in
+    target
+  else
+    0
+in
+
+let win_cred_folder_target = fn u: Unit =>
+  win_utf16z "secure/credentials"
+in
+
+let win_utf16z_equals_string = fn raw: Int => fn s: String =>
+  if raw == 0 then
+    false
+  else
+    loop i = 0, ok = true while i < len s do
+      i + 1,
+      if ok then (peek16 (raw + (i * 2))) == s[i] else false
+    else
+      if ok then (peek16 (raw + ((len s) * 2))) == 0 else false
+in
+
+let win_cred_blob_units = fn blob: Int => fn bytes: Int =>
+  if blob == 0 then
+    0
+  else if bytes < 2 then
+    0
+  else if (bytes % 2) != 0 then
+    0
+  else
+    let units = bytes / 2 in
+    if units == 0 then
+      0
+    else if (peek16 (blob + ((units - 1) * 2))) == 0 then
+      units - 1
+    else
+      units
+in
+
+let win_cred_read_from_target = fn target: Int => fn name: String => fn check_user: Bool =>
+  if target == 0 then
+    (0, locus_string_from_utf16 0 0)
+  else
+    let out = win_alloc 8 in
+    let ok = win_CredReadW target 1 0 out in
+    if ok == 0 then
+      (0, locus_string_from_utf16 0 0)
+    else
+      let cred = peek64 out in
+      let user_ok =
+        if check_user then
+          win_utf16z_equals_string (peek64 (cred + 72)) name
+        else
+          true
+      in
+      if user_ok then
+        let bytes = peek32 (cred + 32) in
+        let blob = peek64 (cred + 40) in
+        let units = win_cred_blob_units blob bytes in
+        let text = locus_string_from_utf16 blob units in
+        let _ = win_CredFree cred in
+        (1, text)
+      else
+        let _ = win_CredFree cred in
+        (0, locus_string_from_utf16 0 0)
+in
+
+let win_cred_read = fn name: String =>
+  let target = win_cred_target_name name in
+  if target == 0 then
+    (0, locus_string_from_utf16 0 0)
+  else
+    let (ok, text) = win_cred_read_from_target target name false in
+    if ok == 0 then
+      win_cred_read_from_target (win_cred_folder_target ()) name true
+    else
+      (ok, text)
+in
 
 ()

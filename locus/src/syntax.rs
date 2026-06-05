@@ -618,9 +618,9 @@ impl VectorShape {
     }
 }
 
-/// A primitive binary operator on `Int`s. Arithmetic (`+ - *` and their
+/// A primitive binary operator on `Int`s. Arithmetic (`+ - * / %` and their
 /// explicit wrapping/checked spellings), bitwise (`& | ^ << >>`) and shifts all
-/// yield `Int`; comparison (`== <`) yields `Bool`. These are kernel primitives
+/// yield `Int`; comparison (`== != < <= > >=`) yields `Bool`. These are kernel primitives
 /// — you cannot define `+` or `&` from nothing — kept deliberately few. Bitwise
 /// ops act on the uniform `i64` value; `>>` is arithmetic (sign-preserving),
 /// matching signed-int `>>` elsewhere.
@@ -631,6 +631,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Mod,
     /// Explicit wrapping arithmetic, also pure.
     AddWrap,
     SubWrap,
@@ -650,13 +651,20 @@ pub enum BinOp {
     /// `>>` — arithmetic right shift (sign-preserving).
     Shr,
     Eq,
+    Ne,
     Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 impl BinOp {
     /// Does this operator produce a `Bool` (rather than an `Int`)?
     pub fn is_comparison(self) -> bool {
-        matches!(self, BinOp::Eq | BinOp::Lt)
+        matches!(
+            self,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
     }
 
     /// Does this operator carry `exn[Overflow]`?
@@ -674,6 +682,7 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::Mod => "%",
             BinOp::AddWrap => "+%",
             BinOp::SubWrap => "-%",
             BinOp::MulWrap => "*%",
@@ -686,7 +695,11 @@ impl BinOp {
             BinOp::Shl => "<<",
             BinOp::Shr => ">>",
             BinOp::Eq => "==",
+            BinOp::Ne => "!=",
             BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
         }
     }
 }
@@ -859,9 +872,9 @@ pub enum Term {
     },
     /// `if c then a else b` — `c : Bool`, branches share a type.
     If(Box<Term>, Box<Term>, Box<Term>),
-    /// `loop x = init, ... while cond do next_x, ... else result` — a structured
+    /// `loop x = init, ... while cond do next_x, ... return result` — a structured
     /// accumulator loop. The `do` expressions compute the next accumulator values;
-    /// the `else` expression computes the loop result when `cond` is false.
+    /// the `return` expression computes the loop result when `cond` is false.
     Loop {
         vars: Vec<(String, Term)>,
         cond: Box<Term>,
@@ -877,6 +890,11 @@ pub enum Term {
     App(Box<Term>, Box<Term>),
     /// `let x = e₁ in e₂`
     Let(String, Box<Term>, Box<Term>),
+    /// Internal flattened declaration sequence. Surface syntax still parses to
+    /// the classic nested forms; stdlib/module grafting compacts long declaration
+    /// spines into this shape so "many declarations" is wide data rather than
+    /// native recursion depth.
+    Block(Vec<BlockItem>, Box<Term>),
     /// `let rec f : T = e₁ in e₂` — a recursive binding: `f : T` is in scope in
     /// `e₁` (its own definition) as well as `e₂`. The annotation `T` makes the
     /// function's type known before its body is checked. `e₁` is a function.
@@ -1099,6 +1117,40 @@ pub enum Term {
     Match {
         scrutinee: Box<Term>,
         arms: Vec<MatchArm>,
+    },
+}
+
+/// One item in an internal [`Term::Block`]. These are the declaration-like term
+/// forms whose `body` was formerly another nested term.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum BlockItem {
+    Let(String, Term),
+    LetRec(String, Type, Term),
+    LetMut(String, Term),
+    LetTuple(Vec<String>, Term),
+    Effect {
+        name: String,
+        ops: Vec<OpDecl>,
+    },
+    TypeDef {
+        name: String,
+        params: Vec<String>,
+        variants: Vec<(String, Vec<Type>)>,
+        module: Option<String>,
+    },
+    Trait {
+        name: String,
+        param: String,
+        supers: Vec<Constraint>,
+        methods: Vec<TraitMethodSig>,
+        module: Option<String>,
+    },
+    Instance {
+        trait_name: String,
+        head: Type,
+        requires: Vec<Constraint>,
+        methods: Vec<InstanceMethod>,
+        module: Option<String>,
     },
 }
 
@@ -1431,9 +1483,12 @@ impl Type {
     /// layout is described separately by [`Type::aggregate_storage_layout`].
     pub fn storage_layout(&self) -> ValueLayout {
         match self {
-            Type::Fun(..) | Type::Tuple(_) | Type::Record(_) | Type::Array(_) | Type::Named(..) => {
-                ValueLayout::pointer_cell()
-            }
+            Type::Fun(..)
+            | Type::Tuple(_)
+            | Type::Record(_)
+            | Type::Array(_)
+            | Type::Named(..)
+            | Type::Str => ValueLayout::pointer_cell(),
             Type::Vector(shape, elem) if matches!(&**elem, Type::Float32) => {
                 let bytes = shape.lanes() * 4;
                 ValueLayout::scalar_bytes(bytes, bytes.min(16).max(4))
@@ -1733,8 +1788,8 @@ mod repr_tests {
         // tagged like any tag-room immediate: `Str << 2` is a low-bits-`00` word the
         // collector skips, and `>> 2` recovers the static, never-moving pointer. It
         // is NOT a managed handle, so it never takes the ToPtr/FromPtr path.
-        assert_eq!(Type::coercion(&var(), &Type::Str), Coercion::Tag);
-        assert_eq!(Type::coercion(&Type::Str, &var()), Coercion::Untag);
+        assert_eq!(Type::coercion(&var(), &Type::Str), Coercion::ToPtr);
+        assert_eq!(Type::coercion(&Type::Str, &var()), Coercion::FromPtr);
         // a polymorphic (uniform) value consumed at a concrete scalar untags.
         assert_eq!(Type::coercion(&Type::Int, &var()), Coercion::Untag);
         // monomorphic joints never coerce.

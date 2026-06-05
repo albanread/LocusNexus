@@ -218,6 +218,14 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_credential_manager_apis() {
+        for name in ["CredReadW", "CredFree"] {
+            let f = find_function_any_dll(name).unwrap_or_else(|| panic!("{name} present"));
+            assert_eq!(f.dll, "advapi32.dll", "{name}");
+        }
+    }
+
+    #[test]
     fn import_lib_mapping() {
         assert_eq!(
             import_lib_for_dll("KERNEL32.DLL").as_deref(),

@@ -1,0 +1,9 @@
+module AgentRt at boundary mints (agent) exposing () =
+-- Private runtime edge for the MCP/agent text channel. The public Agent service
+-- copies the response bytes into a managed String through StringRt.
+
+let locus_agent_ask_utf8 = extern "locus_agent_ask_utf8" : String -> Ptr in
+let locus_agent_response_len = extern "locus_agent_response_len" : Unit -> Int in
+let locus_agent_tell_text = extern "locus_agent_tell_text" : String -> Unit in
+
+()

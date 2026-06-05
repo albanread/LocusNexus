@@ -1,0 +1,30 @@
+module LocusEnv at services seals (winapi, mem) exposing
+  (LocusEnvKey, LocusHome, LocusCache, LocusConfig, LocusTrace, locus_env_get) =
+-- Read-only environment service. App code chooses from a closed set of
+-- LOCUS_* variables; it cannot enumerate or provide arbitrary names.
+
+type LocusEnvKey = LocusHome | LocusCache | LocusConfig | LocusTrace in
+
+let win_locus_env_name = fn key: LocusEnvKey =>
+  match key with
+  | LocusHome => "LOCUS_HOME"
+  | LocusCache => "LOCUS_CACHE"
+  | LocusConfig => "LOCUS_CONFIG"
+  | LocusTrace => "LOCUS_TRACE"
+in
+
+effect locus_env_get_op : LocusEnvKey -> Option[String] in
+
+handle
+  do {
+    let locus_env_get = fn key: LocusEnvKey => locus_env_get_op key;
+  }
+with {
+  locus_env_get_op(key) -> do {
+    let name = win_locus_env_name key;
+    if (win_locus_env_get_ok name) == 0 then
+      None
+    else
+      Some(win_locus_env_get_text name)
+  }
+}

@@ -1,0 +1,30 @@
+module Time at services seals (libc, mem) exposing
+  (clock_ticks, clock_frequency, clock_millis, ticks_to_millis, ticks_to_micros,
+   elapsed_ticks, elapsed_millis) =
+-- stdlib LAYER 1: monotonic timing service over Linux libc.
+-- Linux ticks are nanoseconds from CLOCK_MONOTONIC, so frequency is 1e9.
+
+effect clock_ticks_op : Unit -> Int in
+effect clock_frequency_op : Unit -> Int in
+
+handle
+  do {
+    let clock_ticks = fn u: Unit => clock_ticks_op u;
+    let clock_frequency = fn u: Unit => clock_frequency_op u;
+    let ticks_to_millis = fn ticks: Int =>
+      let freq = clock_frequency () in
+      if freq == 0 then 0 else (ticks * 1000) / freq;
+    let ticks_to_micros = fn ticks: Int =>
+      let freq = clock_frequency () in
+      if freq == 0 then 0 else (ticks * 1000000) / freq;
+    let clock_millis = fn u: Unit =>
+      ticks_to_millis (clock_ticks ());
+    let elapsed_ticks = fn start: Int =>
+      (clock_ticks ()) - start;
+    let elapsed_millis = fn start: Int =>
+      ticks_to_millis (elapsed_ticks start);
+  }
+with {
+  clock_ticks_op(u) -> libc_clock_ticks () ;
+  clock_frequency_op(u) -> libc_clock_frequency ()
+}

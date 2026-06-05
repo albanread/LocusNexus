@@ -1,0 +1,18 @@
+module Agent at services exposing
+  (agent_ask_text, agent_tell_text) =
+-- stdlib LAYER 1: constrained ask/tell text channel for generated programs
+-- running under an MCP/agent host.
+
+let agent_ask_text =
+  fn prompt: String =>
+    let ptr = locus_agent_ask_utf8 prompt in
+    let bytes = locus_agent_response_len () in
+    locus_string_from_utf8 ptr bytes
+in
+
+let agent_tell_text =
+  fn text: String =>
+    locus_agent_tell_text text
+in
+
+()

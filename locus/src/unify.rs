@@ -880,7 +880,9 @@ fn collect_generalizable_row(store: &UnifStore, r: &Row, rows: &mut Vec<RowVarId
 /// called once after `elaborate` and before stage/IR). Walks every node's
 /// `ty`/`row` and recurses into children.
 pub fn zonk(store: &UnifStore, t: &crate::sema::Typed) -> crate::sema::Typed {
-    use crate::sema::{MatchArmT, Node, Typed, TypedHandler, TypedOpClause, TypedReturn};
+    use crate::sema::{
+        MatchArmT, Node, Typed, TypedBlockItem, TypedHandler, TypedOpClause, TypedReturn,
+    };
 
     let z = |c: &Typed| zonk(store, c);
     let zb = |c: &Typed| Box::new(zonk(store, c));
@@ -982,6 +984,31 @@ pub fn zonk(store: &UnifStore, t: &crate::sema::Typed) -> crate::sema::Typed {
         Node::Let { name, bound, body } => Node::Let {
             name: name.clone(),
             bound: zb(bound),
+            body: zb(body),
+        },
+        Node::Block { items, body } => Node::Block {
+            items: items
+                .iter()
+                .map(|item| match item {
+                    TypedBlockItem::Let { name, bound } => TypedBlockItem::Let {
+                        name: name.clone(),
+                        bound: z(bound),
+                    },
+                    TypedBlockItem::LetMut { name, bound } => TypedBlockItem::LetMut {
+                        name: name.clone(),
+                        bound: z(bound),
+                    },
+                    TypedBlockItem::LetTuple {
+                        names,
+                        bound,
+                        fields_layout_known,
+                    } => TypedBlockItem::LetTuple {
+                        names: names.clone(),
+                        bound: z(bound),
+                        fields_layout_known: *fields_layout_known,
+                    },
+                })
+                .collect(),
             body: zb(body),
         },
         Node::LetMut { name, bound, body } => Node::LetMut {

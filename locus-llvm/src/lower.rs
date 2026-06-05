@@ -24,8 +24,9 @@ use inkwell::values::{
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
 use locus::{
-    clause_shape, Atom, BinOp, CastOp, Comp, ExternAbi, FloatMathOp, Ir, IrHandler, IrOpClause,
-    Label, LoopVar, MaskReduceOp, MemWidth, Row, Shape, Type, ValueLayout, VectorShape, Width,
+    clause_shape, Atom, BinOp, CastOp, Comp, ExternAbi, FloatMathOp, Ir, IrBind, IrHandler,
+    IrOpClause, Label, LoopVar, MaskReduceOp, MemWidth, Row, Shape, Type, ValueLayout, VectorShape,
+    Width,
 };
 
 /// An installed handler while its scrutinee is lowered. A `perform` finds its
@@ -52,6 +53,12 @@ struct RawScalarArray<'ctx> {
 }
 
 type ArrayIndexBound = (String, String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopVarStorage {
+    Scalar,
+    HandleRoot,
+}
 
 #[derive(Clone)]
 struct CaptureInfo {
@@ -135,6 +142,34 @@ fn capture_cells(layout: ValueLayout, context: &str) -> Result<u64, String> {
     }
 }
 
+fn loop_var_uses_root(layout: ValueLayout) -> bool {
+    layout.is_single_pointer_cell() && !layout.is_word_cell()
+}
+
+fn loop_var_storage(var: &LoopVar) -> Result<LoopVarStorage, String> {
+    if var.layout.is_scalar_only() {
+        Ok(LoopVarStorage::Scalar)
+    } else if loop_var_uses_root(var.layout) {
+        Ok(LoopVarStorage::HandleRoot)
+    } else if !var.layout.known {
+        Err(format!(
+            "codegen: loop accumulator `{}` has unknown storage layout",
+            var.name
+        ))
+    } else if var.layout.is_word_cell() {
+        Err(format!(
+            "codegen: loop accumulator `{}` has repr-polymorphic word layout; \
+             instantiate it before handle-root lowering",
+            var.name
+        ))
+    } else {
+        Err(format!(
+            "codegen: loop accumulator `{}` has unsupported mixed layout p{} s{}",
+            var.name, var.layout.pointer_cells, var.layout.scalar_cells
+        ))
+    }
+}
+
 enum ArrayElemLayout {
     Pointer,
     /// A scalar-payload element. `elem_cells` is `ceil(byte_width/8)`: a
@@ -203,13 +238,53 @@ pub(crate) fn block_performs_gc(ir: &Ir) -> bool {
         row.labels().any(|l| matches!(l, Label::Gc))
     }
     match ir {
-        Ir::Let { row, rest, .. } => row_has_gc(row) || block_performs_gc(rest),
-        Ir::Ret { row, .. } => row_has_gc(row),
+        Ir::Block { binds, row, comp } => {
+            binds
+                .iter()
+                .any(|bind| row_has_gc(&bind.row) || comp_needs_gc_runtime(&bind.comp))
+                || row_has_gc(row)
+                || comp_needs_gc_runtime(comp)
+        }
+        Ir::Let {
+            row, comp, rest, ..
+        } => row_has_gc(row) || comp_needs_gc_runtime(comp) || block_performs_gc(rest),
+        Ir::Ret { row, comp } => row_has_gc(row) || comp_needs_gc_runtime(comp),
+    }
+}
+
+fn comp_needs_gc_runtime(comp: &Comp) -> bool {
+    match comp {
+        Comp::If(_, then, els) => block_performs_gc(then) || block_performs_gc(els),
+        Comp::Loop {
+            vars,
+            cond,
+            steps,
+            result,
+            ..
+        } => {
+            vars.iter().any(|var| loop_var_uses_root(var.layout))
+                || block_performs_gc(cond)
+                || steps.iter().any(block_performs_gc)
+                || block_performs_gc(result)
+        }
+        Comp::Quote(body) | Comp::Letloc(body) => block_performs_gc(body),
+        Comp::Handle {
+            scrutinee, handler, ..
+        } => {
+            block_performs_gc(scrutinee)
+                || handler.ops.iter().any(|op| block_performs_gc(&op.body))
+                || block_performs_gc(&handler.ret.body)
+        }
+        _ => false,
     }
 }
 
 fn block_produces_gc_handle(ir: &Ir) -> bool {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            binds.iter().any(|bind| comp_produces_gc_handle(&bind.comp))
+                || comp_produces_gc_handle(comp)
+        }
         Ir::Let { comp, rest, .. } => {
             comp_produces_gc_handle(comp) || block_produces_gc_handle(rest)
         }
@@ -219,6 +294,7 @@ fn block_produces_gc_handle(ir: &Ir) -> bool {
 
 fn comp_produces_gc_handle(comp: &Comp) -> bool {
     match comp {
+        Comp::Atom(Atom::Str(_)) => true,
         // `ref e` allocates a one-field heap cell and yields its **handle** — a
         // managed value to be rooted, exactly like a tuple/array allocation.
         Comp::Lam { .. } | Comp::Tuple(_) | Comp::ArrayLit { .. } | Comp::RefNew(_, _) => true,
@@ -255,6 +331,12 @@ fn comp_produces_gc_handle(comp: &Comp) -> bool {
 /// codegen borrow raw object-field pointers for the duration of the loop.
 fn block_preserves_raw_heap_ptrs(ir: &Ir) -> bool {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            binds
+                .iter()
+                .all(|bind| comp_preserves_raw_heap_ptrs(&bind.comp))
+                && comp_preserves_raw_heap_ptrs(comp)
+        }
         Ir::Let { comp, rest, .. } => {
             comp_preserves_raw_heap_ptrs(comp) && block_preserves_raw_heap_ptrs(rest)
         }
@@ -264,6 +346,7 @@ fn block_preserves_raw_heap_ptrs(ir: &Ir) -> bool {
 
 fn comp_preserves_raw_heap_ptrs(comp: &Comp) -> bool {
     match comp {
+        Comp::Atom(Atom::Str(_)) => false,
         Comp::Atom(_)
         | Comp::Extern(_, _)
         | Comp::Bin(_, _, _)
@@ -342,6 +425,12 @@ fn comp_preserves_raw_heap_ptrs(comp: &Comp) -> bool {
 
 fn collect_raw_array_uses(ir: &Ir, out: &mut Vec<String>) {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            for bind in binds {
+                collect_raw_array_uses_comp(&bind.comp, out);
+            }
+            collect_raw_array_uses_comp(comp, out);
+        }
         Ir::Let { comp, rest, .. } => {
             collect_raw_array_uses_comp(comp, out);
             collect_raw_array_uses(rest, out);
@@ -464,6 +553,17 @@ fn nonnegative_loop_vars(vars: &[LoopVar], steps: &[Ir]) -> HashSet<String> {
 
 fn step_preserves_nonnegative_loop_var(name: &str, step: &Ir) -> bool {
     match step {
+        Ir::Block { binds, comp, .. } => {
+            binds
+                .iter()
+                .all(|bind| bind.name != name && !comp_binds_name(&bind.comp, name))
+                && match comp {
+                    Comp::Atom(Atom::Var(x)) => x == name,
+                    Comp::Bin(BinOp::Add, Atom::Var(x), Atom::Int(n))
+                    | Comp::Bin(BinOp::Add, Atom::Int(n), Atom::Var(x)) => x == name && *n >= 0,
+                    _ => false,
+                }
+        }
         Ir::Let {
             name: bound,
             comp,
@@ -489,6 +589,18 @@ fn collect_len_upper_bounds(
     out: &mut Vec<ArrayIndexBound>,
 ) {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            for bind in binds {
+                if let Comp::Len(Atom::Var(arr)) = &bind.comp {
+                    lens.insert(bind.name.clone(), arr.clone());
+                }
+            }
+            if let Comp::Bin(BinOp::Lt, Atom::Var(idx), Atom::Var(bound)) = comp {
+                if let Some(arr) = lens.get(bound) {
+                    out.push((arr.clone(), idx.clone()));
+                }
+            }
+        }
         Ir::Let {
             name, comp, rest, ..
         } => {
@@ -509,6 +621,12 @@ fn collect_len_upper_bounds(
 
 fn block_binds_name(ir: &Ir, target: &str) -> bool {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            binds
+                .iter()
+                .any(|bind| bind.name == target || comp_binds_name(&bind.comp, target))
+                || comp_binds_name(comp, target)
+        }
         Ir::Let {
             name, comp, rest, ..
         } => name == target || comp_binds_name(comp, target) || block_binds_name(rest, target),
@@ -735,8 +853,68 @@ struct Cg<'ctx, 'a> {
 }
 
 impl<'ctx> Cg<'ctx, '_> {
+    fn lower_binding(
+        &mut self,
+        name: &str,
+        ty: &Type,
+        layout: ValueLayout,
+        comp: &Comp,
+    ) -> Result<(), String> {
+        // A foreign-function binding introduces no value; a call to it
+        // was collected into `Comp::Foreign` during IR lowering.
+        if let Comp::Extern(..) = comp {
+            return Ok(());
+        }
+        // A recursive function binding shows up structurally: a
+        // `let`-bound lambda whose body references the let name.
+        if let Comp::Lam {
+            param,
+            param_ty,
+            param_layout,
+            ret_ty,
+            body,
+        } = comp
+        {
+            if free_vars(body, param).contains(name) {
+                let v = self.lower_closure(
+                    Some(name),
+                    param,
+                    param_ty.as_ref(),
+                    *param_layout,
+                    ret_ty,
+                    body,
+                )?;
+                self.env.insert(
+                    name.to_string(),
+                    EnvVal {
+                        value: v,
+                        ty: ty.clone(),
+                        layout,
+                    },
+                );
+                return Ok(());
+            }
+        }
+        let v = self.lower_comp(comp)?;
+        self.env.insert(
+            name.to_string(),
+            EnvVal {
+                value: v,
+                ty: ty.clone(),
+                layout,
+            },
+        );
+        Ok(())
+    }
+
     fn lower_block(&mut self, ir: &Ir) -> Result<BasicValueEnum<'ctx>, String> {
         match ir {
+            Ir::Block { binds, comp, .. } => {
+                for bind in binds {
+                    self.lower_binding(&bind.name, &bind.ty, bind.layout, &bind.comp)?;
+                }
+                self.lower_comp(comp)
+            }
             Ir::Let {
                 name,
                 ty,
@@ -745,50 +923,7 @@ impl<'ctx> Cg<'ctx, '_> {
                 rest,
                 ..
             } => {
-                // A foreign-function binding introduces no value; a call to it
-                // was collected into `Comp::Foreign` during IR lowering.
-                if let Comp::Extern(..) = comp {
-                    return self.lower_block(rest);
-                }
-                // A recursive function binding shows up structurally: a
-                // `let`-bound lambda whose body references the let name.
-                if let Comp::Lam {
-                    param,
-                    param_ty,
-                    param_layout,
-                    ret_ty,
-                    body,
-                } = comp
-                {
-                    if free_vars(body, param).contains(name) {
-                        let v = self.lower_closure(
-                            Some(name),
-                            param,
-                            param_ty.as_ref(),
-                            *param_layout,
-                            ret_ty,
-                            body,
-                        )?;
-                        self.env.insert(
-                            name.clone(),
-                            EnvVal {
-                                value: v,
-                                ty: ty.clone(),
-                                layout: *layout,
-                            },
-                        );
-                        return self.lower_block(rest);
-                    }
-                }
-                let v = self.lower_comp(comp)?;
-                self.env.insert(
-                    name.clone(),
-                    EnvVal {
-                        value: v,
-                        ty: ty.clone(),
-                        layout: *layout,
-                    },
-                );
+                self.lower_binding(name, ty, *layout, comp)?;
                 self.lower_block(rest)
             }
             Ir::Ret { comp, .. } => self.lower_comp(comp),
@@ -1308,7 +1443,10 @@ impl<'ctx> Cg<'ctx, '_> {
             Row::pure(),
         );
 
-        let mut captures: Vec<String> = free_vars(body, param).into_iter().collect();
+        let mut capture_set = free_vars(body, param);
+        capture_set.extend(active_handler_free_vars(body, &self.handlers));
+        capture_set.remove(param);
+        let mut captures: Vec<String> = capture_set.into_iter().collect();
         captures.sort();
         let capture_infos = self.capture_layout(self_name, Some(&self_fun_ty), &captures)?;
 
@@ -1598,6 +1736,12 @@ impl<'ctx> Cg<'ctx, '_> {
         frame: Option<IntValue<'ctx>>,
     ) -> Result<(), String> {
         match ir {
+            Ir::Block { binds, comp, .. } => {
+                for bind in binds {
+                    self.lower_binding(&bind.name, &bind.ty, bind.layout, &bind.comp)?;
+                }
+                self.lower_tail_comp(comp, self_name, loop_block, arg_phi, frame)
+            }
             Ir::Let {
                 name,
                 ty,
@@ -1606,55 +1750,27 @@ impl<'ctx> Cg<'ctx, '_> {
                 rest,
                 ..
             } => {
-                if let Comp::Extern(..) = comp {
-                    return self.lower_tail_return(rest, self_name, loop_block, arg_phi, frame);
-                }
-                if let Comp::Lam {
-                    param,
-                    param_ty,
-                    param_layout,
-                    ret_ty,
-                    body,
-                } = comp
-                {
-                    if free_vars(body, param).contains(name) {
-                        let v = self.lower_closure(
-                            Some(name),
-                            param,
-                            param_ty.as_ref(),
-                            *param_layout,
-                            ret_ty,
-                            body,
-                        )?;
-                        self.env.insert(
-                            name.clone(),
-                            EnvVal {
-                                value: v,
-                                ty: ty.clone(),
-                                layout: *layout,
-                            },
-                        );
-                        return self.lower_tail_return(rest, self_name, loop_block, arg_phi, frame);
-                    }
-                }
-                let v = self.lower_comp(comp)?;
-                self.env.insert(
-                    name.clone(),
-                    EnvVal {
-                        value: v,
-                        ty: ty.clone(),
-                        layout: *layout,
-                    },
-                );
+                self.lower_binding(name, ty, *layout, comp)?;
                 self.lower_tail_return(rest, self_name, loop_block, arg_phi, frame)
             }
-            Ir::Ret {
-                comp:
-                    Comp::App {
-                        fun: Atom::Var(f),
-                        arg,
-                        ..
-                    },
+            Ir::Ret { comp, .. } => {
+                self.lower_tail_comp(comp, self_name, loop_block, arg_phi, frame)
+            }
+        }
+    }
+
+    fn lower_tail_comp(
+        &mut self,
+        comp: &Comp,
+        self_name: &str,
+        loop_block: BasicBlock<'ctx>,
+        arg_phi: PhiValue<'ctx>,
+        frame: Option<IntValue<'ctx>>,
+    ) -> Result<(), String> {
+        match comp {
+            Comp::App {
+                fun: Atom::Var(f),
+                arg,
                 ..
             } if f == self_name => {
                 let next = Self::expect_cell(self.lower_atom(arg)?, "tail-recursive argument")?;
@@ -1668,11 +1784,10 @@ impl<'ctx> Cg<'ctx, '_> {
                     .map_err(|e| e.to_string())?;
                 Ok(())
             }
-            Ir::Ret {
-                comp: Comp::If(cond, then, els),
-                ..
-            } => self.lower_tail_if(cond, then, els, self_name, loop_block, arg_phi, frame),
-            Ir::Ret { comp, .. } => {
+            Comp::If(cond, then, els) => {
+                self.lower_tail_if(cond, then, els, self_name, loop_block, arg_phi, frame)
+            }
+            _ => {
                 let ret = Self::expect_cell(self.lower_comp(comp)?, "function result")?;
                 let ret = match frame {
                     Some(frame) => self.gc_leave_with(frame, ret)?,
@@ -2151,27 +2266,43 @@ impl<'ctx> Cg<'ctx, '_> {
                 steps.len()
             ));
         }
-        if block_produces_gc_handle(cond) || steps.iter().any(block_produces_gc_handle) {
-            return Err(
-                "codegen: loop condition/steps must not allocate or produce handles until loop handle-frame handoff is implemented"
-                    .into(),
-            );
-        }
-        for var in vars {
-            if !var.layout.is_scalar_only() {
-                return Err(format!(
-                    "codegen: loop accumulator `{}` must be scalar/unboxed for now; handle-carrying loops need GC handoff",
-                    var.name
-                ));
-            }
+        let storages = vars
+            .iter()
+            .map(loop_var_storage)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_handle_roots = storages
+            .iter()
+            .any(|storage| matches!(storage, LoopVarStorage::HandleRoot));
+        if has_handle_roots && !self.uses_gc {
+            return Err("codegen: handle loop accumulators require the GC runtime".into());
         }
 
         let mut init_vals = Vec::with_capacity(vars.len());
-        for var in vars {
-            init_vals.push(self.lower_atom(&var.init)?);
+        let mut handle_roots = Vec::with_capacity(vars.len());
+        for (var, storage) in vars.iter().zip(storages.iter()) {
+            let init = self.lower_atom(&var.init)?;
+            match storage {
+                LoopVarStorage::Scalar => {
+                    init_vals.push(Some(init));
+                    handle_roots.push(None);
+                }
+                LoopVarStorage::HandleRoot => {
+                    let init = Self::expect_cell(init, "loop handle accumulator init")?;
+                    let root = self.gc_root(init)?;
+                    init_vals.push(None);
+                    handle_roots.push(Some(root));
+                }
+            }
         }
 
-        let raw_array_names = if block_preserves_raw_heap_ptrs(cond)
+        let handle_loop_names: HashSet<String> = vars
+            .iter()
+            .zip(storages.iter())
+            .filter_map(|(var, storage)| {
+                matches!(storage, LoopVarStorage::HandleRoot).then(|| var.name.clone())
+            })
+            .collect();
+        let mut raw_array_names = if block_preserves_raw_heap_ptrs(cond)
             && steps.iter().all(block_preserves_raw_heap_ptrs)
         {
             let mut names = Vec::new();
@@ -2183,6 +2314,7 @@ impl<'ctx> Cg<'ctx, '_> {
         } else {
             Vec::new()
         };
+        raw_array_names.retain(|name| !handle_loop_names.contains(name));
         let borrowed_raw_arrays = self.borrow_raw_scalar_arrays(&raw_array_names)?;
         let proved_array_bounds = proved_loop_array_bounds(vars, cond, steps);
 
@@ -2213,25 +2345,54 @@ impl<'ctx> Cg<'ctx, '_> {
 
         self.builder.position_at_end(header_bb);
         let mut phis = Vec::with_capacity(vars.len());
-        for (var, init) in vars.iter().zip(init_vals.iter()) {
-            let phi = self
-                .builder
-                .build_phi(init.get_type(), &format!("loop.{}", var.name))
-                .map_err(|e| e.to_string())?;
-            phi.add_incoming(&[(init, preheader)]);
-            loop_env.insert(
-                var.name.clone(),
-                EnvVal {
-                    value: phi.as_basic_value(),
-                    ty: var.ty.clone(),
-                    layout: var.layout,
-                },
-            );
-            phis.push(phi);
+        for (((var, storage), init), root) in vars
+            .iter()
+            .zip(storages.iter())
+            .zip(init_vals.iter())
+            .zip(handle_roots.iter())
+        {
+            match storage {
+                LoopVarStorage::Scalar => {
+                    let init = init.ok_or_else(|| {
+                        format!(
+                            "codegen: loop accumulator `{}` has no scalar init",
+                            var.name
+                        )
+                    })?;
+                    let phi = self
+                        .builder
+                        .build_phi(init.get_type(), &format!("loop.{}", var.name))
+                        .map_err(|e| e.to_string())?;
+                    phi.add_incoming(&[(&init, preheader)]);
+                    loop_env.insert(
+                        var.name.clone(),
+                        EnvVal {
+                            value: phi.as_basic_value(),
+                            ty: var.ty.clone(),
+                            layout: var.layout,
+                        },
+                    );
+                    phis.push(Some(phi));
+                }
+                LoopVarStorage::HandleRoot => {
+                    let root = root.ok_or_else(|| {
+                        format!("codegen: loop accumulator `{}` has no root", var.name)
+                    })?;
+                    loop_env.insert(
+                        var.name.clone(),
+                        EnvVal {
+                            value: root.into(),
+                            ty: var.ty.clone(),
+                            layout: var.layout,
+                        },
+                    );
+                    phis.push(None);
+                }
+            }
         }
 
         self.env = loop_env.clone();
-        let cond_val = self.lower_block(cond)?;
+        let cond_val = self.lower_loop_block(cond)?;
         let cond_cell = Self::expect_cell(cond_val, "loop condition")?;
         let zero = self.ctx.i64_type().const_int(0, false);
         let test = self
@@ -2244,21 +2405,65 @@ impl<'ctx> Cg<'ctx, '_> {
             .map_err(|e| e.to_string())?;
 
         self.builder.position_at_end(body_bb);
-        let mut next_vals = Vec::with_capacity(steps.len());
+        let mut next_vals: Vec<Option<BasicValueEnum<'ctx>>> =
+            (0..steps.len()).map(|_| None).collect();
         for bound in &proved_array_bounds {
             self.loop_array_bounds.insert(bound.clone());
         }
-        for step in steps {
-            self.env = loop_env.clone();
-            next_vals.push(self.lower_block(step)?);
+        if has_handle_roots {
+            let needs_frame = steps
+                .iter()
+                .any(|step| block_performs_gc(step) || block_produces_gc_handle(step));
+            let frame = if self.uses_gc && needs_frame {
+                Some(self.gc_enter()?)
+            } else {
+                None
+            };
+            let mut next_handles = Vec::new();
+            for (idx, (step, storage)) in steps.iter().zip(storages.iter()).enumerate() {
+                self.env = loop_env.clone();
+                let next = self.lower_block(step)?;
+                match storage {
+                    LoopVarStorage::Scalar => next_vals[idx] = Some(next),
+                    LoopVarStorage::HandleRoot => {
+                        let next = Self::expect_cell(next, "loop handle accumulator step")?;
+                        next_handles.push((idx, next));
+                    }
+                }
+            }
+            for (idx, next) in next_handles {
+                let root = handle_roots[idx].ok_or_else(|| {
+                    format!(
+                        "codegen: loop accumulator `{}` has no root for update",
+                        vars[idx].name
+                    )
+                })?;
+                self.gc_root_set(root, next)?;
+            }
+            if let Some(frame) = frame {
+                self.gc_leave(frame)?;
+            }
+        } else {
+            for (idx, step) in steps.iter().enumerate() {
+                self.env = loop_env.clone();
+                next_vals[idx] = Some(self.lower_loop_block(step)?);
+            }
         }
         self.loop_array_bounds = saved_loop_array_bounds.clone();
         let body_end = self
             .builder
             .get_insert_block()
             .ok_or("codegen: loop body has no current block")?;
-        for (phi, next) in phis.iter().zip(next_vals.iter()) {
-            phi.add_incoming(&[(next, body_end)]);
+        for (idx, phi) in phis.iter().enumerate() {
+            if let Some(phi) = phi {
+                let next = next_vals[idx].ok_or_else(|| {
+                    format!(
+                        "codegen: loop accumulator `{}` has no scalar step",
+                        vars[idx].name
+                    )
+                })?;
+                phi.add_incoming(&[(&next, body_end)]);
+            }
         }
         self.builder
             .build_unconditional_branch(header_bb)
@@ -2271,6 +2476,17 @@ impl<'ctx> Cg<'ctx, '_> {
         let out = self.lower_block(result)?;
         self.env = saved_outer;
         Ok(out)
+    }
+
+    fn lower_loop_block(&mut self, ir: &Ir) -> Result<BasicValueEnum<'ctx>, String> {
+        let needs_frame = block_performs_gc(ir) || block_produces_gc_handle(ir);
+        let frame = if self.uses_gc && needs_frame {
+            Some(self.gc_enter()?)
+        } else {
+            None
+        };
+        let value = self.lower_block(ir)?;
+        self.return_with_frame(frame, value)
     }
 
     fn trap_if(&mut self, cond: IntValue<'ctx>, label: &str) -> Result<(), String> {
@@ -2666,9 +2882,7 @@ impl<'ctx> Cg<'ctx, '_> {
             .builder
             .build_store(elem_ptr, v)
             .map_err(|e| e.to_string())?;
-        store
-            .set_alignment(elem_bytes)
-            .map_err(|e| e.to_string())?;
+        store.set_alignment(elem_bytes).map_err(|e| e.to_string())?;
         Ok(self.ctx.i64_type().const_zero().into())
     }
 
@@ -2732,7 +2946,11 @@ impl<'ctx> Cg<'ctx, '_> {
         let b = self.lower_atom(rhs)?.into_vector_value();
         let pred = match op {
             BinOp::Eq => FloatPredicate::OEQ,
+            BinOp::Ne => FloatPredicate::ONE,
             BinOp::Lt => FloatPredicate::OLT,
+            BinOp::Le => FloatPredicate::OLE,
+            BinOp::Gt => FloatPredicate::OGT,
+            BinOp::Ge => FloatPredicate::OGE,
             _ => {
                 return Err(format!(
                     "codegen: `{}` is not a supported vector comparison",
@@ -3209,11 +3427,43 @@ impl<'ctx> Cg<'ctx, '_> {
                     .map_err(|e| e.to_string())?
                     .into())
             }
+            BinOp::Ne => {
+                let cmp = b
+                    .build_float_compare(FloatPredicate::ONE, a, c, "fne")
+                    .map_err(|e| e.to_string())?;
+                Ok(b.build_int_z_extend(cmp, i64t, "fnew")
+                    .map_err(|e| e.to_string())?
+                    .into())
+            }
             BinOp::Lt => {
                 let cmp = b
                     .build_float_compare(FloatPredicate::OLT, a, c, "flt")
                     .map_err(|e| e.to_string())?;
                 Ok(b.build_int_z_extend(cmp, i64t, "fltw")
+                    .map_err(|e| e.to_string())?
+                    .into())
+            }
+            BinOp::Le => {
+                let cmp = b
+                    .build_float_compare(FloatPredicate::OLE, a, c, "fle")
+                    .map_err(|e| e.to_string())?;
+                Ok(b.build_int_z_extend(cmp, i64t, "flew")
+                    .map_err(|e| e.to_string())?
+                    .into())
+            }
+            BinOp::Gt => {
+                let cmp = b
+                    .build_float_compare(FloatPredicate::OGT, a, c, "fgt")
+                    .map_err(|e| e.to_string())?;
+                Ok(b.build_int_z_extend(cmp, i64t, "fgtw")
+                    .map_err(|e| e.to_string())?
+                    .into())
+            }
+            BinOp::Ge => {
+                let cmp = b
+                    .build_float_compare(FloatPredicate::OGE, a, c, "fge")
+                    .map_err(|e| e.to_string())?;
+                Ok(b.build_int_z_extend(cmp, i64t, "fgew")
                     .map_err(|e| e.to_string())?
                     .into())
             }
@@ -3298,6 +3548,9 @@ impl<'ctx> Cg<'ctx, '_> {
             BinOp::Div => {
                 return self.lower_int_div(a, c);
             }
+            BinOp::Mod => {
+                return self.lower_int_rem(a, c);
+            }
             BinOp::AddChecked | BinOp::SubChecked | BinOp::MulChecked => {
                 return self.lower_checked_int(op, a, c);
             }
@@ -3316,11 +3569,39 @@ impl<'ctx> Cg<'ctx, '_> {
                 b.build_int_z_extend(cmp, i64t, "eqw")
                     .map_err(|e| e.to_string())?
             }
+            BinOp::Ne => {
+                let cmp = b
+                    .build_int_compare(IntPredicate::NE, a, c, "ne")
+                    .map_err(|e| e.to_string())?;
+                b.build_int_z_extend(cmp, i64t, "new")
+                    .map_err(|e| e.to_string())?
+            }
             BinOp::Lt => {
                 let cmp = b
                     .build_int_compare(IntPredicate::SLT, a, c, "lt")
                     .map_err(|e| e.to_string())?;
                 b.build_int_z_extend(cmp, i64t, "ltw")
+                    .map_err(|e| e.to_string())?
+            }
+            BinOp::Le => {
+                let cmp = b
+                    .build_int_compare(IntPredicate::SLE, a, c, "le")
+                    .map_err(|e| e.to_string())?;
+                b.build_int_z_extend(cmp, i64t, "lew")
+                    .map_err(|e| e.to_string())?
+            }
+            BinOp::Gt => {
+                let cmp = b
+                    .build_int_compare(IntPredicate::SGT, a, c, "gt")
+                    .map_err(|e| e.to_string())?;
+                b.build_int_z_extend(cmp, i64t, "gtw")
+                    .map_err(|e| e.to_string())?
+            }
+            BinOp::Ge => {
+                let cmp = b
+                    .build_int_compare(IntPredicate::SGE, a, c, "ge")
+                    .map_err(|e| e.to_string())?;
+                b.build_int_z_extend(cmp, i64t, "gew")
                     .map_err(|e| e.to_string())?
             }
         };
@@ -3357,6 +3638,40 @@ impl<'ctx> Cg<'ctx, '_> {
 
         let r = b
             .build_int_signed_div(lhs, rhs, "sdiv")
+            .map_err(|e| e.to_string())?;
+        Ok(r.into())
+    }
+
+    fn lower_int_rem(
+        &mut self,
+        lhs: IntValue<'ctx>,
+        rhs: IntValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let i64t = self.ctx.i64_type();
+        let b = self.builder;
+        let zero = i64t.const_zero();
+        let minus_one = i64t.const_int((-1_i64) as u64, true);
+        let min = i64t.const_int(i64::MIN as u64, true);
+
+        let rem_by_zero = b
+            .build_int_compare(IntPredicate::EQ, rhs, zero, "rem.zero")
+            .map_err(|e| e.to_string())?;
+        let lhs_min = b
+            .build_int_compare(IntPredicate::EQ, lhs, min, "rem.lhs_min")
+            .map_err(|e| e.to_string())?;
+        let rhs_minus_one = b
+            .build_int_compare(IntPredicate::EQ, rhs, minus_one, "rem.rhs_minus_one")
+            .map_err(|e| e.to_string())?;
+        let overflow = b
+            .build_and(lhs_min, rhs_minus_one, "rem.overflow")
+            .map_err(|e| e.to_string())?;
+        let invalid = b
+            .build_or(rem_by_zero, overflow, "rem.invalid")
+            .map_err(|e| e.to_string())?;
+        self.trap_if(invalid, "rem")?;
+
+        let r = b
+            .build_int_signed_rem(lhs, rhs, "srem")
             .map_err(|e| e.to_string())?;
         Ok(r.into())
     }
@@ -3620,6 +3935,22 @@ impl<'ctx> Cg<'ctx, '_> {
         self.gc_call("locus_gc_leave", &[frame], false).map(|_| ())
     }
 
+    fn gc_root(&mut self, value: IntValue<'ctx>) -> Result<IntValue<'ctx>, String> {
+        Ok(self
+            .gc_call("locus_gc_root", &[value], true)?
+            .expect("root returns a handle"))
+    }
+
+    fn gc_root_set(
+        &mut self,
+        root: IntValue<'ctx>,
+        value: IntValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, String> {
+        Ok(self
+            .gc_call("locus_gc_root_set", &[root, value], true)?
+            .expect("root_set returns a handle"))
+    }
+
     fn return_with_frame(
         &mut self,
         frame: Option<IntValue<'ctx>>,
@@ -3831,7 +4162,13 @@ impl<'ctx> Cg<'ctx, '_> {
                     false,
                 )?;
                 for (i, v) in vals.into_iter().enumerate() {
-                    self.array_store_scalar_elem(arr, i64t.const_int(i as u64, false), v, stride, elem_cells)?;
+                    self.array_store_scalar_elem(
+                        arr,
+                        i64t.const_int(i as u64, false),
+                        v,
+                        stride,
+                        elem_cells,
+                    )?;
                 }
                 Ok(arr.into())
             }
@@ -4037,20 +4374,8 @@ impl<'ctx> Cg<'ctx, '_> {
             // boundaries that dereference it (`perform console`, foreign `…W`
             // calls) `inttoptr` it back.
             Atom::Str(s) => {
-                let i16t = self.ctx.i16_type();
-                let mut units: Vec<_> = s
-                    .encode_utf16()
-                    .map(|u| i16t.const_int(u64::from(u), false))
-                    .collect();
-                units.push(i16t.const_int(0, false)); // NUL terminator
-                let arr = i16t.const_array(&units);
-                let g = self.module.add_global(arr.get_type(), None, "wstr");
-                g.set_initializer(&arr);
-                g.set_constant(true);
-                self.builder
-                    .build_ptr_to_int(g.as_pointer_value(), i64t, "str.int")
-                    .map_err(|e| e.to_string())?
-                    .into()
+                let units: Vec<_> = s.encode_utf16().map(|u| Atom::Int(i64::from(u))).collect();
+                self.lower_array_lit(&units, ValueLayout::scalar_bytes(2, 2))?
             }
             Atom::Var(x) => {
                 self.env
@@ -4145,16 +4470,15 @@ impl<'ctx> Cg<'ctx, '_> {
         // barrier is Sprint 3). `field_region` would also classify a pointer cell,
         // but sema guarantees scalar here — assert it loudly rather than silently
         // mis-lower if that ever changes.
-        let cells = match field_region(layout, "ref cell")? {
-            FieldRegion::Scalar { cells } => cells,
-            FieldRegion::Pointer { .. } => {
-                return Err(
+        let cells =
+            match field_region(layout, "ref cell")? {
+                FieldRegion::Scalar { cells } => cells,
+                FieldRegion::Pointer { .. } => return Err(
                     "codegen: a pointer-typed `Ref` cell needs the GC write barrier (Sprint 3); \
                      sema should have rejected it (RN-E0247)"
                         .into(),
-                )
-            }
-        };
+                ),
+            };
         let obj = self
             .gc_call(
                 "locus_gc_alloc",
@@ -4193,11 +4517,7 @@ impl<'ctx> Cg<'ctx, '_> {
         let mut words = Vec::with_capacity(cells as usize);
         for k in 0..cells {
             let word = self
-                .gc_call(
-                    "locus_gc_get_scalar",
-                    &[rv, i64t.const_int(k, false)],
-                    true,
-                )?
+                .gc_call("locus_gc_get_scalar", &[rv, i64t.const_int(k, false)], true)?
                 .expect("get returns a value");
             words.push(word);
         }
@@ -4225,7 +4545,9 @@ impl<'ctx> Cg<'ctx, '_> {
         let cells = match field_region(layout, "ref cell")? {
             FieldRegion::Scalar { cells } => cells,
             FieldRegion::Pointer { .. } => {
-                return Err("codegen: pointer-typed `Ref` write needs the barrier (Sprint 3)".into())
+                return Err(
+                    "codegen: pointer-typed `Ref` write needs the barrier (Sprint 3)".into(),
+                )
             }
         };
         let words = self.scalar_value_to_cells(value, cells, "ref cell")?;
@@ -4263,10 +4585,11 @@ impl<'ctx> Cg<'ctx, '_> {
             }
             return Err(format!(
                 "codegen: unhandled effect `{label}` — no handler in scope, and there is no \
-                 native runtime (output is the `writeln` prelude)"
+                 native runtime (output is the `console_writeln` prelude)"
             ));
         };
         let argv = self.lower_atom(arg)?;
+        let saved_env = self.env.clone();
         self.env.insert(
             c.arg.clone(),
             EnvVal {
@@ -4280,6 +4603,7 @@ impl<'ctx> Cg<'ctx, '_> {
                 let saved = self.resume_id.replace(c.resume.clone());
                 let v = self.lower_block(&c.body);
                 self.resume_id = saved;
+                self.env = saved_env;
                 v
             }
             Shape::Abort => {
@@ -4299,6 +4623,7 @@ impl<'ctx> Cg<'ctx, '_> {
                     .ok_or("codegen: no enclosing function for an abort")?;
                 let dead = self.ctx.append_basic_block(func, "after.abort");
                 self.builder.position_at_end(dead);
+                self.env = saved_env;
                 Ok(self.ctx.i64_type().const_int(0, false).into())
             }
             other => Err(format!(
@@ -4433,6 +4758,10 @@ impl<'ctx> Cg<'ctx, '_> {
 /// them) — they raise a clear error.
 fn cps_transform(block: &Ir, handler: &IrHandler) -> Result<Ir, String> {
     match block {
+        Ir::Block { binds, row, comp } => {
+            let nested = let_chain_from_parts(binds, row, comp);
+            cps_transform(&nested, handler)
+        }
         Ir::Ret { comp, row } => {
             if let Comp::Perform(op, arg) = comp {
                 if handler_handles(handler, op) {
@@ -4504,6 +4833,26 @@ fn cps_transform(block: &Ir, handler: &IrHandler) -> Result<Ir, String> {
             })
         }
     }
+}
+
+/// Convert a flat ANF block back to the legacy let-chain spelling used by
+/// the selective-CPS transformer.
+fn let_chain_from_parts(binds: &[IrBind], row: &Row, comp: &Comp) -> Ir {
+    let mut ir = Ir::Ret {
+        row: row.clone(),
+        comp: comp.clone(),
+    };
+    for bind in binds.iter().rev() {
+        ir = Ir::Let {
+            name: bind.name.clone(),
+            ty: bind.ty.clone(),
+            layout: bind.layout,
+            row: bind.row.clone(),
+            comp: bind.comp.clone(),
+            rest: Box::new(ir),
+        };
+    }
+    ir
 }
 
 /// `let <clause.arg> = arg in let <clause.resume> = cont in <clause.body>` — bind
@@ -4589,6 +4938,13 @@ fn comp_performs(comp: &Comp, handler: &IrHandler) -> bool {
 
 fn block_performs(block: &Ir, handler: &IrHandler) -> bool {
     match block {
+        Ir::Block { binds, comp, .. } => {
+            binds.iter().any(|bind| {
+                matches!(&bind.comp, Comp::Perform(op, _) if handler_handles(handler, op))
+                    || comp_performs(&bind.comp, handler)
+            }) || matches!(comp, Comp::Perform(op, _) if handler_handles(handler, op))
+                || comp_performs(comp, handler)
+        }
         Ir::Let { comp, rest, .. } => {
             matches!(comp, Comp::Perform(op, _) if handler_handles(handler, op))
                 || comp_performs(comp, handler)
@@ -4598,6 +4954,82 @@ fn block_performs(block: &Ir, handler: &IrHandler) -> bool {
             matches!(comp, Comp::Perform(op, _) if handler_handles(handler, op))
                 || comp_performs(comp, handler)
         }
+    }
+}
+
+fn active_handler_free_vars<'ctx>(body: &Ir, handlers: &[Frame<'ctx>]) -> HashSet<String> {
+    let mut free = HashSet::new();
+    let mut shadowed = HashSet::new();
+
+    // A lambda body that says only `perform op x` can still lower to a handler
+    // clause that mentions helpers from the handler's lexical scope. Those
+    // helpers must become closure captures before the lifted function is built.
+    for frame in handlers.iter().rev() {
+        for clause in &frame.clauses {
+            if !shadowed.insert(clause.op.clone()) {
+                continue;
+            }
+            if block_performs_label(body, &clause.op) {
+                free.extend(op_clause_free_vars(clause));
+            }
+        }
+    }
+
+    free
+}
+
+fn op_clause_free_vars(clause: &IrOpClause) -> HashSet<String> {
+    let mut bound = vec![clause.arg.clone(), clause.resume.clone()];
+    let mut free = HashSet::new();
+    fv_ir(&clause.body, &mut bound, &mut free);
+    free
+}
+
+fn block_performs_label(block: &Ir, label: &Label) -> bool {
+    match block {
+        Ir::Block { binds, comp, .. } => {
+            binds
+                .iter()
+                .any(|bind| comp_performs_label(&bind.comp, label))
+                || comp_performs_label(comp, label)
+        }
+        Ir::Let { comp, rest, .. } => {
+            comp_performs_label(comp, label) || block_performs_label(rest, label)
+        }
+        Ir::Ret { comp, .. } => comp_performs_label(comp, label),
+    }
+}
+
+fn comp_performs_label(comp: &Comp, label: &Label) -> bool {
+    match comp {
+        Comp::Perform(op, _) => op == label,
+        Comp::If(_, then, els) => {
+            block_performs_label(then, label) || block_performs_label(els, label)
+        }
+        Comp::Loop {
+            cond,
+            steps,
+            result,
+            ..
+        } => {
+            block_performs_label(cond, label)
+                || steps.iter().any(|step| block_performs_label(step, label))
+                || block_performs_label(result, label)
+        }
+        Comp::Lam { body, .. } | Comp::Quote(body) | Comp::Letloc(body) => {
+            block_performs_label(body, label)
+        }
+        Comp::Handle {
+            scrutinee, handler, ..
+        } => {
+            block_performs_label(scrutinee, label)
+                || handler
+                    .ops
+                    .iter()
+                    .any(|clause| block_performs_label(&clause.body, label))
+                || block_performs_label(&handler.ret.body, label)
+        }
+        _ => false,
     }
 }
 
@@ -4613,6 +5045,16 @@ fn free_vars(body: &Ir, param: &str) -> HashSet<String> {
 
 fn fv_ir(ir: &Ir, bound: &mut Vec<String>, free: &mut HashSet<String>) {
     match ir {
+        Ir::Block { binds, comp, .. } => {
+            for bind in binds {
+                fv_comp(&bind.comp, bound, free);
+                bound.push(bind.name.clone());
+            }
+            fv_comp(comp, bound, free);
+            for _ in binds {
+                bound.pop();
+            }
+        }
         Ir::Let {
             name, comp, rest, ..
         } => {
@@ -4839,8 +5281,10 @@ mod tests {
         assert!(field_region(mixed, "mixed value")
             .unwrap_err()
             .contains("unsupported mixed layout p1 s1"));
-        assert!(field_region(ValueLayout::unknown_scalar_cell(), "poly value")
-            .unwrap_err()
-            .contains("unknown storage layout"));
+        assert!(
+            field_region(ValueLayout::unknown_scalar_cell(), "poly value")
+                .unwrap_err()
+                .contains("unknown storage layout")
+        );
     }
 }

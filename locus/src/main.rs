@@ -14,8 +14,8 @@ use std::process;
 
 use locus::iface::{check_client_against, ConsumeError, Import, LoadedInterface};
 use locus::{
-    analyze, elaborate, iface, infer, lower, parse_program, prelude, program, Ctx, Report, Stage,
-    TypeErr,
+    analyze, elaborate, iface, ir_shape, lower, parse_program, prelude, program,
+    program_source_shape, term_shape, typed_shape, Ctx, Report, ShapeMetrics, Stage, TypeErr,
 };
 
 const USAGE: &str = "\
@@ -27,6 +27,10 @@ USAGE:
   locus ir       [options] [FILE]   lower to A-normal form; print the IR (effect-tagged)
   locus evidence [options] [FILE]   evidence-pass; classify each effect (zero-cost / residual)
   locus ast      [options] [FILE]   print the parsed AST
+  locus help [TOPIC] [--human]      discover language syntax, operation, and services
+  locus help search QUERY [--human] search syntax/services/examples/reminders
+  locus help service NAME [--human] show a service/module/function help card
+  locus help services [--human]     list published services
   locus emit-interface [opts] FILE  compile one module; emit its `.locusi` interface
   locus check-client  [opts] FILE   type-check a client against imported `.locusi`s
   locus --help
@@ -37,7 +41,15 @@ OPTIONS (check / ast):
   --stage N      check at stage N (0 = runtime [default], 1 = generation)
   --brief        one-line output (the judgment, or `error: …`)
   --json         machine-readable JSON (schema locus-diag/1)
+  --trace-stack-usage
+                 print compiler tree-depth / spine metrics to stderr
   (default)      structured, labelled text
+
+FOR AGENTS:
+  locus help agent                  start here (JSON by default)
+  locus help search \"loop string\"
+  locus help service Agent
+  locus help remind loops --human
 
 OPTIONS (emit-interface):
   FILE | -       read FILE, or stdin if FILE is `-` or omitted
@@ -82,6 +94,7 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
         Some("ir") => command(&args[1..], Mode::Ir),
         Some("evidence") => command(&args[1..], Mode::Evidence),
         Some("ast") => command(&args[1..], Mode::Ast),
+        Some("help") => cmd_help(&args[1..]),
         Some("emit-interface") => emit_interface(&args[1..]),
         Some("check-client") => check_client(&args[1..]),
         None | Some("--help") | Some("-h") => {
@@ -90,9 +103,148 @@ fn dispatch(args: &[String]) -> Result<i32, String> {
         }
         Some(other) => Err(format!(
             "unknown command `{other}` (try `check`, `sema`, `ir`, `evidence`, `ast`, \
-             `emit-interface`, `check-client`, `--help`)"
+             `help`, `emit-interface`, `check-client`, `--help`)"
         )),
     }
+}
+
+fn cmd_help(args: &[String]) -> Result<i32, String> {
+    let (human, words) = parse_help_args(args);
+    if words.is_empty() || matches!(words[0].as_str(), "overview" | "index") {
+        println!(
+            "{}",
+            if human {
+                locus::help::overview_text()
+            } else {
+                locus::help::overview_json()
+            }
+        );
+        return Ok(0);
+    }
+
+    match words[0].as_str() {
+        "agent" => print_help_card("agent.start", human),
+        "search" => {
+            let query = words[1..].join(" ");
+            if query.trim().is_empty() {
+                return Err("usage: locus help search QUERY [--human]".into());
+            }
+            let hits = locus::help::search(&query, 8);
+            println!(
+                "{}",
+                if human {
+                    locus::help::search_text(&query, &hits)
+                } else {
+                    locus::help::search_json(&query, &hits)
+                }
+            );
+            Ok(0)
+        }
+        "topic" => {
+            let id = words
+                .get(1)
+                .ok_or("usage: locus help topic TOPIC [--human]")?;
+            print_help_card(id, human)
+        }
+        "service" => {
+            let name = words
+                .get(1)
+                .ok_or("usage: locus help service NAME [--human]")?;
+            let Some(card) = locus::help::service(name) else {
+                return Err(format!(
+                    "unknown service `{name}` (try `locus help search {name}`)"
+                ));
+            };
+            println!(
+                "{}",
+                if human {
+                    locus::help::card_text(card)
+                } else {
+                    locus::help::card_json(card)
+                }
+            );
+            Ok(0)
+        }
+        "services" => {
+            println!(
+                "{}",
+                if human {
+                    locus::help::services_text()
+                } else {
+                    locus::help::services_json()
+                }
+            );
+            Ok(0)
+        }
+        "remind" => {
+            let topic = words
+                .get(1)
+                .ok_or("usage: locus help remind TOPIC [--human]")?;
+            println!(
+                "{}",
+                if human {
+                    locus::help::remind_text(topic)
+                } else {
+                    locus::help::remind_json(topic)
+                }
+            );
+            Ok(0)
+        }
+        other => {
+            if let Some(card) = locus::help::find(other) {
+                println!(
+                    "{}",
+                    if human {
+                        locus::help::card_text(card)
+                    } else {
+                        locus::help::card_json(card)
+                    }
+                );
+            } else {
+                let query = words.join(" ");
+                let hits = locus::help::search(&query, 8);
+                println!(
+                    "{}",
+                    if human {
+                        locus::help::search_text(&query, &hits)
+                    } else {
+                        locus::help::search_json(&query, &hits)
+                    }
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn parse_help_args(args: &[String]) -> (bool, Vec<String>) {
+    let mut human = false;
+    let mut words = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--human" => human = true,
+            "--json" => {}
+            _ => words.push(arg.clone()),
+        }
+    }
+    (human, words)
+}
+
+fn print_help_card(id: &str, human: bool) -> Result<i32, String> {
+    let Some(card) = locus::help::find(id) else {
+        return Err(format!(
+            "unknown help topic `{id}` (try `locus help search {id}`)"
+        ));
+    };
+    println!(
+        "{}",
+        if human {
+            locus::help::card_text(card)
+        } else {
+            locus::help::card_json(card)
+        }
+    );
+    Ok(0)
 }
 
 /// What to do with the parsed program.
@@ -141,12 +293,14 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
     let mut stage: Stage = 0;
     let mut inline: Option<String> = None;
     let mut file: Option<String> = None;
+    let mut trace_stack = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--json" => fmt = Fmt::Json,
             "--brief" => fmt = Fmt::Brief,
+            "--trace-stack-usage" => trace_stack = true,
             "--help" | "-h" => {
                 print!("{USAGE}");
                 return Ok(0);
@@ -168,12 +322,27 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
         None => read_input(file.as_deref())?,
     };
 
+    let source_shape = if trace_stack {
+        parse_program(&source)
+            .ok()
+            .map(|p| program_source_shape(&p))
+    } else {
+        None
+    };
+
     // A parse failure is the same diagnostic in every mode. `program` parses the
-    // user source and grafts the prelude (e.g. `writeln`) if the program uses it.
+    // user source and grafts the prelude (e.g. `console_writeln`) if the program uses it.
     let term = match program(&source) {
         Ok(t) => t,
         Err(e) => return Ok(emit(&Report::parse_error(&e, &source), fmt)),
     };
+    if trace_stack {
+        trace_stack_header();
+        if let Some(shape) = source_shape {
+            trace_shape("user source", shape);
+        }
+        trace_shape("stdlib-grafted term", term_shape(&term));
+    }
 
     match mode {
         Mode::Ast => Ok(emit(
@@ -184,8 +353,17 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
         )),
 
         Mode::Check => {
-            let r = match infer(&prelude::sig(), &Ctx::new(), stage, &term) {
-                Ok((ty, row)) => Report::Ok { ty, row, stage },
+            let r = match elaborate(&prelude::sig(), &Ctx::new(), stage, &term) {
+                Ok(tree) => {
+                    if trace_stack {
+                        trace_shape("typed tree", typed_shape(&tree));
+                    }
+                    Report::Ok {
+                        ty: tree.ty,
+                        row: tree.row,
+                        stage,
+                    }
+                }
                 Err(e) => Report::type_error(&e),
             };
             Ok(emit(&r, fmt))
@@ -196,6 +374,9 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
         // Errors stay on the shared diagnostic path.
         Mode::Sema => match elaborate(&prelude::sig(), &Ctx::new(), stage, &term) {
             Ok(tree) => {
+                if trace_stack {
+                    trace_shape("typed tree", typed_shape(&tree));
+                }
                 println!(
                     "{}",
                     match fmt {
@@ -213,6 +394,9 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
         // `--brief` keeps the program's overall judgment for context.
         Mode::Ir => match elaborate(&prelude::sig(), &Ctx::new(), stage, &term) {
             Ok(tree) => {
+                if trace_stack {
+                    trace_shape("typed tree", typed_shape(&tree));
+                }
                 if tree.has_unknown_layout() {
                     return Ok(emit(
                         &Report::type_error(&TypeErr::RepresentationPolymorphicLayout),
@@ -220,6 +404,9 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
                     ));
                 }
                 let ir = lower(&tree);
+                if trace_stack {
+                    trace_shape("anf ir", ir_shape(&ir));
+                }
                 println!(
                     "{}",
                     match fmt {
@@ -236,13 +423,20 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
         // Evidence runs the zero-cost pass over the IR (schema `locus-evidence/1`).
         Mode::Evidence => match elaborate(&prelude::sig(), &Ctx::new(), stage, &term) {
             Ok(tree) => {
+                if trace_stack {
+                    trace_shape("typed tree", typed_shape(&tree));
+                }
                 if tree.has_unknown_layout() {
                     return Ok(emit(
                         &Report::type_error(&TypeErr::RepresentationPolymorphicLayout),
                         fmt,
                     ));
                 }
-                let report = analyze(&lower(&tree));
+                let ir = lower(&tree);
+                if trace_stack {
+                    trace_shape("anf ir", ir_shape(&ir));
+                }
+                let report = analyze(&ir);
                 println!(
                     "{}",
                     match fmt {
@@ -264,6 +458,26 @@ fn command(args: &[String], mode: Mode) -> Result<i32, String> {
 /// contract (value signatures with rows, type defs + layouts, layer/mints/seals,
 /// the interface hash + ABI version) is serialized. Cross-module type-check
 /// (Sprint 2) and link (Sprint 3) are not done here.
+fn trace_stack_header() {
+    let bytes = locus::PIPELINE_STACK_BYTES;
+    eprintln!(
+        "locus stack trace: configured pipeline stack = {} bytes ({} MiB)",
+        bytes,
+        bytes / (1024 * 1024)
+    );
+}
+
+fn trace_shape(label: &str, shape: ShapeMetrics) {
+    eprintln!(
+        "  {label:<21} nodes={:<6} max_depth={:<5} binding_spine={:<5} app_spine={:<5} type_depth={}",
+        shape.nodes,
+        shape.max_depth,
+        shape.max_binding_spine,
+        shape.max_app_spine,
+        shape.max_type_depth
+    );
+}
+
 fn emit_interface(args: &[String]) -> Result<i32, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;

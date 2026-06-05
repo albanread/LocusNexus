@@ -1,0 +1,22 @@
+module Db at services seals (winapi, mem) exposing
+  (db_mock_connect, db_mock_health_check) =
+-- Mock database service for the agent-safe credential pattern.
+--
+-- App code names a credential profile such as `test.api.key`; the service
+-- consumes the credential internally and returns only mock connection state.
+-- It does not expose the reusable secret as a String.
+
+effect db_mock_connect_op : String -> Bool in
+
+handle
+  do {
+    let db_mock_connect = fn credential: String => db_mock_connect_op credential;
+    let db_mock_health_check = fn credential: String =>
+      if db_mock_connect credential then 1 else 0;
+  }
+with {
+  db_mock_connect_op(credential) -> do {
+    let (ok, _secret) = win_cred_read credential;
+    ok != 0
+  }
+}

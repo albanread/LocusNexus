@@ -56,7 +56,7 @@
 //!   A runtime (stage-0) handler is only **dispatch-free**: the same handler
 //!   reads *dispatch-free* at stage 0 but *eliminated* at stage 1. Zero-cost is
 //!   **earned by staging** the handler, not left to LLVM (§5.2).
-//! - **Slice 13: a `String` type + `"…"` literals** — the value `writeln`
+//! - **Slice 13: a `String` type + `"…"` literals** — the value `console_writeln`
 //!   needs; threads through every phase untouched ([`Type::Str`]).
 //! - **Slice 14 (this commit): the runtime prelude — native effects.** A
 //!   native effect (a `World` label) is fully interceptable, but its *default*
@@ -74,11 +74,13 @@ pub mod capability;
 pub mod check;
 pub mod diag;
 pub mod evidence;
+pub mod help;
 pub mod iface;
 pub mod ir;
 pub mod parse;
 pub mod prelude;
 pub mod sema;
+pub mod stackdiag;
 pub mod stage;
 pub mod stdlib;
 pub mod syntax;
@@ -89,16 +91,21 @@ pub use capability::{check_module_seals, mint_gate, CapError};
 pub use check::{infer, Ctx, Sig, Stage, TypeErr};
 pub use diag::{Report, Span, SCHEMA};
 pub use evidence::{analyze, clause_shape, Cost, Shape};
+pub use help::{
+    all_cards as help_cards, find as help_find, search as help_search, HelpCard, HelpHit,
+};
 pub use iface::{
     check_client_against, check_client_against_with_imports, exported_functions, interface_of,
     mangle_export, ConsumeError, ExportedFn, Import, ImportedSymbol, LoadedInterface,
     ModuleInterface, SumVariant, TypeDefKind, TypeExport, ValExport, ABI_VERSION, LOCUSI_FORMAT,
 };
 pub use ir::{
-    lower, lower_function_body, lower_with_imports, Atom, Comp, Ir, IrHandler, IrOpClause, LoopVar,
+    lower, lower_function_body, lower_with_imports, Atom, Comp, Ir, IrBind, IrHandler, IrOpClause,
+    LoopVar,
 };
 pub use parse::{parse, parse_module, parse_program, ParseErr};
 pub use sema::{elaborate, Node, Typed};
+pub use stackdiag::{ir_shape, program_source_shape, term_shape, typed_shape, ShapeMetrics};
 pub use stage::stage_reduce;
 pub use stdlib::{
     first_mint, linux_modules as linux_stdlib_modules, linux_program, linux_program_with_modules,
@@ -106,9 +113,9 @@ pub use stdlib::{
     program_with_stdlib, stdlib_module_decls, stdlib_module_decls_from,
 };
 pub use syntax::{
-    BinOp, CastOp, ExternAbi, FloatMathOp, Handler, Label, Layer, MaskReduceOp, MemWidth,
-    ModuleDecl, OpClause, OpSig, ProgramSource, Return, Row, RowVarId, Term, TyVarId, Type,
-    ValueLayout, VectorShape, Width,
+    BinOp, BlockItem, CastOp, ExternAbi, FloatMathOp, Handler, Label, Layer, MaskReduceOp,
+    MemWidth, ModuleDecl, OpClause, OpSig, ProgramSource, Return, Row, RowVarId, Term, TyVarId,
+    Type, ValueLayout, VectorShape, Width,
 };
 pub use tagcheck::{check_tags, TagError};
 pub use unify::{unify, unify_row, zonk, UnifStore};

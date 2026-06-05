@@ -5,17 +5,20 @@ module Array at services =
 -- surface on the compiler's unboxed scalar-array path instead of accidentally
 -- promising a generic container abstraction before layout traits exist.
 
+let array_make_int = fn count: Int => fn v: Int =>
+  locus_array_new_int count v in
+
 let array_sum_int = fn a: Array[Int] =>
-  loop i = 0, acc = 0 while i < len a do i + 1, acc + a[i] else acc in
+  loop i = 0, acc = 0 while i < len a do i + 1, acc + a[i] return acc in
 
 let array_sum_float = fn a: Array[Float] =>
-  loop i = 0, acc = 0.0 while i < len a do i + 1, acc + a[i] else acc in
+  loop i = 0, acc = 0.0 while i < len a do i + 1, acc + a[i] return acc in
 
 let array_fill_int = fn a: Array[Int] => fn v: Int =>
-  loop i = 0 while i < len a do (let _ = a[i] <- v in i + 1) else () in
+  loop i = 0 while i < len a do (let _ = a[i] <- v in i + 1) endloop in
 
 let array_fill_float = fn a: Array[Float] => fn v: Float =>
-  loop i = 0 while i < len a do (let _ = a[i] <- v in i + 1) else () in
+  loop i = 0 while i < len a do (let _ = a[i] <- v in i + 1) endloop in
 
 let array_copy_range_int =
   fn src: Array[Int] => fn src_start: Int =>
@@ -23,7 +26,7 @@ let array_copy_range_int =
   fn count: Int =>
     loop i = 0 while i < count do
       (let _ = dst[dst_start + i] <- src[src_start + i] in i + 1)
-    else () in
+    endloop in
 
 let array_copy_range_float =
   fn src: Array[Float] => fn src_start: Int =>
@@ -31,15 +34,19 @@ let array_copy_range_float =
   fn count: Int =>
     loop i = 0 while i < count do
       (let _ = dst[dst_start + i] <- src[src_start + i] in i + 1)
-    else () in
+    endloop in
 
 -- dot product over `len a` elements (a and b must have equal length); an empty
 -- array yields 0.0 from the accumulator.
 let array_dot_float = fn a: Array[Float] => fn b: Array[Float] =>
-  loop i = 0, acc = 0.0 while i < len a do i + 1, acc + a[i] * b[i] else acc in
+  loop i = 0, acc = 0.0 while i < len a do i + 1, acc + a[i] * b[i] return acc in
 
 -- scale every element in place by `k`.
 let array_scale_float = fn a: Array[Float] => fn k: Float =>
-  loop i = 0 while i < len a do (let _ = a[i] <- a[i] * k in i + 1) else () in
+  loop i = 0 while i < len a do (let _ = a[i] <- a[i] * k in i + 1) endloop in
+
+trait ArrayMake a { array_make : Int -> a -> Array[a] ! {gc} } in
+
+instance ArrayMake Int { array_make = array_make_int } in
 
 ()

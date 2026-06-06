@@ -66,6 +66,9 @@ joined by a distributive law. You don't need that vocabulary to use the language
 
 - **[Getting started](getting-started.md)** — install the toolchain, build the
   two binaries, write and run your first program, and meet the built-in help.
+- **[The Locus IDE](ide.md)** — the small desktop environment that ships with
+  Locus: write a program, run it, and watch graphical output appear in its own
+  window panes. The friendliest way to try the language.
 
 **The language**
 

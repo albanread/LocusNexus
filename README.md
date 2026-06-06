@@ -8,7 +8,9 @@ This is a personal project, exploring concepts for an agentic world.
 
 <img src="docs/selfie.png" alt="Locus in its Rust IDE, playing Othello" width="600">
 
-*Locus in its Rust IDE, playing Othello.*
+*Locus in its Rust IDE, playing Othello.* Locus ships with a small integrated
+IDE — a self-contained world you download and run, where programs open their own
+window panes and draw. See **[The Locus IDE](docs/guide/ide.md)**.
 
 ## Documentation
 

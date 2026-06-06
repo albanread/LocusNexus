@@ -18,8 +18,8 @@ use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, VectorType,
 };
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, IntValue, PhiValue,
-    PointerValue, VectorValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue, FunctionValue, IntValue,
+    PhiValue, PointerValue, VectorValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
@@ -410,6 +410,7 @@ fn comp_preserves_raw_heap_ptrs(comp: &Comp) -> bool {
         }
         Comp::Quote(body) | Comp::Letloc(body) => block_preserves_raw_heap_ptrs(body),
         Comp::App { .. }
+        | Comp::Call { .. }
         | Comp::Foreign(_, _, _)
         | Comp::Lam { .. }
         | Comp::Perform(_, _)
@@ -617,6 +618,44 @@ fn collect_len_upper_bounds(
             }
         }
     }
+}
+
+/// Peel a curried lambda chain off an IR body: while the body is exactly a
+/// lambda value (no prerequisite binds), collect each parameter and descend.
+/// Returns the *additional* parameters past the first, the innermost body, and
+/// the innermost return type (`None` iff no further lambda was peeled — i.e. the
+/// enclosing lambda has arity 1). Used to build an uncurried fast entry.
+#[allow(clippy::type_complexity)]
+fn peel_lam_chain(ir: &Ir) -> (Vec<(String, Type, ValueLayout)>, &Ir, Option<&Type>) {
+    let mut params: Vec<(String, Type, ValueLayout)> = Vec::new();
+    let mut cur = ir;
+    let mut inner_ret: Option<&Type> = None;
+    loop {
+        let comp = match cur {
+            Ir::Ret { comp, .. } => comp,
+            Ir::Block { binds, comp, .. } if binds.is_empty() => comp,
+            _ => break,
+        };
+        match comp {
+            Comp::Lam {
+                param,
+                param_ty,
+                param_layout,
+                ret_ty,
+                body,
+            } => {
+                params.push((
+                    param.clone(),
+                    param_ty.clone().unwrap_or(Type::Int),
+                    *param_layout,
+                ));
+                inner_ret = Some(ret_ty);
+                cur = &**body;
+            }
+            _ => break,
+        }
+    }
+    (params, cur, inner_ret)
 }
 
 fn block_binds_name(ir: &Ir, target: &str) -> bool {
@@ -1017,6 +1056,12 @@ impl<'ctx> Cg<'ctx, '_> {
                 arg_ty,
                 ret_ty,
             } => self.lower_app(fun, arg, arg_ty, ret_ty),
+            Comp::Call {
+                fun,
+                args,
+                fun_ty,
+                ret_ty,
+            } => self.lower_call(fun, args, fun_ty, ret_ty),
             Comp::Foreign(sym, args, abi) => self.lower_foreign(sym, args, abi),
             Comp::Perform(label, arg) => self.lower_perform(label, arg),
             Comp::Handle {
@@ -1400,7 +1445,11 @@ impl<'ctx> Cg<'ctx, '_> {
             });
         }
 
-        let (mut ptr_slot, mut scalar_slot, mut raw_slot) = (0u64, 1u64, 1u64); // scalar/raw 0 is fn-ptr
+        // scalar/raw 0 = curried fn-ptr; 1 = UNCURRIED fast-entry ptr (0 if
+        // none); 2 = fast-entry arity (0 if none). A saturated call site reads
+        // slot 2 to confirm the arity matches before calling slot 1 directly.
+        // Captures start at 3.
+        let (mut ptr_slot, mut scalar_slot, mut raw_slot) = (0u64, 3u64, 3u64);
         for info in &mut infos {
             let context = format!("captured variable `{}`", info.name);
             let cells = capture_cells(info.layout, &context)?;
@@ -1415,6 +1464,196 @@ impl<'ctx> Cg<'ctx, '_> {
             raw_slot += cells;
         }
         Ok(infos)
+    }
+
+    /// Bind a lifted function's captures into `self.env`, reading them from its
+    /// `env` parameter (`env_param`): a GC closure HANDLE (i64) or a raw env
+    /// pointer. Shared by the curried lifted entry and the uncurried fast entry
+    /// so both read captures at identical slots. (Slots 0/1 are the curried and
+    /// fast fn-ptrs; `capture_layout` numbers captures from 2.)
+    fn load_captures_into_env(
+        &mut self,
+        env_param: BasicValueEnum<'ctx>,
+        capture_infos: &[CaptureInfo],
+    ) -> Result<(), String> {
+        let i64t = self.ctx.i64_type();
+        if self.uses_gc {
+            let env_h = env_param.into_int_value();
+            for cap in capture_infos {
+                let context = format!("captured variable `{}`", cap.name);
+                let cap_pointer = capture_pointer(cap.layout, &context)?;
+                let loaded = if cap_pointer {
+                    let shim = if cap.layout.is_word_cell() {
+                        "locus_gc_get_word"
+                    } else {
+                        "locus_gc_get_ptr"
+                    };
+                    self.gc_call(shim, &[env_h, i64t.const_int(cap.gc_slot, false)], true)?
+                        .expect("capture get returns a value")
+                        .into()
+                } else {
+                    let cells = capture_cells(cap.layout, &context)?;
+                    let mut values = Vec::with_capacity(cells as usize);
+                    for i in 0..cells {
+                        let cell = self
+                            .gc_call(
+                                "locus_gc_get_scalar",
+                                &[env_h, i64t.const_int(cap.gc_slot + i, false)],
+                                true,
+                            )?
+                            .expect("capture get returns a value");
+                        values.push(cell);
+                    }
+                    self.capture_cells_to_value(&cap.ty, cap.layout, &values, &context)?
+                };
+                self.env.insert(
+                    cap.name.clone(),
+                    EnvVal {
+                        value: loaded,
+                        ty: cap.ty.clone(),
+                        layout: cap.layout,
+                    },
+                );
+            }
+        } else {
+            let env_ptr = env_param.into_pointer_value();
+            for cap in capture_infos {
+                let context = format!("captured variable `{}`", cap.name);
+                let cells = capture_cells(cap.layout, &context)?;
+                let mut values = Vec::with_capacity(cells as usize);
+                for i in 0..cells {
+                    let s = self.slot(env_ptr, cap.raw_slot + i, "cap.slot")?;
+                    let loaded = self
+                        .builder
+                        .build_load(i64t, s, "cap")
+                        .map_err(|e| e.to_string())?
+                        .into_int_value();
+                    values.push(loaded);
+                }
+                let loaded = self.capture_cells_to_value(&cap.ty, cap.layout, &values, &context)?;
+                self.env.insert(
+                    cap.name.clone(),
+                    EnvVal {
+                        value: loaded,
+                        ty: cap.ty.clone(),
+                        layout: cap.layout,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate an **uncurried fast entry** `ret (env, p1, …, pn)` for a
+    /// non-recursive lambda chain of arity n ≥ 2: it binds every parameter
+    /// directly and reads the chain's captures from `env` (the same closure the
+    /// curried entries use — `capture_infos` is the outermost closure's layout),
+    /// then runs the innermost `body`. A saturated call site invokes this with
+    /// one direct call and zero per-argument closure allocation. The curried
+    /// entries (`__locus_lam_*`) are still emitted for partial application; this
+    /// is a parallel fast path, not a replacement.
+    fn emit_fast_entry(
+        &mut self,
+        self_name: Option<&str>,
+        params: &[(String, Type, ValueLayout)],
+        capture_infos: &[CaptureInfo],
+        body: &Ir,
+        ret_ty: &Type,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let i64t = self.ctx.i64_type();
+        let ptrt = self.ctx.ptr_type(AddressSpace::default());
+        let env_ty: BasicMetadataTypeEnum = if self.uses_gc {
+            i64t.into()
+        } else {
+            ptrt.into()
+        };
+        let mut param_metas: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(params.len() + 1);
+        param_metas.push(env_ty);
+        for (_, ty, _) in params {
+            param_metas.push(self.abi_meta_type(ty)?);
+        }
+        let ret_abi = self.abi_type(ret_ty)?;
+        let name = format!("__locus_fast_{}", self.lifted);
+        self.lifted += 1;
+        let func = self
+            .module
+            .add_function(&name, ret_abi.fn_type(&param_metas, false), None);
+
+        let outer_block = self.builder.get_insert_block();
+        let outer_env = std::mem::take(&mut self.env);
+
+        let entry = self.ctx.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+
+        // Parameters occupy native slots 1..=n (slot 0 is env).
+        for (i, (pname, pty, playout)) in params.iter().enumerate() {
+            let arg = func.get_nth_param((i + 1) as u32).unwrap();
+            self.env.insert(
+                pname.clone(),
+                EnvVal {
+                    value: arg,
+                    ty: pty.clone(),
+                    layout: *playout,
+                },
+            );
+        }
+
+        let frame = if self.uses_gc {
+            Some(self.gc_enter()?)
+        } else {
+            None
+        };
+
+        self.load_captures_into_env(func.get_nth_param(0).unwrap(), capture_infos)?;
+
+        match self_name {
+            // Recursive (TCO-eligible) fast entry: a phi-loop so a saturated
+            // self-tail-call `f a₁ … aₙ` jumps back instead of recursing —
+            // constant native stack even for multi-arg functions.
+            Some(sname) => {
+                let loop_block = self.ctx.append_basic_block(func, "tail.loop");
+                self.builder
+                    .build_unconditional_branch(loop_block)
+                    .map_err(|e| e.to_string())?;
+                let incoming = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| "codegen: missing fast-entry block".to_string())?;
+                self.builder.position_at_end(loop_block);
+                let mut phis: Vec<PhiValue<'ctx>> = Vec::with_capacity(params.len());
+                for (i, (pname, pty, playout)) in params.iter().enumerate() {
+                    let phi = self
+                        .builder
+                        .build_phi(i64t, "tail.p")
+                        .map_err(|e| e.to_string())?;
+                    let seed = func.get_nth_param((i + 1) as u32).unwrap().into_int_value();
+                    phi.add_incoming(&[(&seed, incoming)]);
+                    self.env.insert(
+                        pname.clone(),
+                        EnvVal {
+                            value: phi.as_basic_value(),
+                            ty: pty.clone(),
+                            layout: *playout,
+                        },
+                    );
+                    phis.push(phi);
+                }
+                self.lower_tail_return_n(body, sname, loop_block, &phis, frame)?;
+            }
+            None => {
+                let body_ret = self.lower_block(body)?;
+                let ret = self.return_with_frame(frame, body_ret)?;
+                self.builder
+                    .build_return(Some(&ret))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+
+        self.env = outer_env;
+        if let Some(b) = outer_block {
+            self.builder.position_at_end(b);
+        }
+        Ok(func)
     }
 
     /// A lambda → a lifted top-level function `i64 (ptr env, i64 arg)` plus a
@@ -1490,72 +1729,7 @@ impl<'ctx> Cg<'ctx, '_> {
             None
         };
 
-        if self.uses_gc {
-            // Scalar field 0 holds the fn-ptr. Captures are loaded from their
-            // typed pointer/scalar regions; there is no runtime value probing.
-            let env_h = func.get_nth_param(0).unwrap().into_int_value();
-            for cap in &capture_infos {
-                let context = format!("captured variable `{}`", cap.name);
-                let cap_pointer = capture_pointer(cap.layout, &context)?;
-                let loaded = if cap_pointer {
-                    let shim = if cap.layout.is_word_cell() {
-                        "locus_gc_get_word"
-                    } else {
-                        "locus_gc_get_ptr"
-                    };
-                    self.gc_call(shim, &[env_h, i64t.const_int(cap.gc_slot, false)], true)?
-                        .expect("capture get returns a value")
-                        .into()
-                } else {
-                    let cells = capture_cells(cap.layout, &context)?;
-                    let mut values = Vec::with_capacity(cells as usize);
-                    for i in 0..cells {
-                        let cell = self
-                            .gc_call(
-                                "locus_gc_get_scalar",
-                                &[env_h, i64t.const_int(cap.gc_slot + i, false)],
-                                true,
-                            )?
-                            .expect("capture get returns a value");
-                        values.push(cell);
-                    }
-                    self.capture_cells_to_value(&cap.ty, cap.layout, &values, &context)?
-                };
-                self.env.insert(
-                    cap.name.clone(),
-                    EnvVal {
-                        value: loaded,
-                        ty: cap.ty.clone(),
-                        layout: cap.layout,
-                    },
-                );
-            }
-        } else {
-            let env_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-            for cap in &capture_infos {
-                let context = format!("captured variable `{}`", cap.name);
-                let cells = capture_cells(cap.layout, &context)?;
-                let mut values = Vec::with_capacity(cells as usize);
-                for i in 0..cells {
-                    let s = self.slot(env_ptr, cap.raw_slot + i, "cap.slot")?;
-                    let loaded = self
-                        .builder
-                        .build_load(i64t, s, "cap")
-                        .map_err(|e| e.to_string())?
-                        .into_int_value();
-                    values.push(loaded);
-                }
-                let loaded = self.capture_cells_to_value(&cap.ty, cap.layout, &values, &context)?;
-                self.env.insert(
-                    cap.name.clone(),
-                    EnvVal {
-                        value: loaded,
-                        ty: cap.ty.clone(),
-                        layout: cap.layout,
-                    },
-                );
-            }
-        }
+        self.load_captures_into_env(func.get_nth_param(0).unwrap(), &capture_infos)?;
 
         if let Some(name) = self_name.filter(|_| {
             !block_performs_gc(body)
@@ -1606,12 +1780,64 @@ impl<'ctx> Cg<'ctx, '_> {
             .build_ptr_to_int(func.as_global_value().as_pointer_value(), i64t, "fnaddr")
             .map_err(|e| e.to_string())?;
 
+        // Uncurried fast entry for a lambda chain of arity >= 2, called from
+        // saturated call sites (Comp::Call). A NON-recursive chain always gets
+        // one. A RECURSIVE chain gets one only when it is tail-call-eligible
+        // (every param + the result is a scalar cell, and the body performs no
+        // GC), so a self-tail-call becomes a constant-stack loop — multi-arg
+        // curried recursion was never tail-optimized, so this is a strict win
+        // and removes a latent stack-growth case. A recursive chain that isn't
+        // eligible keeps the curried path unchanged (no fast entry). The address
+        // lives in slot 1, the arity in slot 2; 0/0 means "no fast entry".
+        let zero = i64t.const_int(0, false);
+        let (fast_ptr_i, fast_arity_i) = {
+            let (extra, inner_body, inner_ret) = peel_lam_chain(body);
+            match inner_ret {
+                Some(inner_ret) if !extra.is_empty() => {
+                    let mut all_params: Vec<(String, Type, ValueLayout)> =
+                        Vec::with_capacity(extra.len() + 1);
+                    all_params.push((param.to_string(), param_ty.clone(), param_layout));
+                    all_params.extend(extra);
+                    let recursive = self_name.is_some();
+                    let tco_ok = all_params
+                        .iter()
+                        .all(|(_, t, _)| Self::abi_is_scalar_cell(t))
+                        && Self::abi_is_scalar_cell(inner_ret)
+                        && !block_performs_gc(inner_body);
+                    if recursive && !tco_ok {
+                        (zero, zero)
+                    } else {
+                        let arity = all_params.len() as u64;
+                        // Recursive entries get `self_name` (→ TCO loop); non-
+                        // recursive ones pass None (straight-line body).
+                        let f = self.emit_fast_entry(
+                            self_name,
+                            &all_params,
+                            &capture_infos,
+                            inner_body,
+                            inner_ret,
+                        )?;
+                        let ptr = self
+                            .builder
+                            .build_ptr_to_int(
+                                f.as_global_value().as_pointer_value(),
+                                i64t,
+                                "fastaddr",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        (ptr, i64t.const_int(arity, false))
+                    }
+                }
+                _ => (zero, zero),
+            }
+        };
+
         if self.uses_gc {
             // A GC closure is laid out like every managed object: pointer
             // captures first, then scalar cells. Scalar 0 is the fn-ptr; scalar
             // captures follow. This is lossless for full-width scalar bits.
             let mut n_ptr = 0u64;
-            let mut n_scalar = 1u64;
+            let mut n_scalar = 3u64; // scalars 0/1/2 = curried ptr, fast ptr, fast arity
             for cap in &capture_infos {
                 let context = format!("captured variable `{}`", cap.name);
                 if capture_pointer(cap.layout, &context)? {
@@ -1643,6 +1869,17 @@ impl<'ctx> Cg<'ctx, '_> {
             self.gc_call(
                 "locus_gc_set_scalar",
                 &[clos, i64t.const_int(0, false), fnptr_i],
+                false,
+            )?;
+            // Scalar 1/2: the uncurried fast-entry ptr and its arity (0/0 when none).
+            self.gc_call(
+                "locus_gc_set_scalar",
+                &[clos, i64t.const_int(1, false), fast_ptr_i],
+                false,
+            )?;
+            self.gc_call(
+                "locus_gc_set_scalar",
+                &[clos, i64t.const_int(2, false), fast_arity_i],
                 false,
             )?;
             for cap in &capture_infos {
@@ -1678,6 +1915,8 @@ impl<'ctx> Cg<'ctx, '_> {
             }
             Ok(clos.into())
         } else {
+            // Raw slots 0/1/2 (curried ptr, fast ptr, fast arity) are reserved
+            // before any captures, so a closure is always at least three cells.
             let total_cells = capture_infos
                 .last()
                 .map(|cap| {
@@ -1685,7 +1924,7 @@ impl<'ctx> Cg<'ctx, '_> {
                         .map(|cells| cap.raw_slot + cells)
                 })
                 .transpose()?
-                .unwrap_or(1);
+                .unwrap_or(3);
             let block = self.call_alloc(total_cells * 8)?;
             let clos = self
                 .builder
@@ -1704,6 +1943,15 @@ impl<'ctx> Cg<'ctx, '_> {
             let s0 = self.slot(block, 0, "fn.slot")?;
             self.builder
                 .build_store(s0, fnptr_i)
+                .map_err(|e| e.to_string())?;
+            // Raw slots 1/2: fast-entry ptr and arity (0/0 when none).
+            let s1 = self.slot(block, 1, "fast.slot")?;
+            self.builder
+                .build_store(s1, fast_ptr_i)
+                .map_err(|e| e.to_string())?;
+            let s2 = self.slot(block, 2, "fastarity.slot")?;
+            self.builder
+                .build_store(s2, fast_arity_i)
                 .map_err(|e| e.to_string())?;
             for cap in &capture_infos {
                 let val = self
@@ -1839,6 +2087,130 @@ impl<'ctx> Cg<'ctx, '_> {
         Ok(())
     }
 
+    /// n-ary analogue of `lower_tail_return`, for an uncurried fast entry. A
+    /// saturated self-tail-call `f a₁ … aₙ` (a `Comp::Call` to `self_name`)
+    /// updates every loop phi and jumps, so tail recursion runs in constant
+    /// native stack — even for multi-argument functions, which the curried path
+    /// never tail-optimized. Non-tail self-calls fall through to `lower_binding`
+    /// /`lower_call` as ordinary direct recursive calls.
+    fn lower_tail_return_n(
+        &mut self,
+        ir: &Ir,
+        self_name: &str,
+        loop_block: BasicBlock<'ctx>,
+        phis: &[PhiValue<'ctx>],
+        frame: Option<IntValue<'ctx>>,
+    ) -> Result<(), String> {
+        match ir {
+            Ir::Block { binds, comp, .. } => {
+                for bind in binds {
+                    self.lower_binding(&bind.name, &bind.ty, bind.layout, &bind.comp)?;
+                }
+                self.lower_tail_comp_n(comp, self_name, loop_block, phis, frame)
+            }
+            Ir::Let {
+                name,
+                ty,
+                layout,
+                comp,
+                rest,
+                ..
+            } => {
+                self.lower_binding(name, ty, *layout, comp)?;
+                self.lower_tail_return_n(rest, self_name, loop_block, phis, frame)
+            }
+            Ir::Ret { comp, .. } => self.lower_tail_comp_n(comp, self_name, loop_block, phis, frame),
+        }
+    }
+
+    fn lower_tail_comp_n(
+        &mut self,
+        comp: &Comp,
+        self_name: &str,
+        loop_block: BasicBlock<'ctx>,
+        phis: &[PhiValue<'ctx>],
+        frame: Option<IntValue<'ctx>>,
+    ) -> Result<(), String> {
+        match comp {
+            Comp::Call {
+                fun: Atom::Var(f),
+                args,
+                ..
+            } if f == self_name && args.len() == phis.len() => {
+                // Evaluate every next-iteration argument (all ANF atoms), then
+                // feed the phis and jump — a multi-arg self-tail-call as a loop.
+                let mut nexts = Vec::with_capacity(args.len());
+                for (a, _) in args {
+                    nexts.push(Self::expect_cell(self.lower_atom(a)?, "tail-recursive argument")?);
+                }
+                let current = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| "codegen: missing tail-recursive block".to_string())?;
+                for (phi, next) in phis.iter().zip(nexts.iter()) {
+                    phi.add_incoming(&[(next, current)]);
+                }
+                self.builder
+                    .build_unconditional_branch(loop_block)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Comp::If(cond, then, els) => {
+                self.lower_tail_if_n(cond, then, els, self_name, loop_block, phis, frame)
+            }
+            _ => {
+                let ret = Self::expect_cell(self.lower_comp(comp)?, "function result")?;
+                let ret = match frame {
+                    Some(frame) => self.gc_leave_with(frame, ret)?,
+                    None => ret,
+                };
+                self.builder
+                    .build_return(Some(&ret))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_tail_if_n(
+        &mut self,
+        cond: &Atom,
+        then: &Ir,
+        els: &Ir,
+        self_name: &str,
+        loop_block: BasicBlock<'ctx>,
+        phis: &[PhiValue<'ctx>],
+        frame: Option<IntValue<'ctx>>,
+    ) -> Result<(), String> {
+        let i64t = self.ctx.i64_type();
+        let cv = Self::expect_cell(self.lower_atom(cond)?, "if condition")?;
+        let c = self
+            .builder
+            .build_int_compare(IntPredicate::NE, cv, i64t.const_zero(), "ifcond")
+            .map_err(|e| e.to_string())?;
+        let parent = self
+            .builder
+            .get_insert_block()
+            .and_then(|b| b.get_parent())
+            .ok_or_else(|| "codegen: `if` outside a function".to_string())?;
+        let then_bb = self.ctx.append_basic_block(parent, "then");
+        let else_bb = self.ctx.append_basic_block(parent, "else");
+        self.builder
+            .build_conditional_branch(c, then_bb, else_bb)
+            .map_err(|e| e.to_string())?;
+
+        let saved = self.env.clone();
+        self.builder.position_at_end(then_bb);
+        self.env = saved.clone();
+        self.lower_tail_return_n(then, self_name, loop_block, phis, frame)?;
+
+        self.builder.position_at_end(else_bb);
+        self.env = saved;
+        self.lower_tail_return_n(els, self_name, loop_block, phis, frame)?;
+        Ok(())
+    }
+
     /// A fully-applied **foreign call** → declare the symbol with its *native*
     /// signature (per the [`ExternAbi`]) and call it; ORC (JIT) / the linker
     /// (AOT) resolve it. Win64 has a *single* calling convention, so LLVM's C
@@ -1944,10 +2316,24 @@ impl<'ctx> Cg<'ctx, '_> {
                 return self.lower_atom(a);
             }
         }
-        let i64t = self.ctx.i64_type();
-        let ptrt = self.ctx.ptr_type(AddressSpace::default());
         let fv: IntValue = Self::expect_cell(self.lower_atom(f)?, "function value")?;
         let av = self.lower_atom(a)?;
+        self.apply_one_val(fv, av, arg_ty, ret_ty)
+    }
+
+    /// Apply ONE argument to an already-lowered closure handle `fv`: load its
+    /// curried fn-ptr from slot 0 and invoke `fn(env = fv, arg = av)`. The unit
+    /// of the curried calling convention; `lower_app` is this on lowered atoms,
+    /// and `lower_call`'s slow path folds it over a saturated argument list.
+    fn apply_one_val(
+        &mut self,
+        fv: IntValue<'ctx>,
+        av: BasicValueEnum<'ctx>,
+        arg_ty: &Type,
+        ret_ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let i64t = self.ctx.i64_type();
+        let ptrt = self.ctx.ptr_type(AddressSpace::default());
         let arg_abi = self.abi_meta_type(arg_ty)?;
         let ret_abi = self.abi_type(ret_ty)?;
 
@@ -1993,6 +2379,152 @@ impl<'ctx> Cg<'ctx, '_> {
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| "call returned no value".to_string())
+    }
+
+    /// Read scalar slot `idx` of a closure handle `clos` as an i64 (the curried
+    /// fn-ptr at 0, the fast-entry ptr at 1, the fast-entry arity at 2).
+    fn read_closure_slot(
+        &mut self,
+        clos: IntValue<'ctx>,
+        idx: u64,
+    ) -> Result<IntValue<'ctx>, String> {
+        let i64t = self.ctx.i64_type();
+        if self.uses_gc {
+            Ok(self
+                .gc_call("locus_gc_get_scalar", &[clos, i64t.const_int(idx, false)], true)?
+                .expect("closure scalar"))
+        } else {
+            let ptrt = self.ctx.ptr_type(AddressSpace::default());
+            let env_ptr = self
+                .builder
+                .build_int_to_ptr(clos, ptrt, "clos")
+                .map_err(|e| e.to_string())?;
+            let s = self.slot(env_ptr, idx, "clos.slot")?;
+            Ok(self
+                .builder
+                .build_load(i64t, s, "clos.cell")
+                .map_err(|e| e.to_string())?
+                .into_int_value())
+        }
+    }
+
+    /// A SATURATED call `f a₁ … aₙ` (n ≥ 2) to a named function. If the
+    /// closure's stored fast-entry arity (slot 2) equals `n`, call its uncurried
+    /// fast entry (slot 1) directly — one call, no per-argument closure
+    /// allocation. Otherwise fall back to the curried apply chain. The guard is
+    /// loop-invariant for a fixed callee, so LICM hoists it and a hot inner loop
+    /// is left with just the direct call (which is itself then inlinable).
+    fn lower_call(
+        &mut self,
+        fun: &Atom,
+        args: &[(Atom, Type)],
+        fun_ty: &Type,
+        ret_ty: &Type,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let i64t = self.ctx.i64_type();
+        let ptrt = self.ctx.ptr_type(AddressSpace::default());
+        let clos = Self::expect_cell(self.lower_atom(fun)?, "function value")?;
+        let argc = args.len();
+        let mut arg_vals: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(argc);
+        for (a, _) in args {
+            arg_vals.push(self.lower_atom(a)?);
+        }
+        let ret_abi = self.abi_type(ret_ty)?;
+
+        let fast_arity = self.read_closure_slot(clos, 2)?;
+        let fast_ptr = self.read_closure_slot(clos, 1)?;
+
+        let func = self
+            .builder
+            .get_insert_block()
+            .and_then(|b| b.get_parent())
+            .ok_or_else(|| "codegen: lower_call outside a function".to_string())?;
+        let fast_bb = self.ctx.append_basic_block(func, "call.fast");
+        let slow_bb = self.ctx.append_basic_block(func, "call.curried");
+        let cont_bb = self.ctx.append_basic_block(func, "call.cont");
+
+        let cond = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                fast_arity,
+                i64t.const_int(argc as u64, false),
+                "call.arity.ok",
+            )
+            .map_err(|e| e.to_string())?;
+        self.builder
+            .build_conditional_branch(cond, fast_bb, slow_bb)
+            .map_err(|e| e.to_string())?;
+
+        // FAST: one direct call to the uncurried entry, `fast(env, a1..an)`.
+        self.builder.position_at_end(fast_bb);
+        let mut metas: Vec<BasicMetadataTypeEnum> = Vec::with_capacity(argc + 1);
+        metas.push(if self.uses_gc { i64t.into() } else { ptrt.into() });
+        for (_, ty) in args {
+            metas.push(self.abi_meta_type(ty)?);
+        }
+        let fnty = ret_abi.fn_type(&metas, false);
+        let fp = self
+            .builder
+            .build_int_to_ptr(fast_ptr, ptrt, "fastfp")
+            .map_err(|e| e.to_string())?;
+        let env_arg: BasicMetadataValueEnum = if self.uses_gc {
+            clos.into()
+        } else {
+            self.builder
+                .build_int_to_ptr(clos, ptrt, "fastenv")
+                .map_err(|e| e.to_string())?
+                .into()
+        };
+        let mut callargs: Vec<BasicMetadataValueEnum> = Vec::with_capacity(argc + 1);
+        callargs.push(env_arg);
+        for v in &arg_vals {
+            callargs.push((*v).into());
+        }
+        let fast_ret = self
+            .builder
+            .build_indirect_call(fnty, fp, &callargs, "fastcall")
+            .map_err(|e| e.to_string())?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| "fast call returned no value".to_string())?;
+        let fast_end = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(cont_bb)
+            .map_err(|e| e.to_string())?;
+
+        // SLOW: the curried apply chain, identical to nested `Comp::App`s.
+        self.builder.position_at_end(slow_bb);
+        let mut fv = clos;
+        let mut cur_ty = fun_ty.clone();
+        let mut slow_ret: Option<BasicValueEnum<'ctx>> = None;
+        for (i, (_, aty)) in args.iter().enumerate() {
+            let rest = match &cur_ty {
+                Type::Fun(_, ret, _) => (**ret).clone(),
+                _ => return Err("codegen: curried fallback head is not a function".into()),
+            };
+            let r = self.apply_one_val(fv, arg_vals[i], aty, &rest)?;
+            if i + 1 < argc {
+                fv = Self::expect_cell(r, "intermediate closure")?;
+                cur_ty = rest;
+            } else {
+                slow_ret = Some(r);
+            }
+        }
+        let slow_ret = slow_ret.ok_or_else(|| "codegen: empty saturated call".to_string())?;
+        let slow_end = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(cont_bb)
+            .map_err(|e| e.to_string())?;
+
+        // CONT: merge the two results.
+        self.builder.position_at_end(cont_bb);
+        let phi = self
+            .builder
+            .build_phi(ret_abi, "callret")
+            .map_err(|e| e.to_string())?;
+        phi.add_incoming(&[(&fast_ret, fast_end), (&slow_ret, slow_end)]);
+        Ok(phi.as_basic_value())
     }
 
     /// `if c then … else …` → a conditional branch into two blocks that merge
@@ -5079,6 +5611,12 @@ fn fv_comp(comp: &Comp, bound: &mut Vec<String>, free: &mut HashSet<String>) {
         Comp::App { fun, arg, .. } => {
             fv_atom(fun, bound, free);
             fv_atom(arg, bound, free);
+        }
+        Comp::Call { fun, args, .. } => {
+            fv_atom(fun, bound, free);
+            for (a, _) in args {
+                fv_atom(a, bound, free);
+            }
         }
         Comp::Bin(_, a, b) | Comp::FloatBin(_, a, b) => {
             fv_atom(a, bound, free);

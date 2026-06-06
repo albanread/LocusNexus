@@ -192,6 +192,7 @@ fn walk_comp(c: &Comp, ev: &[Ev], sites: &mut Vec<Site>) {
         // surfaced by the *row*, not as a perform — see the type, not here.)
         Comp::Atom(_)
         | Comp::App { .. }
+        | Comp::Call { .. }
         | Comp::Bin(_, _, _)
         | Comp::FloatBin(_, _, _)
         | Comp::Cast(_, _)
@@ -363,6 +364,7 @@ fn count_var_comp(name: &str, c: &Comp) -> usize {
     match c {
         Comp::Atom(a) => is(a),
         Comp::App { fun, arg, .. } => is(fun) + is(arg),
+        Comp::Call { fun, args, .. } => is(fun) + args.iter().map(|(a, _)| is(a)).sum::<usize>(),
         Comp::Extern(_, _) => 0,
         Comp::Foreign(_, args, _) => args.iter().map(is).sum(),
         Comp::Bin(_, a, b) | Comp::FloatBin(_, a, b) => is(a) + is(b),

@@ -138,6 +138,18 @@ pub fn ir_shape(ir: &Ir) -> ShapeMetrics {
                         out.observe_type(arg_ty);
                         out.observe_type(ret_ty);
                     }
+                    Comp::Call {
+                        args,
+                        fun_ty,
+                        ret_ty,
+                        ..
+                    } => {
+                        out.observe_type(fun_ty);
+                        out.observe_type(ret_ty);
+                        for (_, ty) in args {
+                            out.observe_type(ty);
+                        }
+                    }
                     Comp::FloatMathUnary { ty, .. }
                     | Comp::FloatMathBinary { ty, .. }
                     | Comp::FloatMathTernary { ty, .. } => out.observe_type(ty),

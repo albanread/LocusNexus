@@ -58,6 +58,19 @@ pub enum Comp {
         arg_ty: Type,
         ret_ty: Type,
     },
+    /// `f a₁ … aₙ` — a fully-**saturated** application (n ≥ 2) whose head is a
+    /// named function value, gathered from the spine like `Foreign`. Codegen
+    /// calls the closure's *uncurried* fast entry directly (one call, no
+    /// per-argument closure allocation) when its stored arity matches `n`,
+    /// falling back to the curried apply (via `fun_ty`) otherwise — so this is
+    /// always correct even if the head's runtime arity differs. `args` carry
+    /// their source types for the typed ABI.
+    Call {
+        fun: Atom,
+        args: Vec<(Atom, Type)>,
+        fun_ty: Type,
+        ret_ty: Type,
+    },
     /// `extern "symbol"` — a foreign function *reference*; `usize` is its arg
     /// count (the arrow-spine length; a single `Unit` domain is 0). A bare
     /// reference is only ever a `let`-binding — calls are collected into
@@ -497,6 +510,16 @@ fn collect_spine<'a>(e: &'a Typed, out: &mut Vec<&'a Typed>) -> &'a Typed {
     }
 }
 
+/// The number of leading value arrows in a function type — how many arguments
+/// a fully-saturated application supplies (`Int -> Int -> Int` is 2). Used to
+/// recognise a saturated call at a spine site.
+fn arrow_arity(ty: &Type) -> usize {
+    match ty {
+        Type::Fun(_, ret, _) => 1 + arrow_arity(ret),
+        _ => 0,
+    }
+}
+
 /// One prerequisite binding accumulated while normalizing a block.
 type Bind = IrBind;
 
@@ -669,15 +692,36 @@ impl Lower {
                         Comp::Foreign(sym, atoms, abi)
                     }
                     // not an extern, or a partial / over-application: an
-                    // ordinary curried application.
+                    // ordinary curried application — UNLESS it is a saturated
+                    // (n >= 2) call to a named function value, which collapses
+                    // to one `Comp::Call` the backend routes to an uncurried
+                    // entry. `n == arrow_arity(head)` keeps partial/over-
+                    // applications on the curried path.
                     _ => {
-                        let f = self.atom(fun, binds);
-                        let a = self.atom(arg, binds);
-                        Comp::App {
-                            fun: f,
-                            arg: a,
-                            arg_ty: arg.ty.clone(),
-                            ret_ty: e.ty.clone(),
+                        let saturated_named = matches!(head.node, Node::Var(_))
+                            && spine.len() >= 2
+                            && spine.len() == arrow_arity(&head.ty);
+                        if saturated_named {
+                            let fun = self.atom(head, binds);
+                            let mut args = Vec::with_capacity(spine.len());
+                            for &a in &spine {
+                                args.push((self.atom(a, binds), a.ty.clone()));
+                            }
+                            Comp::Call {
+                                fun,
+                                args,
+                                fun_ty: head.ty.clone(),
+                                ret_ty: e.ty.clone(),
+                            }
+                        } else {
+                            let f = self.atom(fun, binds);
+                            let a = self.atom(arg, binds);
+                            Comp::App {
+                                fun: f,
+                                arg: a,
+                                arg_ty: arg.ty.clone(),
+                                ret_ty: e.ty.clone(),
+                            }
                         }
                     }
                 }
@@ -1488,6 +1532,14 @@ fn write_comp(s: &mut String, prefix: &str, row: &Row, comp: &Comp, depth: usize
     match comp {
         Comp::Atom(a) => line(atom_str(a)),
         Comp::App { fun, arg, .. } => line(format!("{} {}", atom_str(fun), atom_str(arg))),
+        Comp::Call { fun, args, .. } => {
+            let arglist = args
+                .iter()
+                .map(|(a, _)| atom_str(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            line(format!("call {} {}", atom_str(fun), arglist))
+        }
         Comp::Bin(op, a, b) => line(format!("{} {} {}", atom_str(a), op.symbol(), atom_str(b))),
         Comp::FloatBin(op, a, b) => line(format!(
             "float {} {} {}",

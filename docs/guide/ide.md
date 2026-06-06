@@ -1,31 +1,58 @@
 # The Locus IDE
 
-Locus comes with a small integrated desktop **IDE** — a self-contained place to
-write a Locus program, run it, and *see what it does*, including graphical output
-in its own window panes. It is the friendliest way to try the language and learn
-it by doing: edit on the left, press Run, watch the result (and the program's
-effect row) appear on the right.
+Locus comes with a small integrated desktop **IDE** — a little app you download
+and run to write a Locus program, press **Run**, and immediately see what it
+does. Output and errors appear in panes; graphical programs open their own
+windows and draw into them. There is nothing to install and nothing you can
+break, which makes it the friendliest way to try the language and learn it by
+doing.
 
-The IDE is also the clearest demonstration of the idea at the centre of Locus —
-the **world boundary**. The IDE is a tiny, curated *world*, and the program you
-run is embedded inside it. Everything the program can reach — a window pane, a
-pixel, a mouse click — is a capability the IDE grants through a sealed service.
-Step outside the IDE and those capabilities simply cease to exist.
+Under that friendly surface it is also a hands-on demonstration of the idea at
+the centre of Locus — the **world boundary** — which we'll come back to once
+you've seen it run.
+
+## Not a REPL, and not a browser playground
+
+It helps to say what the IDE is *not*. A language REPL hands your snippet the full
+power of the host process — the whole operating system is one call away. A browser
+playground hands your code the DOM and whatever the page can reach. The Locus IDE
+does neither. It gives a program **only the sealed powers of its own small world**
+— open a pane, draw, read input, print — and nothing else. There is no escape
+hatch, because in Locus a power you were not granted has no name you could even
+write down. That makes it a safe place to experiment *by construction*, not by
+policing.
+
+```
+   +-- The IDE: a small, sealed world -----------------
+   |   it grants:  graphics   event   console   gc   mem
+   |
+   |       +-- your program ------------------
+   |       |   effect row: { graphics, event, gc, mem }
+   |       +----------------------------------
+   +---------------------------------------------------
+
+   Outside this world there is no graphics, no event, and
+   no iGui.* — a graphical program will not even link.
+```
 
 ## Getting it
 
 The IDE ships as a **downloadable zip release** — no build, no install. Unzip it
-and run `locus-ide.exe` (Windows; it draws with Direct2D / DirectWrite). The
-release is self-contained: the editor, the compiler, the JIT, and the runtime are
-all in the one executable. There is nothing else to set up.
+and run `locus-ide.exe`. The release is self-contained: the editor, the compiler,
+the JIT, and the runtime are all in the one executable, so there is nothing else
+to set up.
+
+It is **Windows-only today** — it draws with Direct2D / DirectWrite. (The Locus
+*compiler* itself also runs on Linux; the windowed IDE is the Windows-specific
+piece.)
 
 ## What you see
 
 `locus-ide` is a multi-pane window. A typical session has:
 
 - an **editor pane** with your Locus source;
-- a **console pane** — anything a program prints with `console_writeln` lands
-  here (the IDE quietly routes the console to this pane);
+- a **console pane** — anything a program prints with `console_writeln` is
+  captured by the IDE and shown here, in place of an OS console;
 - an **effects pane** — the inferred **effect row** of the program you ran, so
   you can read exactly which powers it used;
 - and, for graphical programs, one or more **graphics panes** the program opens
@@ -38,7 +65,7 @@ the running program is drawing in the middle.
 ## Running a program
 
 Press **Run** and the IDE compiles and executes your program *in its own
-process*. The whole Locus pipeline runs in-memory — parse, type-and-effect check,
+process*. The whole Locus pipeline runs in memory — parse, type-and-effect check,
 compile-time staging, lower to IR, and JIT to native code — and the result runs
 immediately. There is no separate compile step and no file to launch; the program
 is alive inside the IDE a fraction of a second after you press Run.
@@ -49,13 +76,24 @@ program that draws shows `{graphics, event, gc, mem}`. You learn to read a
 program's footprint at a glance, which is the whole habit Locus is trying to
 teach.
 
-## Window panes and graphics
+## Your first graphics
 
-A program opens a pane and draws into it through the **Graphics** service. A
-frame is three steps — begin a batch, issue draw calls, submit:
+The smallest graphical program opens a pane, clears it, writes a word, and
+submits the frame:
 
 ```locus
 let pane = open_window "Hello" in
+let _ = gfx_begin pane in
+let _ = clear 0.10 0.11 0.14 1.0 in
+let _ = draw_text pane 24.0 24.0 "Hello, Locus" 1.0 1.0 1.0 1.0 in
+gfx_submit ()
+```
+
+A frame is always those three movements — **begin** a batch, issue **draw**
+calls, **submit**. Here is one with some shapes:
+
+```locus
+let pane = open_window "Shapes" in
 let _ = gfx_begin pane in
 let _ = clear 0.10 0.11 0.14 1.0 in
 let _ = fill_rect 20.0 20.0 180.0 120.0 0.20 0.45 0.70 1.0 in
@@ -64,7 +102,7 @@ gfx_submit ()
 ```
 
 Coordinates are device-independent pixels and colours are RGBA floats in
-`0.0..1.0`. The service surface:
+`0.0..1.0`. The full surface:
 
 | Function | Draws |
 |----------|-------|
@@ -80,8 +118,8 @@ Coordinates are device-independent pixels and colours are RGBA floats in
 
 ## Input and animation
 
-Programs receive input and timer ticks through the **Event** service, which
-hands back a decoded sum:
+Programs receive input and timer ticks through the **Event** service, which hands
+back a decoded sum:
 
 ```locus
 type Event =
@@ -145,11 +183,10 @@ auditable surface.
 
 ## The world boundary, made literal
 
-Here is where the IDE becomes more than a convenience. Every ordinary Locus
-program has a *world* — the operating system — reached through a boundary module
-(`Winapi`) that **mints** raw power and a service (`Console`) that **seals** it.
-The IDE is exactly the same shape, with the IDE shell itself standing in for the
-OS:
+Every ordinary Locus program has a *world* — the operating system — reached
+through a boundary module (`Winapi`) that **mints** raw power and a service
+(`Console`) that **seals** it. The IDE is exactly the same shape, with the IDE
+shell itself standing in for the OS:
 
 ```mermaid
 flowchart TD
@@ -167,9 +204,9 @@ flowchart TD
   `open_window` / `fill_rect` / … API your program actually calls. `IdeEvent` and
   `Event` do the same for `event`.
 
-So a graphical program's authority is, in full, the `graphics` and `event`
-labels in its row — never the raw `iGui.*` mint, never the OS. You read what it
-can touch off its type, the same way you would for any Locus program.
+So a graphical program's authority is, in full, the `graphics` and `event` labels
+in its row — never the raw `iGui.*` mint, never the OS. You read what it can touch
+off its type, the same way you would for any Locus program.
 
 And the boundary is *real*, not a convention. Those `iGui.*` symbols only exist
 because the IDE **injects them into the JIT** when it runs your program. Take the
@@ -178,19 +215,37 @@ to — it **fails to link**. That is the cleanest possible statement of the thes
 a power that belongs to a world does not exist outside it. The IDE doesn't
 *restrict* drawing to its window; drawing is simply *meaningless* anywhere else.
 
-## Why the theme matters
+## The IDE and agents
 
-The IDE is a microcosm of the whole language. It is a small, self-contained
-**world** with a curated set of verbs (draw, take input, print), each one a
-sealed service with an honest label, and a program embedded inside it whose every
-reach is written in its type and shown in a pane while it runs. The thing that
-makes Locus safe to hand to an autonomous colleague — *power is granted by the
-world, named in the type, and impossible to forge* — is the same thing that makes
-the IDE a calm place for a human to experiment: you cannot reach anything you
-were not given, so there is nothing to break, and the effects pane keeps you
-honest as you learn.
+The IDE is a toy version of the thing Locus is really for. Swap the IDE shell for
+an agent runtime and almost nothing changes:
 
-In other words, the IDE is itself a worked example of the idea the
+| | The IDE | An agent runtime |
+|---|---------|------------------|
+| The world | the desktop shell | the production host |
+| Granted verbs | `graphics`, `event`, `console` | whatever the team minted (an API, a store, a queue) |
+| How granted | sealed services over boundary mints | sealed services over boundary mints |
+| What a program can reach | exactly its row, nothing more | exactly its row, nothing more |
+| Audit | read the effects pane | read the effect row in review |
+
+Both obey the same rule — **power is granted by the world, named in the type, and
+impossible to forge** — and neither has ambient access to anything else. The IDE
+is the "toy world" where you can *see* the discipline at work in a pane; an agent
+runtime is the same discipline at production stakes. Learning to read the IDE's
+effects pane is, quite literally, learning to review code an AI colleague wrote.
+See [Programs for agents](agents.md) for that side of the story.
+
+## Why it matters
+
+The IDE is a microcosm of the whole language: a small, self-contained world with a
+curated set of verbs, each one a sealed service with an honest label, and a
+program embedded inside it whose every reach is written in its type and shown in a
+pane while it runs. The thing that makes Locus safe to hand to an autonomous
+colleague is the same thing that makes the IDE a calm place for a human to learn —
+you cannot reach anything you were not given, so there is nothing to break, and
+the effects pane keeps you honest as you go.
+
+In short, the IDE is itself a worked example of the idea the
 [README](../../README.md) opens with: software is made of boundaries, and Locus
 gives every power a place and routes all authority through a small, controlled
 crossing. The IDE is one such world — small enough to hold in your head, real

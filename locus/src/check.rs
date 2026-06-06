@@ -1864,7 +1864,9 @@ mod tests {
             ("len 1", "RN-E0213", "array.not-an-array"),
             ("Nope", "RN-E0220", "sum.unknown-constructor"),
             (
-                "loop a = 1, b = 2 while true do a + 1 else a",
+                // More step expressions than accumulators. (A *single* step for
+                // a multi-var loop is the tuple form, not an arity error.)
+                "loop a = 1, b = 2 while true do a + 1, b + 1, a + b else a",
                 "RN-E0228",
                 "loop.step-arity",
             ),

@@ -7495,16 +7495,44 @@ mod tests {
 
     #[test]
     fn accumulator_loop_step_arity_is_checked() {
+        // A genuine arity mismatch (more steps than accumulators) still fires
+        // LoopArity. (A *single* step for a multi-var loop is now the tuple
+        // form — see the two tests below.)
+        let term = crate::parse::parse(
+            "loop i = 0, acc = 0 while i < 10 do i + 1, acc + 1, i else acc",
+        )
+        .unwrap();
+        let err = elaborate(&Sig::new(), &Ctx::new(), 0, &term).unwrap_err();
+        assert_eq!(err, TypeErr::LoopArity { expected: 2, found: 3 });
+    }
+
+    #[test]
+    fn multi_var_loop_accepts_a_single_tuple_step() {
+        // The natural shape: a multi-variable loop whose single step is a tuple
+        // of the next accumulator values (so a `let`/`match` can be shared
+        // across them). Desugars to a single-accumulator tuple loop.
+        let term = crate::parse::parse(
+            "loop a = 0, b = 100 while a < 10 do let m = a + 1 in (m, b - m) else b",
+        )
+        .unwrap();
+        let t = el(0, &term);
+        assert_eq!(t.ty, Type::Int);
+    }
+
+    #[test]
+    fn multi_var_loop_single_scalar_step_is_a_tuple_mismatch() {
+        // A single *non-tuple* step for a multi-var loop is a clear type error:
+        // the step must be an N-tuple of the accumulators.
         let term =
             crate::parse::parse("loop i = 0, acc = 0 while i < 10 do i + 1 else acc").unwrap();
         let err = elaborate(&Sig::new(), &Ctx::new(), 0, &term).unwrap_err();
-        assert_eq!(
-            err,
-            TypeErr::LoopArity {
-                expected: 2,
-                found: 1
+        match err {
+            TypeErr::Mismatch { expected, found } => {
+                assert_eq!(expected, Type::Tuple(vec![Type::Int, Type::Int]));
+                assert_eq!(found, Type::Int);
             }
-        );
+            other => panic!("expected a tuple Mismatch, got {other:?}"),
+        }
     }
 
     // ── S2: parametric polymorphism (schemes / value restriction) ───────────

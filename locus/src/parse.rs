@@ -1349,6 +1349,44 @@ impl Parser {
             } else {
                 return Err(self.err("expected `return`, `else`, or `endloop` after loop steps"));
             };
+            // Multi-variable loop with a SINGLE step expression: treat the step
+            // as a *tuple* of the next accumulator values — evaluated once per
+            // iteration and destructured into the accumulators. This makes the
+            // natural shapes work without the packed-Int workaround:
+            //
+            //   loop a, b, c while p do let (x,y,z) = m in (x, y, z) else f
+            //   loop a, b, c while p do (match e with | P => (..) | ..) else f
+            //
+            // because a comma-separated step list can't share a `let`/`match`
+            // across its elements (the `let … in` body or a match arm is a
+            // single expr; the commas belong to the loop). Desugar to a
+            // single-accumulator loop over a tuple, rebinding the names from it
+            // in the condition / step / result — reusing tuple destructuring,
+            // so no change to elaboration or lowering. This only fires for
+            // `vars > 1 && steps == 1`, which was previously always a
+            // `LoopArity` error, so no existing program changes meaning.
+            if vars.len() > 1 && steps.len() == 1 {
+                let names: Vec<String> = vars.iter().map(|(n, _)| n.clone()).collect();
+                let inits: Vec<Term> = vars.into_iter().map(|(_, i)| i).collect();
+                let step = steps.into_iter().next().expect("steps.len() == 1");
+                // A binder the user is exceedingly unlikely to collide with; even
+                // if they did, the destructuring binds values eagerly, so a
+                // shadow is harmless.
+                let tup = "__loop_tuple";
+                let wrap = |body: Term| {
+                    Term::LetTuple(
+                        names.clone(),
+                        Box::new(Term::Var(tup.to_string())),
+                        Box::new(body),
+                    )
+                };
+                return Ok(Term::Loop {
+                    vars: vec![(tup.to_string(), Term::Tuple(inits))],
+                    cond: Box::new(wrap(cond)),
+                    steps: vec![wrap(step)],
+                    result: Box::new(wrap(result)),
+                });
+            }
             Ok(Term::Loop {
                 vars,
                 cond: Box::new(cond),

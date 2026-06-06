@@ -145,30 +145,38 @@ and a yellow dot that jumps to wherever you click, repainting every 16 ms.
 let pane = open_window "Locus demo" in
 let _ = set_redraw_rate pane 16 in
 
+-- Draw one frame: clear, a 4×4 grid of rects, and the dot at (dotx, doty).
 let frame = fn dotx: Int => fn doty: Int =>
   let _ = gfx_begin pane in
   let _ = clear 0.10 0.11 0.14 1.0 in
   let _ =
     loop r = 0 while r < 4 do
-      loop c = 0 while c < 4 do
-        let x0 = toFloat (8 + c * 36) in
-        let y0 = toFloat (8 + r * 36) in
-        let _ = fill_rect x0 y0 (x0 + 30.0) (y0 + 30.0) 0.20 0.45 0.70 1.0 in
-        c + 1
-      else c, r + 1
+      let _ =
+        loop c = 0 while c < 4 do
+          let x0 = toFloat (8 + c * 36) in
+          let y0 = toFloat (8 + r * 36) in
+          let _ = fill_rect x0 y0 (x0 + 30.0) (y0 + 30.0) 0.20 0.45 0.70 1.0 in
+          c + 1
+        else c
+      in
+      r + 1
     else r
   in
   let _ = fill_circle (toFloat dotx) (toFloat doty) 12.0 1.0 0.85 0.25 1.0 in
   gfx_submit ()
 in
 
-loop running = 1, dotx = 80, doty = 80 while running == 1 do
-  let _ = frame dotx doty in
-  match poll_event 16 with
-  | MouseDown(x, y) => 1, x, y
-  | Close           => 0, dotx, doty
-  | _               => 1, dotx, doty
-else 0
+-- Event loop as tail recursion: draw, poll once, recurse with the new dot.
+-- A self-tail-call lowers to a jump, so this never grows the stack.
+let rec spin : Int -> Int -> Int ! {graphics, event, gc, mem} =
+  fn dotx: Int => fn doty: Int =>
+    let _ = frame dotx doty in
+    match poll_event 16 with
+    | MouseDown(x, y) => spin x y
+    | Close           => 0
+    | _               => spin dotx doty
+in
+spin 80 80
 ```
 
 Its effect row is `{graphics, event, gc, mem}` — it draws (`graphics`), reads

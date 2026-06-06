@@ -6,6 +6,31 @@
 
 This is a personal project, exploring concepts for an agentic world.
 
+## Documentation
+
+*A language for people and their AI colleagues* — so the docs come in two
+flavours, depending on who is reading.
+
+### Locus for people
+
+- **[Language guide](docs/guide/index.md)** — a comprehensive, diagram-rich tour:
+  getting started, the type system, effects and handlers, staging, modules and
+  capabilities, the standard library, and how it all compiles.
+- **[Articles](docs/articles/README.md)** — longer-form essays: the Phantom diptych
+  (handlers and staging), the `mem` effect in action, and safety through
+  transparency.
+- **[Manifesto](MANIFESTO.md)** — the design philosophy behind the project.
+- **[Calculus status & theory](#locus-language--calculus-mechanization-status--theory)**
+  — the Lean mechanization ledger, further down this file.
+
+### Locus for agents
+
+- **[Locus for agents](docs/locus_for_agents.md)** — a compact field guide for AI
+  colleagues: the MCP tools, the `locusc` CLI, and the operator and keyword tables
+  with one-line examples.
+- **[Programs for agents](docs/guide/agents.md)** — the guide chapter on the Agent
+  service and driving a Locus program turn by turn over MCP.
+
 
 ## The idea in one paragraph
 

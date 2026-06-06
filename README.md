@@ -6,6 +6,10 @@
 
 This is a personal project, exploring concepts for an agentic world.
 
+<img src="docs/selfie.png" alt="Locus in its Rust IDE, playing Othello" width="600">
+
+*Locus in its Rust IDE, playing Othello.*
+
 ## Documentation
 
 *A language for people and their AI colleagues* — so the docs come in two

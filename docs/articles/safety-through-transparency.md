@@ -37,12 +37,16 @@ Locus tracks effects in the type. Touching the terminal is `console`; raw memory
 `mem`; the managed heap is `gc`; the OS boundary is `winapi`. Any code that does one
 of these has the label in its row, and the row flows up through every caller until
 something explicitly discharges it ([the `mem` article](the-mem-effect-in-action.md)
-walks this end to end; [`capabilities.md`](../capabilities.md) covers the layering).
+walks this end to end; [the capabilities chapter](../guide/modules-and-capabilities.md) covers the layering).
 
 The consequence is a property worth saying plainly: **a program's complete
-interaction with the world is printed in its type.** There is no off-the-books I/O,
-no `unsafe` block that's invisible in a signature. So you can ask the compiler what
-a program touches and get the whole truth:
+interaction with the world is printed in its type** — enforced by the checker on
+every program it accepts. There is no off-the-books I/O, no `unsafe` block that's
+invisible in a signature. (That the row can *never* lie — the universal claim, for
+*all* programs — is the soundness metatheorem: the checker enforces it and the test
+suite exercises it, but the end-to-end proof is [the result still being
+closed](../../README.md#locus-language--calculus-mechanization-status--theory).) So
+you can ask the compiler what a program touches and read its footprint:
 
 ```
 $ locusc effects hello.locus
@@ -200,5 +204,5 @@ A lead, not a leash.
 *Reproducible against this repo: `locusc effects FILE`, `locusc republish [DIR]`, and
 the dev-warn / prod-block split (`--features sealed`) are all in `locusc`. Companions:
 [the `mem` effect in action](the-mem-effect-in-action.md) (effects you can read down
-to the assembly), [`capabilities.md`](../capabilities.md) (the layered platform),
-[`../MANIFESTO.md`](../MANIFESTO.md) (the transparency commitment this rests on).*
+to the assembly), [the capabilities chapter](../guide/modules-and-capabilities.md) (the layered platform),
+[the manifesto](../../MANIFESTO.md) (the transparency commitment this rests on).*

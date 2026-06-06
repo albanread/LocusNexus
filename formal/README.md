@@ -1,6 +1,6 @@
 # `formal/` — the Locus core calculus in Lean 4
 
-A Lean **v4.28.0** formalization of [`../docs/calculus.md`](../docs/calculus.md),
+A Lean **v4.28.0** formalization of [the Locus calculus](../README.md#locus-language--calculus-mechanization-status--theory),
 the graded modal calculus at the heart of Locus: a **monadic effect grade**
 joined to a **comonadic stage grade** by a **distributive law `δ`**.
 
@@ -42,8 +42,8 @@ These are the genuinely *mathematical* core: the law that makes `δ` lawful
 (`split` is a monoid hom), the idempotence that makes the comultiplication
 square collapse, and the grade structures.
 
-**Also proved — the calculus-extensions companion
-([`../docs/calculus-extensions.md`](../docs/calculus-extensions.md)):**
+**Also proved — the sealing and representation-kind extensions** (the §13 / §11
+content, now summarized in [the calculus status](../README.md#locus-language--calculus-mechanization-status--theory)):
 
 | Lean fact | Calculus content |
 |---|---|

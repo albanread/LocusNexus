@@ -4,7 +4,7 @@
 
  
 
-> **Why Locus exists — the idea the rest serves.** Locus's effect system is *calculus-driven* ([`calculus.md`](docs/calculus.md)): effects are a graded monad, so **every effect a computation can have is written in its type** — nothing hidden, ambient, or implicit, down to `{gc}` itself. That one fact is what sets Locus apart from everything else: it buys **transparency** (you read what code *does* straight from its signature) and **safety** (the effect row is a checked upper bound and capabilities seal every raw power, so the dangerous thing cannot happen silently or nonlocally). Every other feature exists to keep that guarantee total.
+> **Why Locus exists — the idea the rest serves.** Locus's effect system is *calculus-driven* (see [the calculus](README.md#locus-language--calculus-mechanization-status--theory)): effects are a graded monad, so **every effect a computation can have is written in its type** — nothing hidden, ambient, or implicit, down to `{gc}` itself. That one fact is what sets Locus apart from everything else: it buys **transparency** (you read what code *does* straight from its signature) and **safety** (the effect row is a checked upper bound and capabilities seal every raw power, so the dangerous thing cannot happen silently or nonlocally). Every other feature exists to keep that guarantee total.
 
 ## What this is
 

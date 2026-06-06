@@ -46,9 +46,9 @@ transitively, carries `mem` until something explicitly discharges it. "Safe-look
 code that secretly touches memory" is not expressible.
 
 None of this is special-cased for memory. `mem` is an ordinary **world label**
-([calculus §1.1](../calculus.md)) — the same kind of label as `console` or `gc`
+(see [the calculus](../../README.md#locus-language--calculus-mechanization-status--theory)) — the same kind of label as `console` or `gc`
 ("touches the managed heap") — and it enters and propagates by the two core effect
-rules ([calculus §2.1](../calculus.md)): `(perform)` adds the label to the row when
+rules ([the calculus](../../README.md#locus-language--calculus-mechanization-status--theory)): `(perform)` adds the label to the row when
 a primitive runs, and `(bind)` takes the row **union** across a sequence. That
 union is the whole story of why `mem` is contagious — it flows up through every
 caller until a handler or a seal removes it.

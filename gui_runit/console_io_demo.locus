@@ -1,0 +1,25 @@
+-- Console I/O demo for the IDE pane — text output AND input, no graphics.
+--
+-- Shows the whole console surface working live in the ⁂ console pane:
+--   * the native `perform console` and the `console_writeln` service for output,
+--   * `console_read_line` for input — type your answer at the console pane's
+--     prompt and press Enter; the running program receives the line.
+--
+-- Run it with F5 inside `locus-ide`, then click the console pane to type. Run it
+-- from a terminal with `locusc run` and it reads from stdin instead — same
+-- program, different world.
+--
+-- Effects (see the IDE's effects pane): { console, winapi, gc, mem } — confined
+-- to the console surface. No filesystem, no network. The type proves it.
+
+let _ = perform console "— Locus console demo —" in
+let _ = console_writeln "What is your name?" in
+let name = console_read_line () in
+let _ = console_writeln (string_concat "Hello, " (string_concat name "! Welcome to Locus.")) in
+
+let _ = console_writeln "Type a line and press Enter to echo it back:" in
+let echo = console_read_line () in
+let _ = console_writeln (string_concat "you said: " echo) in
+
+let _ = console_writeln "Done." in
+0

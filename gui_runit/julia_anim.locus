@@ -1,0 +1,63 @@
+-- Animated Julia set — exercises the DOUBLE-BUFFERED canvas.
+--
+-- Each frame: render into the back buffer (raw pixel writes, the `mem` lane),
+-- then `canvas_present` displays it AND returns the *next* back-buffer address
+-- (a pointer flip, no copy). The frame loop threads that address along — so the
+-- worker draws the next frame while the GUI shows the last. The Julia constant
+-- sweeps, so the set morphs continuously.
+
+let w = 256 in
+let h = 256 in
+let maxit = 48 in
+let pane = open_window_sized "Julia (animated)" w h in
+
+-- The escape iteration is written as an inline multi-var `loop`, NOT a
+-- recursive function — and that is the whole performance story. A `loop`
+-- lowers to a register phi: zx/zy stay in xmm registers (the `Float`
+-- cells are a free i64<->f64 bitcast), zero heap, pure SSE — ~650 fps of
+-- compute. A curried *recursive* `escape` instead allocates a closure per
+-- step (LLVM can't devirtualize a recursive closure), which ran ~100x
+-- slower. Same math, same result; the loop form keeps floats on the stack.
+
+-- Render one frame into the buffer at `base`, for animation step `frame`.
+let render = fn base: Int => fn frame: Int =>
+  let phase = frame - (frame / 240) * 240 in            -- 0..239, a slow loop
+  let cre = (0.0 - 0.8) + toFloat phase / 240.0 * 0.5 in -- sweep -0.8 .. -0.3
+  let cim = 0.156 in
+  loop py = 0 while py < h do
+    let _ =
+      loop px = 0 while px < w do
+        let zx0 = (toFloat px / toFloat w) * 3.0 - 1.5 in
+        let zy0 = (toFloat py / toFloat h) * 3.0 - 1.5 in
+        let it =
+          loop zx = zx0, zy = zy0, i = 0
+            while i < maxit && (zx * zx + zy * zy) <= 4.0 do
+              zx * zx - zy * zy + cre,
+              2.0 * zx * zy + cim,
+              i + 1
+          else i
+        in
+        let g = it * 255 / maxit in
+        let argb = 0xFF000000 | ((255 - g) << 16) | (g << 8) | (4 * g * (255 - g) / 255) in
+        let _ = canvas_set base w px py argb in
+        px + 1
+      else px
+    in
+    py + 1
+  else py
+in
+
+-- Frame loop: draw, present (flip → next back buffer), poll, repeat.
+-- Exit on a window close (the pane's Close event) OR Escape (vkey 27);
+-- the IDE's Break/Restart also lands here as a synthetic Close, so the
+-- program leaves this loop on its own and the worker is freed.
+let rec run : Int -> Int -> Int ! {graphics, event, gc, mem} =
+  fn base: Int => fn frame: Int =>
+    let _ = render base frame in
+    let next = canvas_present pane in
+    match poll_event 16 with
+    | Close  => 0
+    | Key(k) => if k == 27 then 0 else run next (frame + 1)
+    | _      => run next (frame + 1)
+in
+run (canvas_open pane w h) 0

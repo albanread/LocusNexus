@@ -1,0 +1,50 @@
+[package]
+name = "locus-igui"
+version = "0.1.0"
+edition = "2021"
+description = "Direct2D/DirectWrite/D3D11 + Win32 MDI shell for the Locus IDE. Ported from NewFactor's igui (NewCP / NewCormanLisp lineage); language-agnostic shell only — the doc/help panes, lisp_shims, and Factor stack_view are excised for Phase 0."
+
+[lib]
+# Keep the crate's lib name `igui` so the in-crate `super::`/`igui::`
+# paths port verbatim and the host calls `igui::window::run(...)`.
+name = "igui"
+path = "src/lib.rs"
+
+# Windows-only: the whole module is `#![cfg(windows)]`. Mirrors the
+# windows-rs feature set the shell needs (Direct2D/3D/DirectWrite/DXGI
+# + Win32 windowing, COM, HiDPI, VEH for the crash handler).
+[target.'cfg(windows)'.dependencies]
+windows-numerics = "0.3"
+# The markdown + Mermaid render core, shared with the standalone doc-crate.
+# Backs the `doc_pane` report pane (NOT the Help/manual pane — that is
+# help_pane's job): the IDE renders capability/effect reports as markdown
+# with Mermaid diagrams through this.
+docpane = { path = "../vendor/docpane" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+]

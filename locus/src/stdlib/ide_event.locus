@@ -1,0 +1,67 @@
+module IdeEvent at boundary mints (event) exposing () =
+-- stdlib LAYER 0: the IDE-world EVENT boundary. Raw `iGui.*` C-ABI imports for
+-- the input/animation channel the shell drives, plus the private scratch-buffer
+-- decode of `iGui.NextEvent`'s seven packed VAR out-params. Like `IdeGraphics`,
+-- these resolve only inside `locus-ide` (host-injected JIT symbols). MINTS
+-- `event`; the `Event` services layer SEALS it into a `next_event` returning a
+-- decoded sum.
+--
+-- iGui.NextEvent(out kind, child, time, p1, p2, p3, p4 : INTEGER; timeoutMs):
+--   returns 1 if an event was delivered, 0 on timeout. Field semantics per
+--   channels.rs:
+--     MOUSE(3): p1=x, p2=y, p3=mods|button<<8|op<<16   (op LEFT_DOWN=1)
+--     KEY(1):   p1=vkey
+--     RESIZE(5):p1=width, p2=height
+--     TICK(13): (child carries the pane id)
+--     CLOSE(7) / FRAME_CLOSE(8): no payload.
+
+let igui_next_event =
+  extern "iGui.NextEvent"
+    : Ptr -> Ptr -> Ptr -> Ptr -> Ptr -> Ptr -> Ptr -> Int -> I32 in
+let igui_set_redraw_rate = extern "iGui.SetRedrawRate" : Int -> Int -> I32 in
+
+-- A small allocator for the seven out-slots (one i64 each = 56 bytes; round up).
+let ev_VirtualAlloc = extern "VirtualAlloc" : Int -> Int -> U32 -> U32 -> Int in
+
+let ev_alloc = fn bytes: Int =>
+  ev_VirtualAlloc 0 bytes 0x3000 0x04
+in
+
+-- Poll once with `timeout_ms` (< 0 blocks). Returns a packed Int describing the
+-- event so the service layer can build the sum without crossing the boundary
+-- again. Encoding (kept inside the boundary; the service decodes it):
+--   word layout:  (kind) | (a << 8) | (b << 32)
+-- where for MOUSE we fold the op into `kind` space by emitting synthetic kinds:
+--   100 = MouseDown, 101 = MouseUp, 102 = MouseMove
+-- and a=x, b=y; for KEY a=vkey; for RESIZE a=width, b=height; TICK/CLOSE a=b=0.
+-- On timeout (no event) returns 0 (NONE kind).
+let ev_poll_packed = fn timeout_ms: Int =>
+  let k    = ev_alloc 8 in
+  let ch   = ev_alloc 8 in
+  let tm   = ev_alloc 8 in
+  let p1   = ev_alloc 8 in
+  let p2   = ev_alloc 8 in
+  let p3   = ev_alloc 8 in
+  let p4   = ev_alloc 8 in
+  let got  = igui_next_event k ch tm p1 p2 p3 p4 timeout_ms in
+  if got == 0 then
+    0
+  else
+    let kind = peek64 k in
+    let a1 = peek64 p1 in
+    let a2 = peek64 p2 in
+    let a3 = peek64 p3 in
+    -- mouse op lives in bits 16.. of p3
+    let op = (a3 >> 16) & 0xFF in
+    let synth =
+      if kind == 3 then
+        -- MOUSE: 1=LEFT_DOWN, 2=LEFT_UP; everything else => move
+        if op == 1 then 100 else if op == 2 then 101 else 102
+      else
+        kind
+    in
+    -- pack: kind in low byte, a1 in bits 8.., a2 in bits 32..
+    (synth & 0xFF) | ((a1 & 0xFFFFFF) << 8) | ((a2 & 0xFFFFFF) << 32)
+in
+
+()

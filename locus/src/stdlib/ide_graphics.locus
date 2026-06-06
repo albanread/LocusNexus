@@ -1,0 +1,214 @@
+module IdeGraphics at boundary mints (graphics) exposing () =
+-- stdlib LAYER 0: the IDE-world GRAPHICS boundary. Raw `iGui.*` C-ABI imports
+-- (the Direct2D/DirectWrite batch surface the IDE shell exposes) plus the
+-- private string-marshalling helper. These resolve only inside `locus-ide`,
+-- where the host injects the `igui_*` addresses into the JIT
+-- (`jit_run_i64_with_symbols`); a program run OUTSIDE the IDE that imports
+-- Graphics fails at link — correct: these are IDE-world capabilities.
+--
+-- Mirrors `winapi.locus` → `console.locus`: this module MINTS `graphics` over
+-- the externs; `Graphics` (the services layer) SEALS it into a tidy public API.
+-- The numeric draw primitives bind the `iGui.*` exports directly (Float ⇒ the
+-- Win64 FP lane, exactly the f64 the shim takes); string arguments
+-- (window title, drawn text) are copied into a fresh NUL-terminated UTF-8
+-- buffer here so the shim's `read_cp_shortstr` reads valid bytes.
+
+-- ── window / pane lifecycle ──
+let igui_open_child = extern "iGui.OpenChild" : Ptr -> Int -> Ptr -> Int -> Int -> I32 in
+let igui_close_child = extern "iGui.CloseChild" : Int -> I32 in
+let igui_set_title = extern "iGui.SetTitle" : Int -> Ptr -> Int -> Unit in
+
+-- ── batch builder ── (SubmitBatch takes no native args; declared `Unit -> I32`
+-- so the boundary has an arrow to mint `graphics` on — the Win64 caller-cleaned
+-- convention ignores the extra unit register, exactly as `locus_string_empty :
+-- Unit -> String` already does over its 0-arg shim.)
+let igui_begin_batch = extern "iGui.BeginBatch" : Int -> Unit in
+let igui_submit_batch = extern "iGui.SubmitBatch" : Unit -> I32 in
+
+-- ── shared framebuffer (Canvas) ── the bulk-data fast path. `CanvasOpen pane w
+-- h` allocates a host-owned w*h BGRA buffer and returns its base address (an
+-- Int); the program writes pixels into it with `poke32` (the `mem` effect — no
+-- boundary crossing per pixel) and `CanvasPresent pane` blits the whole frame
+-- as one command.
+let igui_canvas_open = extern "iGui.CanvasOpen" : Int -> Int -> Int -> Int in
+-- Returns the next back-buffer base address (double-buffered); 0 if none open.
+let igui_canvas_present = extern "iGui.CanvasPresent" : Int -> Int in
+
+-- Write one 0xAARRGGBB pixel at (x, y) into the canvas (base address `base`,
+-- width `w`). A raw memory write (`poke32`) — legal here because this is the
+-- `at boundary` module (the raw-memory edge); the `Canvas` service re-exports
+-- it so app code reaches the framebuffer through the sealed surface, not a
+-- bare `poke`.
+let g_canvas_set = fn base: Int => fn w: Int => fn x: Int => fn y: Int => fn argb: Int =>
+  poke32 (base + ((y * w + x) * 4)) argb in
+
+-- ── geometry primitives (all coordinates + colours are Float = f64) ──
+let igui_emit_clear = extern "iGui.EmitClear" : Float -> Float -> Float -> Float -> Unit in
+let igui_emit_fill_rect =
+  extern "iGui.EmitFillRect"
+    : Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Unit in
+let igui_emit_stroke_rect =
+  extern "iGui.EmitStrokeRect"
+    : Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Unit in
+let igui_emit_draw_line =
+  extern "iGui.EmitDrawLine"
+    : Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Unit in
+let igui_emit_fill_circle =
+  extern "iGui.EmitFillCircle"
+    : Float -> Float -> Float -> Float -> Float -> Float -> Float -> Unit in
+let igui_emit_stroke_circle =
+  extern "iGui.EmitStrokeCircle"
+    : Float -> Float -> Float -> Float -> Float -> Float -> Float -> Float -> Unit in
+
+-- ── text ── EmitDrawTextRun(text,$len, x, y, fontSize, family,$len, weight,
+--            style, stretch, locale,$len, maxWidth, alignment, trimming, r,g,b,a)
+let igui_emit_draw_text_run =
+  extern "iGui.EmitDrawTextRun"
+    : Ptr -> Int -> Float -> Float -> Float -> Ptr -> Int -> I32 -> I32 -> I32
+      -> Ptr -> Int -> Float -> I32 -> I32 -> Float -> Float -> Float -> Float -> Unit in
+
+-- The allocator for the marshalling scratch buffers. Declared here (not shared
+-- with winapi) so Graphics is self-contained: VirtualAlloc(MEM_COMMIT|RESERVE,
+-- PAGE_READWRITE). Leaks per call — fine for a per-frame title/text; the JIT run
+-- is ephemeral.
+let igui_VirtualAlloc = extern "VirtualAlloc" : Int -> Int -> U32 -> U32 -> Int in
+
+let g_alloc = fn bytes: Int =>
+  igui_VirtualAlloc 0 bytes 0x3000 0x04
+in
+
+-- Count the UTF-8 byte length of a managed String (BMP + surrogate pairs).
+let g_utf8_len = fn s: String =>
+  let n = len s in
+  loop i = 0, bytes = 0 while i < n do
+    if s[i] < 0xD800 then
+      i + 1
+    else if s[i] < 0xDC00 then
+      if i + 1 < n then
+        if s[i + 1] < 0xDC00 then i + 1 else (if s[i + 1] < 0xE000 then i + 2 else i + 1)
+      else
+        i + 1
+    else
+      i + 1,
+    bytes + (
+      if s[i] < 0x80 then 1
+      else if s[i] < 0x800 then 2
+      else if s[i] < 0xD800 then 3
+      else if s[i] < 0xDC00 then
+        if i + 1 < n then
+          if s[i + 1] < 0xDC00 then 3 else (if s[i + 1] < 0xE000 then 4 else 3)
+        else
+          3
+      else
+        3
+    )
+  else
+    bytes
+in
+
+-- Marshal a managed String into a fresh NUL-terminated UTF-8 buffer; return the
+-- raw byte pointer. The shim's `read_cp_shortstr` scans to the NUL. Encoding
+-- logic mirrors winapi's `win_write_file_string`.
+let g_utf8z = fn s: String =>
+  let n = len s in
+  let bytes = g_utf8_len s in
+  let buf = g_alloc (bytes + 1) in
+  let _ =
+    loop i = 0, j = 0 while i < n do
+      let _ =
+        if s[i] < 0x80 then
+          poke8 (buf + j) s[i]
+        else if s[i] < 0x800 then
+          let ch = s[i] in
+          let _ = poke8 (buf + j) (0xC0 | (ch >> 6)) in
+          poke8 (buf + j + 1) (0x80 | (ch & 0x3F))
+        else if s[i] < 0xD800 then
+          let ch = s[i] in
+          let _ = poke8 (buf + j) (0xE0 | (ch >> 12)) in
+          let _ = poke8 (buf + j + 1) (0x80 | ((ch >> 6) & 0x3F)) in
+          poke8 (buf + j + 2) (0x80 | (ch & 0x3F))
+        else if s[i] < 0xDC00 then
+          if i + 1 < n then
+            let lo = s[i + 1] in
+            if lo < 0xDC00 then
+              let _ = poke8 (buf + j) 0xEF in
+              let _ = poke8 (buf + j + 1) 0xBF in
+              poke8 (buf + j + 2) 0xBD
+            else if lo < 0xE000 then
+              let ch = s[i] in
+              let code = 0x10000 + ((ch - 0xD800) << 10) + (lo - 0xDC00) in
+              let _ = poke8 (buf + j) (0xF0 | (code >> 18)) in
+              let _ = poke8 (buf + j + 1) (0x80 | ((code >> 12) & 0x3F)) in
+              let _ = poke8 (buf + j + 2) (0x80 | ((code >> 6) & 0x3F)) in
+              poke8 (buf + j + 3) (0x80 | (code & 0x3F))
+            else
+              let _ = poke8 (buf + j) 0xEF in
+              let _ = poke8 (buf + j + 1) 0xBF in
+              poke8 (buf + j + 2) 0xBD
+          else
+            let _ = poke8 (buf + j) 0xEF in
+            let _ = poke8 (buf + j + 1) 0xBF in
+            poke8 (buf + j + 2) 0xBD
+        else if s[i] < 0xE000 then
+          let _ = poke8 (buf + j) 0xEF in
+          let _ = poke8 (buf + j + 1) 0xBF in
+          poke8 (buf + j + 2) 0xBD
+        else
+          let ch = s[i] in
+          let _ = poke8 (buf + j) (0xE0 | (ch >> 12)) in
+          let _ = poke8 (buf + j + 1) (0x80 | ((ch >> 6) & 0x3F)) in
+          poke8 (buf + j + 2) (0x80 | (ch & 0x3F))
+      in
+      if s[i] < 0xD800 then
+        i + 1
+      else if s[i] < 0xDC00 then
+        if i + 1 < n then
+          if s[i + 1] < 0xDC00 then i + 1 else (if s[i + 1] < 0xE000 then i + 2 else i + 1)
+        else
+          i + 1
+      else
+        i + 1,
+      j + (
+        if s[i] < 0x80 then 1
+        else if s[i] < 0x800 then 2
+        else if s[i] < 0xD800 then 3
+        else if s[i] < 0xDC00 then
+          if i + 1 < n then
+            if s[i + 1] < 0xDC00 then 3 else (if s[i + 1] < 0xE000 then 4 else 3)
+          else
+            3
+        else
+          3
+      )
+    else
+      j
+  in
+  let _ = poke8 (buf + bytes) 0 in
+  buf
+in
+
+-- Open a child pane titled `title` with a `w × h` **client area** (0 on either
+-- axis = the Windows default size); return its child id (0 on failure).
+let g_open_child = fn title: String => fn w: Int => fn h: Int =>
+  let out = g_alloc 8 in
+  let _ = poke64 out 0 in
+  let tbuf = g_utf8z title in
+  let ok = igui_open_child tbuf (g_utf8_len title) out w h in
+  if ok == 0 then 0 else peek64 out
+in
+
+-- Draw `text` at (x, y) in the active batch, in the given colour, at a default
+-- size/weight using the shell's default family. The family pointer is null
+-- (the shim substitutes "Segoe UI"); locale null ("en-us"); no wrapping.
+let g_draw_text =
+  fn child: Int => fn x: Float => fn y: Float => fn s: String =>
+  fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    let tbuf = g_utf8z s in
+    igui_emit_draw_text_run
+      tbuf (g_utf8_len s) x y 16.0
+      0 0 400 0 5
+      0 0 (0.0 - 1.0) 0 0
+      r g b a
+in
+
+()

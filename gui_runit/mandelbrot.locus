@@ -1,0 +1,65 @@
+-- Mandelbrot set, rendered into an IDE pane, then timed.
+--
+-- The escape-time iteration uses a MULTI-VARIABLE LOOP whose single step is a
+-- tuple `(zx, zy, i)` — one of the two equally good ways to carry loop state in
+-- Locus (the other is tail recursion; see `julia`). The window is opened at the
+-- exact pixel size we draw into (`open_window_sized`); each cell is `scale` px.
+-- A good subject for Locus -> Show ANF IR / LLVM IR / Assembly: tight float math.
+
+let gw = 200 in
+let gh = 150 in
+let scale = 2 in
+let maxit = 60 in
+let pane = open_window_sized "Mandelbrot" (gw * scale) (gh * scale) in
+
+-- Escape time for (cx, cy): iterate z <- z*z + c until |z|^2 > 4 or maxit.
+let escape = fn cx: Float => fn cy: Float =>
+  loop zx = 0.0, zy = 0.0, i = 0
+    while if i < maxit then (zx * zx + zy * zy) <= 4.0 else false
+  do
+    let zx2 = zx * zx - zy * zy + cx in
+    let zy2 = 2.0 * zx * zy + cy in
+    (zx2, zy2, i + 1)
+  else i
+in
+
+let plot = fn px: Int => fn py: Int => fn it: Int =>
+  let t = toFloat it / toFloat maxit in
+  let x0 = toFloat (px * scale) in
+  let y0 = toFloat (py * scale) in
+  fill_rect x0 y0 (x0 + toFloat scale) (y0 + toFloat scale) t (t * t) (1.0 - t) 1.0
+in
+
+let render = fn u: Unit =>
+  let _ = gfx_begin pane in
+  let _ = clear 0.0 0.0 0.0 1.0 in
+  let _ =
+    loop py = 0 while py < gh do
+      let _ =
+        loop px = 0 while px < gw do
+          let cx = (toFloat px / toFloat gw) * 3.0 - 2.0 in
+          let cy = (toFloat py / toFloat gh) * 2.4 - 1.2 in
+          let _ = plot px py (escape cx cy) in
+          px + 1
+        else px
+      in
+      py + 1
+    else py
+  in
+  gfx_submit ()
+in
+
+let start = clock_ticks () in
+let _ = render () in
+let ms = elapsed_millis start in
+let _ = console_write "Mandelbrot rendered in " in
+let _ = console_write_float (toFloat ms) in
+let _ = console_writeln " ms" in
+
+let rec idle : Unit -> Int ! {event, gc, mem} =
+  fn u: Unit =>
+    match poll_event 100 with
+    | Close => 0
+    | _     => idle ()
+in
+idle ()

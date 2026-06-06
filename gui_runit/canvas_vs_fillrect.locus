@@ -1,0 +1,85 @@
+-- Canvas vs. fill_rect — the boundary speedup, measured.
+--
+-- Renders the SAME Mandelbrot two ways, times each, prints the ratio:
+--   A) one fill_rect per pixel — a boundary crossing per pixel (the slow lane);
+--   B) write pixels into a shared framebuffer with poke, present once (fast).
+-- Same image, wildly different boundary traffic. The pane shows the canvas
+-- render (B, presented last); the console shows how much faster it was.
+
+let w = 200 in
+let h = 150 in
+let maxit = 60 in
+let pane = open_window_sized "Canvas vs fill_rect" w h in
+
+let escape = fn cx: Float => fn cy: Float =>
+  loop zx = 0.0, zy = 0.0, i = 0
+    while if i < maxit then (zx * zx + zy * zy) <= 4.0 else false
+  do (zx * zx - zy * zy + cx, 2.0 * zx * zy + cy, i + 1)
+  else i
+in
+
+let cx_of = fn px: Int => (toFloat px / toFloat w) * 3.0 - 2.0 in
+let cy_of = fn py: Int => (toFloat py / toFloat h) * 2.4 - 1.2 in
+
+-- A) per-pixel fill_rect.
+let render_rects = fn u: Unit =>
+  let _ = gfx_begin pane in
+  let _ = clear 0.0 0.0 0.0 1.0 in
+  let _ =
+    loop py = 0 while py < h do
+      let _ =
+        loop px = 0 while px < w do
+          let t = toFloat (escape (cx_of px) (cy_of py)) / toFloat maxit in
+          let x0 = toFloat px in
+          let y0 = toFloat py in
+          let _ = fill_rect x0 y0 (x0 + 1.0) (y0 + 1.0) t (t * t) (1.0 - t) 1.0 in
+          px + 1
+        else px
+      in
+      py + 1
+    else py
+  in
+  gfx_submit ()
+in
+
+-- B) shared framebuffer.
+let render_canvas = fn base: Int =>
+  loop py = 0 while py < h do
+    let _ =
+      loop px = 0 while px < w do
+        let it = escape (cx_of px) (cy_of py) in
+        let g = it * 255 / maxit in
+        let argb = 0xFF000000 | (g << 16) | (((g * g) / 255) << 8) | (255 - g) in
+        let _ = canvas_set base w px py argb in
+        px + 1
+      else px
+    in
+    py + 1
+  else py
+in
+
+let base = canvas_open pane w h in
+
+let t0 = clock_ticks () in
+let _ = render_rects () in
+let rects_us = ticks_to_micros (elapsed_ticks t0) in
+
+let t1 = clock_ticks () in
+let _ = render_canvas base in
+let _ = canvas_present pane in
+let canvas_us = ticks_to_micros (elapsed_ticks t1) in
+
+let _ = console_write "fill_rect (per pixel): " in
+let _ = console_write_float (toFloat rects_us) in
+let _ = console_writeln " us" in
+let _ = console_write "canvas    (one blit) : " in
+let _ = console_write_float (toFloat canvas_us) in
+let _ = console_writeln " us" in
+let _ = console_write "speedup x" in
+let _ = console_write_float (toFloat rects_us / toFloat (if canvas_us <= 0 then 1 else canvas_us)) in
+let _ = console_writeln "" in
+
+let rec idle : Unit -> Int ! {event, gc, mem} =
+  fn u: Unit => match poll_event 100 with | Close => 0 | _ => idle ()
+in
+idle ()

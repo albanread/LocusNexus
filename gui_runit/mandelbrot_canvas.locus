@@ -1,0 +1,49 @@
+-- Mandelbrot via a SHARED FRAMEBUFFER — the boundary's bulk-data lane.
+-- The IDE owns the pixel buffer; we write pixels with poke (the `mem` effect,
+-- no per-pixel boundary crossing) and present the whole frame as ONE command.
+-- Contrast mandelbrot.locus, which crosses the boundary once per pixel.
+
+let w = 640 in
+let h = 480 in
+let maxit = 80 in
+let pane = open_window_sized "Mandelbrot (shared framebuffer)" w h in
+let base = canvas_open pane w h in
+
+let escape = fn cx: Float => fn cy: Float =>
+  loop zx = 0.0, zy = 0.0, i = 0
+    while if i < maxit then (zx * zx + zy * zy) <= 4.0 else false
+  do (zx * zx - zy * zy + cx, 2.0 * zx * zy + cy, i + 1)
+  else i
+in
+
+let colour = fn it: Int =>
+  if it >= maxit then 0xFF000000
+  else
+    let t = it * 255 / maxit in
+    0xFF000000 | (t << 16) | (((t * t) / 255) << 8) | (255 - t)
+in
+
+let start = clock_ticks () in
+let _ =
+  loop py = 0 while py < h do
+    let _ =
+      loop px = 0 while px < w do
+        let cx = (toFloat px / toFloat w) * 3.0 - 2.0 in
+        let cy = (toFloat py / toFloat h) * 2.4 - 1.2 in
+        let _ = canvas_set base w px py (colour (escape cx cy)) in
+        px + 1
+      else px
+    in
+    py + 1
+  else py
+in
+let _ = canvas_present pane in
+let us = ticks_to_micros (elapsed_ticks start) in
+let _ = console_write "shared-framebuffer Mandelbrot: " in
+let _ = console_write_float (toFloat us) in
+let _ = console_writeln " us" in
+
+let rec idle : Unit -> Int ! {event, gc, mem} =
+  fn u: Unit => match poll_event 100 with | Close => 0 | _ => idle ()
+in
+idle ()

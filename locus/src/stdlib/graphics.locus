@@ -1,0 +1,128 @@
+module Graphics at services exposing
+  (open_window, open_window_sized, open_child, close_window,
+   gfx_begin, gfx_submit,
+   clear, fill_rect, stroke_rect, fill_circle, stroke_circle, draw_line, draw_text,
+   canvas_open, canvas_present, canvas_set) =
+-- stdlib LAYER 1: the controlled GRAPHICS service over the hidden IDE-world
+-- boundary (`IdeGraphics`). Mirrors `Console` over `Winapi`: the boundary MINTS
+-- `graphics`; this layer SEALS it behind a tidy public surface. An app that
+-- imports Graphics carries `graphics` in its effect row — provably confined to
+-- draw-and-window, never the raw `iGui.*` mint.
+--
+-- A frame is: `gfx_begin pane; <draw calls>; gfx_submit ()`. Colours are RGBA
+-- Floats in 0.0..1.0. Coordinates are Floats (device-independent pixels).
+
+-- Open a top-level pane (an MDI child) titled `title` at the default size;
+-- returns its pane id.
+let open_window = fn title: String =>
+  g_open_child title 0 0
+in
+
+-- Open a pane titled `title` whose **client area** is exactly `w × h` pixels —
+-- so a program can size its window to the image it draws (e.g. a fractal).
+let open_window_sized = fn title: String => fn w: Int => fn h: Int =>
+  g_open_child title w h
+in
+
+-- Alias: in the IDE a "window" is a child pane.
+let open_child = fn title: String =>
+  g_open_child title 0 0
+in
+
+let close_window = fn pane: Int =>
+  let _ = igui_close_child pane in
+  ()
+in
+
+-- Begin a draw batch for `pane`. Draw calls accumulate until `gfx_submit`.
+let gfx_begin = fn pane: Int =>
+  igui_begin_batch pane
+in
+
+-- Submit the accumulated batch to the shell for compositing/painting.
+let gfx_submit = fn u: Unit =>
+  let _ = igui_submit_batch () in
+  ()
+in
+
+-- Clear the whole surface to a solid RGBA colour.
+let clear = fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+  igui_emit_clear r g b a
+in
+
+-- Filled rectangle (x0,y0)-(x1,y1), square corners, colour (r,g,b,a).
+let fill_rect =
+  fn x0: Float => fn y0: Float => fn x1: Float => fn y1: Float =>
+  fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    igui_emit_fill_rect x0 y0 x1 y1 0.0 r g b a
+in
+
+-- Stroked rectangle outline, `half` = half the line thickness.
+let stroke_rect =
+  fn x0: Float => fn y0: Float => fn x1: Float => fn y1: Float =>
+  fn half: Float => fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    igui_emit_stroke_rect x0 y0 x1 y1 0.0 half r g b a
+in
+
+-- Filled circle centred (cx,cy), radius `rad`, colour (r,g,b,a).
+let fill_circle =
+  fn cx: Float => fn cy: Float => fn rad: Float =>
+  fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    igui_emit_fill_circle cx cy rad r g b a
+in
+
+-- Stroked circle outline, `half` = half the line thickness.
+let stroke_circle =
+  fn cx: Float => fn cy: Float => fn rad: Float =>
+  fn half: Float => fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    igui_emit_stroke_circle cx cy rad half r g b a
+in
+
+-- Line from (x0,y0) to (x1,y1), `half` = half the line thickness.
+let draw_line =
+  fn x0: Float => fn y0: Float => fn x1: Float => fn y1: Float =>
+  fn half: Float => fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    igui_emit_draw_line x0 y0 x1 y1 half r g b a
+in
+
+-- Text run at (x,y) in colour (r,g,b,a), default family + size.
+let draw_text =
+  fn pane: Int => fn x: Float => fn y: Float => fn s: String =>
+  fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
+    g_draw_text pane x y s r g b a
+in
+
+-- ── Shared framebuffer (Canvas) — high-speed pixel data over the boundary ──
+-- The per-primitive calls above cross the boundary once each: fine for shapes,
+-- slow for a megapixel of fractal. `Canvas` is the bulk-data lane: the IDE owns
+-- a `w*h` pixel buffer (this service hands out its base address and blits it),
+-- and the *program* writes pixels straight in with `poke32` — its own `mem`
+-- effect, no crossing per pixel. The boundary is split exactly right: the
+-- service grants the buffer (`graphics`), the app fills it (`mem`). A pixel
+-- renderer's row reads `{graphics, mem}` — the cost model, visible.
+--
+-- A pixel is a 0xAARRGGBB word; little-endian that is native BGRA. Address of
+-- (x, y): base + (y*w + x)*4. The app pokes it:
+--   poke32 (base + ((y * w + x) * 4)) argb
+
+-- Open (or resize) a `w*h` ARGB canvas for `pane`; returns its base address.
+let canvas_open = fn pane: Int => fn w: Int => fn h: Int =>
+  igui_canvas_open pane w h
+in
+
+-- Present the canvas: hand the GUI the just-written buffer (one Blit, no pixel
+-- copy) and return the next back-buffer base address — double-buffered. An
+-- animated program threads the returned base into its next frame; a one-shot
+-- renderer can ignore it.
+let canvas_present = fn pane: Int =>
+  igui_canvas_present pane
+in
+
+-- Write one 0xAARRGGBB pixel at (x, y) into the canvas (base `base`, width `w`).
+-- The raw `poke` lives in the boundary module (`g_canvas_set`); re-exported here
+-- so the app reaches the framebuffer through the sealed Graphics surface. Still
+-- a direct write per pixel (no handler) — fast — and the row reads `{graphics,
+-- mem}`.
+let canvas_set = g_canvas_set in
+
+()

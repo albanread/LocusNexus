@@ -1,0 +1,384 @@
+-- Othello in a pane — the graphical showcase for the Locus IDE.
+--
+-- A port of NewCormanLisp's othello-gui.lisp (Norvig's PAIP ch.18 rules) to
+-- Locus's IDE-world Graphics/Event services. You play Black; the computer plays
+-- White with an alpha-beta search (move-ordered, with a weighted-squares +
+-- endgame disc-count evaluation). Small green dots mark your legal moves.
+--
+--   click a dot   place a black disc (your move); White replies
+--   n             new game
+--   b / i / a     White plays Beginner (1-ply) / Intermediate (3) / Advanced (4)
+--   Esc           quit
+--
+-- The live board is one flat mutable Array[Int] (r*8 + c), 0 = empty, 1 = black,
+-- 2 = white — mutated in place; the search runs on copies (array_make_int +
+-- array_copy_range_int). The loop variable packs the run flag, the pane size,
+-- and the difficulty into one Int.
+--
+-- Run it with F5 inside `locus-ide`. Effects: { graphics, event, gc, mem } —
+-- confined to draw-and-input. It cannot touch the filesystem or the network,
+-- and the IDE's effects pane shows exactly that.
+
+let empty = 0 in
+let black = 1 in
+let white = 2 in
+
+let idx = fn r: Int => fn c: Int => (r * 8) + c in
+let get = fn board: Array[Int] => fn r: Int => fn c: Int => board[idx r c] in
+let put = fn board: Array[Int] => fn r: Int => fn c: Int => fn piece: Int =>
+  board[idx r c] <- piece
+in
+let opponent = fn piece: Int => if piece == black then white else black in
+
+let onBoard = fn r: Int => fn c: Int =>
+  if r < 0 then false else if 7 < r then false
+  else if c < 0 then false else if 7 < c then false else true
+in
+
+let countLine =
+  fn board: Array[Int] => fn piece: Int =>
+  fn r: Int => fn c: Int => fn dr: Int => fn dc: Int =>
+    let opp = opponent piece in
+    loop rr = r + dr, cc = c + dc, seen = 0, out = 0
+      while if out == 0 then onBoard rr cc else false
+      do
+        (let here = get board rr cc in if here == opp then rr + dr else rr),
+        (let here = get board rr cc in if here == opp then cc + dc else cc),
+        (let here = get board rr cc in if here == opp then seen + 1 else seen),
+        (let here = get board rr cc in
+         if here == opp then 0
+         else if here == piece then (if seen == 0 then 0 - 1 else seen)
+         else 0 - 1)
+      else if out < 0 then 0 else out
+in
+
+let legalMove = fn board: Array[Int] => fn piece: Int => fn r: Int => fn c: Int =>
+  if get board r c == empty then
+    if 0 < countLine board piece r c (0 - 1) (0 - 1) then true
+    else if 0 < countLine board piece r c (0 - 1) 0 then true
+    else if 0 < countLine board piece r c (0 - 1) 1 then true
+    else if 0 < countLine board piece r c 0 (0 - 1) then true
+    else if 0 < countLine board piece r c 0 1 then true
+    else if 0 < countLine board piece r c 1 (0 - 1) then true
+    else if 0 < countLine board piece r c 1 0 then true
+    else if 0 < countLine board piece r c 1 1 then true
+    else false
+  else false
+in
+
+let flipLine =
+  fn board: Array[Int] => fn piece: Int =>
+  fn r: Int => fn c: Int => fn dr: Int => fn dc: Int =>
+    let n = countLine board piece r c dr dc in
+    loop i = 1 while i < n + 1 do
+      (let _ = put board (r + (dr * i)) (c + (dc * i)) piece in i + 1)
+    else ()
+in
+
+let applyMove = fn board: Array[Int] => fn piece: Int => fn r: Int => fn c: Int =>
+  if legalMove board piece r c then
+    do {
+      let _ = put board r c piece;
+      let _ = flipLine board piece r c (0 - 1) (0 - 1);
+      let _ = flipLine board piece r c (0 - 1) 0;
+      let _ = flipLine board piece r c (0 - 1) 1;
+      let _ = flipLine board piece r c 0 (0 - 1);
+      let _ = flipLine board piece r c 0 1;
+      let _ = flipLine board piece r c 1 (0 - 1);
+      let _ = flipLine board piece r c 1 0;
+      let _ = flipLine board piece r c 1 1;
+      true
+    }
+  else false
+in
+
+let hasAnyMove = fn board: Array[Int] => fn piece: Int =>
+  loop pos = 0, found = false
+    while if found then false else pos < 64
+    do
+      pos + 1,
+      (let r = pos / 8 in let c = pos - (r * 8) in
+       if legalMove board piece r c then true else false)
+    else found
+in
+
+let countPieces = fn board: Array[Int] => fn piece: Int =>
+  loop pos = 0, total = 0 while pos < 64 do
+    pos + 1, (if board[pos] == piece then total + 1 else total)
+  else total
+in
+
+-- ── evaluation: weighted squares, switching to disc count in the endgame ────
+let isCorner = fn r: Int => fn c: Int =>
+  if r == 0 then (if c == 0 then true else c == 7)
+  else if r == 7 then (if c == 0 then true else c == 7) else false
+in
+let isEdge = fn r: Int => fn c: Int =>
+  if r == 0 then true else if r == 7 then true
+  else if c == 0 then true else if c == 7 then true else false
+in
+let isXsquare = fn r: Int => fn c: Int =>
+  if r == 1 then (if c == 1 then true else if c == 6 then true else false)
+  else if r == 6 then (if c == 1 then true else if c == 6 then true else false)
+  else false
+in
+let isCsquare = fn r: Int => fn c: Int =>
+  if r == 0 then (if c == 1 then true else c == 6)
+  else if r == 7 then (if c == 1 then true else c == 6)
+  else if c == 0 then (if r == 1 then true else r == 6)
+  else if c == 7 then (if r == 1 then true else r == 6) else false
+in
+let sqWeight = fn r: Int => fn c: Int =>
+  if isCorner r c then 120
+  else if isXsquare r c then 0 - 40
+  else if isCsquare r c then 0 - 20
+  else if isEdge r c then 15 else 3
+in
+
+let evalFor = fn board: Array[Int] => fn piece: Int =>
+  let opp = opponent piece in
+  loop pos = 0, posScore = 0, discDiff = 0, empties = 0 while pos < 64 do
+    pos + 1,
+    (let r = pos / 8 in let c = pos - (r * 8) in
+     let v = board[pos] in
+     if v == piece then posScore + (sqWeight r c)
+     else if v == opp then posScore - (sqWeight r c) else posScore),
+    (let v = board[pos] in
+     if v == piece then discDiff + 1 else if v == opp then discDiff - 1 else discDiff),
+    (let v = board[pos] in if v == empty then empties + 1 else empties)
+  else
+    (if empties < 10 then discDiff * 100 else posScore + discDiff)
+in
+
+-- ── search: negamax with alpha-beta over board copies, move-ordered ─────────
+let copyBoard = fn board: Array[Int] =>
+  let b = array_make_int 64 0 in
+  let _ = array_copy_range_int board 0 b 0 64 in b
+in
+let applyOn = fn board: Array[Int] => fn piece: Int => fn r: Int => fn c: Int =>
+  let b = copyBoard board in let _ = applyMove b piece r c in b
+in
+
+-- Squares by descending static value (corners, edges, centre, then the C/X
+-- danger squares last). Searching strong squares first sharpens alpha-beta.
+let order = [
+   0,  7, 56, 63,
+   2,  3,  4,  5, 58, 59, 60, 61, 16, 24, 32, 40, 23, 31, 39, 47,
+  10, 11, 12, 13, 17, 18, 19, 20, 21, 22, 25, 26, 27, 28, 29, 30,
+  33, 34, 35, 36, 37, 38, 41, 42, 43, 44, 45, 46, 50, 51, 52, 53,
+   1,  6, 57, 62,  8, 48, 15, 55,  9, 14, 49, 54
+] in
+
+let rec negamax : Array[Int] -> Int -> Int -> Int -> Int -> Int ! {gc} =
+  fn board: Array[Int] => fn piece: Int => fn depth: Int => fn alpha: Int => fn beta: Int =>
+    if depth == 0 then evalFor board piece
+    else if hasAnyMove board piece then
+      loop pos = 0, best = 0 - 1000000
+        while if beta <= best then false else pos < 64
+        do
+          pos + 1,
+          (let sq = order[pos] in let r = sq / 8 in let c = sq - (r * 8) in
+           if legalMove board piece r c then
+             let a = if alpha < best then best else alpha in
+             let child = applyOn board piece r c in
+             let score = 0 - (negamax child (opponent piece) (depth - 1) (0 - beta) (0 - a)) in
+             if best < score then score else best
+           else best)
+        else best
+    else if hasAnyMove board (opponent piece) then
+      0 - (negamax board (opponent piece) (depth - 1) (0 - beta) (0 - alpha))
+    else evalFor board piece
+in
+
+-- Best square for `piece` to `depth`, or -1 to pass. One negamax call per move:
+-- the running (score, square) argmax is packed into `acc` (score offset +10000).
+let bestMove = fn board: Array[Int] => fn piece: Int => fn depth: Int =>
+  loop pos = 0, acc = 127 while pos < 64 do
+    pos + 1,
+    (let sq = order[pos] in let r = sq / 8 in let c = sq - (r * 8) in
+     if legalMove board piece r c then
+       let child = applyOn board piece r c in
+       let score = 0 - (negamax child (opponent piece) (depth - 1) (0 - 1000000) 1000000) in
+       let curScore = (acc / 128) - 10000 in
+       if curScore < score then (((score + 10000) * 128) + sq) else acc
+     else acc)
+  else (acc - ((acc / 128) * 128))
+in
+
+let applyBestMove = fn board: Array[Int] => fn piece: Int => fn depth: Int =>
+  if hasAnyMove board piece then
+    let move = bestMove board piece depth in
+    let r = move / 8 in let c = move - (r * 8) in
+    let _ = applyMove board piece r c in move
+  else 0 - 1
+in
+
+-- AI turn: White plays, and keeps playing while Black has no reply (Black
+-- passes), until Black can move again or neither side can (game over).
+let advanceAi = fn board: Array[Int] => fn depth: Int =>
+  loop go = 1 while go == 1 do
+    if hasAnyMove board white then
+      let _ = applyBestMove board white depth in
+      (if hasAnyMove board black then 0 else 1)
+    else 0
+  else ()
+in
+
+let resetBoard = fn board: Array[Int] =>
+  let _ =
+    loop i = 0 while i < 64 do (let _ = board[i] <- empty in i + 1) else i
+  in
+  let _ = put board 3 3 white in
+  let _ = put board 3 4 black in
+  let _ = put board 4 3 black in
+  let _ = put board 4 4 white in
+  ()
+in
+
+-- ── status line: score, AI level, prompt ────────────────────────────────────
+let digitText = fn n: Int =>
+  if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2"
+  else if n == 3 then "3" else if n == 4 then "4" else if n == 5 then "5"
+  else if n == 6 then "6" else if n == 7 then "7" else if n == 8 then "8" else "9"
+in
+let numText = fn n: Int =>
+  if n < 10 then digitText n
+  else string_concat (digitText (n / 10)) (digitText (n - ((n / 10) * 10)))
+in
+let depthName = fn d: Int =>
+  if d < 2 then "beginner" else if d < 4 then "intermediate" else "advanced"
+in
+let statusText = fn board: Array[Int] => fn depth: Int =>
+  let bs = countPieces board black in
+  let ws = countPieces board white in
+  let score =
+    string_concat (string_concat "Black " (numText bs))
+                  (string_concat "   White " (numText ws)) in
+  let ai = string_concat "   AI: " (depthName depth) in
+  if hasAnyMove board black then
+    string_concat (string_concat score ai) "    click a dot   (n new, b/i/a level, Esc)"
+  else if hasAnyMove board white then
+    string_concat (string_concat score ai) "    Black passes…"
+  else
+    string_concat (string_concat score ai) "    — game over —   (n = new)"
+in
+
+-- ── geometry: square board centred under a status strip, sized to the pane ──
+let cellOf = fn bw: Int => fn bh: Int =>
+  let aw = bw - 20 in
+  let ah = bh - 52 in
+  let avail = if aw < ah then aw else ah in
+  if avail < 64 then 8 else avail / 8
+in
+let originX = fn bw: Int => fn bh: Int =>
+  let cell = cellOf bw bh in (bw - (cell * 8)) / 2
+in
+let originTop = 40 in
+
+let pane = open_window "Othello" in
+let _ = set_redraw_rate pane 33 in
+
+let drawBoard = fn board: Array[Int] => fn bw: Int => fn bh: Int => fn depth: Int =>
+  let cell = cellOf bw bh in
+  let ox = originX bw bh in
+  let oy = originTop in
+  let _ = gfx_begin pane in
+  let _ = clear 0.07 0.08 0.11 1.0 in
+  let _ = draw_text pane 12.0 10.0 (statusText board depth) 0.85 0.88 0.95 1.0 in
+  let _ =
+    loop r = 0 while r < 8 do
+      let _ =
+        loop c = 0 while c < 8 do
+          let x0i = ox + (c * cell) in
+          let y0i = oy + (r * cell) in
+          let x0 = toFloat x0i in
+          let y0 = toFloat y0i in
+          let x1 = toFloat (x0i + cell) in
+          let y1 = toFloat (y0i + cell) in
+          let _ = fill_rect x0 y0 x1 y1 0.16 0.42 0.26 1.0 in
+          let _ = stroke_rect x0 y0 x1 y1 0.5 0.08 0.22 0.14 1.0 in
+          let v = get board r c in
+          let cx = toFloat (x0i + (cell / 2)) in
+          let cy = toFloat (y0i + (cell / 2)) in
+          let rad = toFloat ((cell * 2) / 5) in
+          let _ =
+            if v == black then fill_circle cx cy rad 0.06 0.06 0.09 1.0
+            else if v == white then fill_circle cx cy rad 0.95 0.95 0.90 1.0
+            else if legalMove board black r c then
+              fill_circle cx cy (toFloat (cell / 8)) 0.40 0.72 0.48 1.0
+            else ()
+          in
+          c + 1
+        else c
+      in
+      r + 1
+    else r
+  in
+  gfx_submit ()
+in
+
+-- Click → square; if a legal Black move, play it, show it at once, then reply.
+let handleClick = fn board: Array[Int] => fn px: Int => fn py: Int =>
+  fn bw: Int => fn bh: Int => fn depth: Int =>
+    let cell = cellOf bw bh in
+    let ox = originX bw bh in
+    let oy = originTop in
+    let span = cell * 8 in
+    let inside =
+      if px < ox then false
+      else if py < oy then false
+      else if px >= ox + span then false
+      else if py >= oy + span then false
+      else true
+    in
+    if inside then
+      let c = (px - ox) / cell in
+      let r = (py - oy) / cell in
+      (if legalMove board black r c then
+         let _ = applyMove board black r c in
+         let _ = drawBoard board bw bh depth in
+         advanceAi board depth
+       else ())
+    else ()
+in
+
+-- The board: the standard opening (White (3,3)/(4,4), Black (3,4)/(4,3)).
+let board = [
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 2, 1, 0, 0, 0,
+  0, 0, 0, 1, 2, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0, 0
+] in
+
+-- Event loop. One Int carries: bit0 = running, bits 1..12 = pane width,
+-- bits 13..24 = pane height, bits 25..27 = AI search depth.
+let pack = fn go: Int => fn w: Int => fn h: Int => fn d: Int =>
+  go | ((w & 0xFFF) << 1) | ((h & 0xFFF) << 13) | ((d & 7) << 25)
+in
+
+loop st = (pack 1 480 520 3) while (st & 1) == 1 do
+  let bw = (st >> 1) & 0xFFF in
+  let bh = (st >> 13) & 0xFFF in
+  let depth = (st >> 25) & 7 in
+  let _ = drawBoard board bw bh depth in
+  match poll_event 33 with
+  | MouseDown(px, py) => let _ = handleClick board px py bw bh depth in pack 1 bw bh depth
+  | Key(k) =>
+      if k == 27 then pack 0 bw bh depth
+      else if k == 78 then (let _ = resetBoard board in pack 1 bw bh depth)
+      else if k == 66 then pack 1 bw bh 1
+      else if k == 73 then pack 1 bw bh 3
+      else if k == 65 then pack 1 bw bh 4
+      else pack 1 bw bh depth
+  | Resize(nw, nh) => pack 1 nw nh depth
+  | Close => pack 0 bw bh depth
+  | _ => pack 1 bw bh depth
+else
+  -- The loop has ended (Esc, the window's close box, or game over): close the
+  -- pane so the user sees the action took effect, then return the final score.
+  let _ = close_window pane in
+  (countPieces board black) * 100 + (countPieces board white)

@@ -1,0 +1,63 @@
+module Event at services exposing
+  (Event, MouseDown, MouseUp, MouseMove, Key, Tick, Resize, Close, NoEvent,
+   next_event, poll_event, set_redraw_rate) =
+-- stdlib LAYER 1: the controlled EVENT service over the hidden IDE-world
+-- boundary (`IdeEvent`). Mirrors `Console` over `Winapi`: the boundary MINTS
+-- `event`; this layer SEALS it behind a decoded sum. An app that imports Event
+-- carries `event` in its row — provably confined to input/animation, never the
+-- raw `iGui.*` mint.
+--
+-- The event loop shape an IDE-pane app uses:
+--   loop ... while running do
+--     let e = next_event () in
+--     match e with | MouseDown(x, y) => ... | Tick => ... | Close => ... | _ => ...
+
+-- The decoded input/lifecycle event. `None` would clash with Option, so the
+-- empty case is `NoEvent`.
+type Event =
+    MouseDown(Int, Int)
+  | MouseUp(Int, Int)
+  | MouseMove(Int, Int)
+  | Key(Int)
+  | Tick
+  | Resize(Int, Int)
+  | Close
+  | NoEvent
+in
+
+-- Rebuild the sum from the boundary's packed word (see IdeEvent.ev_poll_packed):
+--   kind = low byte; a = bits 8..31; b = bits 32..55.
+let decode_event = fn packed: Int =>
+  let kind = packed & 0xFF in
+  let a = (packed >> 8) & 0xFFFFFF in
+  let b = (packed >> 32) & 0xFFFFFF in
+  if kind == 0 then NoEvent
+  else if kind == 100 then MouseDown(a, b)
+  else if kind == 101 then MouseUp(a, b)
+  else if kind == 102 then MouseMove(a, b)
+  else if kind == 1 then Key(a)
+  else if kind == 13 then Tick
+  else if kind == 5 then Resize(a, b)
+  else if kind == 7 then Close
+  else if kind == 8 then Close
+  else NoEvent
+in
+
+-- Block until the next event (no timeout) and return it decoded.
+let next_event = fn u: Unit =>
+  decode_event (ev_poll_packed (0 - 1))
+in
+
+-- Poll with a timeout in milliseconds; returns NoEvent if none arrived.
+let poll_event = fn timeout_ms: Int =>
+  decode_event (ev_poll_packed timeout_ms)
+in
+
+-- Schedule a Tick for `pane` every `interval_ms` (<= 0 disables). Drives the
+-- animation loop. Returns Unit.
+let set_redraw_rate = fn pane: Int => fn interval_ms: Int =>
+  let _ = igui_set_redraw_rate pane interval_ms in
+  ()
+in
+
+()

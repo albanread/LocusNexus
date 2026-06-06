@@ -1,0 +1,35 @@
+[package]
+name = "locus-ide"
+version = "0.1.0"
+edition = "2021"
+description = "The Locus IDE — a Windows-native Direct2D/DirectWrite MDI shell over the frozen Locus engine. Phase 0: the igui shell stands up with a stubbed LocusSession (the JIT eval seam lands in Phase 1)."
+
+[lib]
+name = "locus_ide"
+path = "src/lib.rs"
+
+[[bin]]
+name = "locus-ide"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+locus-igui = { path = "../locus-igui" }
+# The frozen engine: the core checker (`program`/`elaborate`/`stage_reduce`/
+# `lower`/`Report`) and the LLVM/ORC JIT backend (`winapi_resolve::resolve`,
+# `jit_run_i64`). `locus-llvm`'s default `windows-driver` feature is the same
+# JIT surface `locusc` (its `run`/`effects` verbs) builds against; inkwell /
+# llvm-sys enter transitively, only here. Phase 1 wires `LocusSession::eval`
+# and the editor checker onto these — host-side, the engine stays untouched.
+locus = { path = "../locus" }
+locus-llvm = { path = "../locus-llvm" }
+# Direct dep only to install the console-line sink (`set_console_sink`): the
+# integrator points `perform console`'s runtime output at the igui console pane.
+# locus-llvm already pulls locus-rt in transitively for its runtime symbols.
+locus-rt = { path = "../locus-rt" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+]

@@ -1,0 +1,69 @@
+-- Loop vs. recursion, head to head: the SAME computation done both ways.
+--
+-- Locus carries loop state two equally-good ways — a multi-variable loop, or
+-- tail recursion (a self-tail-call lowers to the same jump). This sums the
+-- first N terms of the Leibniz series for pi with each, times both, and shows
+-- they give the identical result at the same speed. Pure float math — a good
+-- subject for Locus -> Show ANF IR / LLVM IR / Assembly.
+
+let n = 4000000 in
+let pane = open_window "Loop vs Recursion" in
+
+-- The k-th Leibniz term (-1)^k / (2k+1), as a Float.
+let term = fn k: Int =>
+  let mag = 1.0 / toFloat (2 * k + 1) in
+  if (k / 2) * 2 == k then mag else 0.0 - mag
+in
+
+-- Sum with a MULTI-VARIABLE LOOP whose single step is the tuple (k, acc).
+let pi_loop = fn u: Unit =>
+  loop k = 0, acc = 0.0 while k < n do
+    (k + 1, acc + term k)
+  else acc * 4.0
+in
+
+-- Sum with TAIL RECURSION.
+let rec pi_rec : Int -> Float -> Float =
+  fn k: Int => fn acc: Float =>
+    if k >= n then acc * 4.0
+    else pi_rec (k + 1) (acc + term k)
+in
+
+let t0 = clock_ticks () in
+let a = pi_loop () in
+let loop_us = ticks_to_micros (elapsed_ticks t0) in
+
+let t1 = clock_ticks () in
+let b = pi_rec 0 0.0 in
+let rec_us = ticks_to_micros (elapsed_ticks t1) in
+
+let _ = console_write "loop       pi = " in
+let _ = console_write_float a in
+let _ = console_write "   in " in
+let _ = console_write_float (toFloat loop_us) in
+let _ = console_writeln " us" in
+let _ = console_write "recursion  pi = " in
+let _ = console_write_float b in
+let _ = console_write "   in " in
+let _ = console_write_float (toFloat rec_us) in
+let _ = console_writeln " us" in
+
+let mx = if loop_us > rec_us then loop_us else rec_us in
+let scale = if mx <= 0 then 1.0 else 360.0 / toFloat mx in
+let bar = fn y: Float => fn us: Int => fn r: Float => fn g: Float => fn bl: Float =>
+  let wpx = toFloat us * scale in
+  fill_rect 96.0 y (96.0 + wpx) (y + 22.0) r g bl 1.0
+in
+
+let _ = gfx_begin pane in
+let _ = clear 0.10 0.11 0.14 1.0 in
+let _ = draw_text pane 10.0 12.0 "loop" 0.85 0.90 0.97 1.0 in
+let _ = bar 10.0 loop_us 0.30 0.65 0.95 in
+let _ = draw_text pane 10.0 46.0 "recursion" 0.85 0.90 0.97 1.0 in
+let _ = bar 44.0 rec_us 0.95 0.65 0.30 in
+let _ = gfx_submit () in
+
+let rec idle : Unit -> Int ! {event, gc, mem} =
+  fn u: Unit => match poll_event 100 with | Close => 0 | _ => idle ()
+in
+idle ()

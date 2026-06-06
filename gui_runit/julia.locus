@@ -1,0 +1,62 @@
+-- Julia set, rendered into an IDE pane, then timed.
+--
+-- The escape-time iteration is TAIL RECURSION — the other equally good way to
+-- carry loop state in Locus (Mandelbrot uses a multi-variable loop). The window
+-- is opened at the exact pixel size we draw into; each cell is `scale` px.
+
+let gw = 200 in
+let gh = 150 in
+let scale = 2 in
+let maxit = 60 in
+let cre = 0.0 - 0.8 in
+let cim = 0.156 in
+let pane = open_window_sized "Julia" (gw * scale) (gh * scale) in
+
+-- Escape as an inline `loop` (a register phi: zx/zy stay in xmm, zero
+-- heap, pure SSE). A curried *recursive* escape would allocate a closure
+-- per step — same result, ~100x slower. See mandelbrot_canvas for the
+-- same form on the fast canvas.
+let escape = fn zx0: Float => fn zy0: Float =>
+  loop zx = zx0, zy = zy0, i = 0
+    while if i < maxit then (zx * zx + zy * zy) <= 4.0 else false
+  do (zx * zx - zy * zy + cre, 2.0 * zx * zy + cim, i + 1)
+  else i
+in
+
+let plot = fn px: Int => fn py: Int => fn it: Int =>
+  let t = toFloat it / toFloat maxit in
+  let x0 = toFloat (px * scale) in
+  let y0 = toFloat (py * scale) in
+  fill_rect x0 y0 (x0 + toFloat scale) (y0 + toFloat scale) (1.0 - t) t (4.0 * t * (1.0 - t)) 1.0
+in
+
+let render = fn u: Unit =>
+  let _ = gfx_begin pane in
+  let _ = clear 0.0 0.0 0.0 1.0 in
+  let _ =
+    loop py = 0 while py < gh do
+      let _ =
+        loop px = 0 while px < gw do
+          let zx = (toFloat px / toFloat gw) * 3.2 - 1.6 in
+          let zy = (toFloat py / toFloat gh) * 2.4 - 1.2 in
+          let _ = plot px py (escape zx zy) in
+          px + 1
+        else px
+      in
+      py + 1
+    else py
+  in
+  gfx_submit ()
+in
+
+let start = clock_ticks () in
+let _ = render () in
+let ms = elapsed_millis start in
+let _ = console_write "Julia rendered in " in
+let _ = console_write_float (toFloat ms) in
+let _ = console_writeln " ms" in
+
+let rec idle : Unit -> Int ! {event, gc, mem} =
+  fn u: Unit => match poll_event 100 with | Close => 0 | _ => idle ()
+in
+idle ()

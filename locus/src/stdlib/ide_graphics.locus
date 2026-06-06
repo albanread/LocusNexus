@@ -69,12 +69,20 @@ let igui_emit_draw_text_run =
 
 -- The allocator for the marshalling scratch buffers. Declared here (not shared
 -- with winapi) so Graphics is self-contained: VirtualAlloc(MEM_COMMIT|RESERVE,
--- PAGE_READWRITE). Leaks per call — fine for a per-frame title/text; the JIT run
--- is ephemeral.
+-- PAGE_READWRITE). Each marshalled buffer is short-lived — the shim's
+-- `read_cp_shortstr` copies it *during* the emit call — so callers free it with
+-- `g_free` right after, rather than leaking a page per draw/window.
 let igui_VirtualAlloc = extern "VirtualAlloc" : Int -> Int -> U32 -> U32 -> Int in
+let igui_VirtualFree = extern "VirtualFree" : Int -> Int -> U32 -> I32 in
 
 let g_alloc = fn bytes: Int =>
   igui_VirtualAlloc 0 bytes 0x3000 0x04
+in
+
+-- Release a buffer from `g_alloc` (VirtualFree with dwSize 0 = MEM_RELEASE).
+let g_free = fn p: Int =>
+  let _ = igui_VirtualFree p 0 0x8000 in
+  ()
 in
 
 -- Count the UTF-8 byte length of a managed String (BMP + surrogate pairs).
@@ -194,7 +202,10 @@ let g_open_child = fn title: String => fn w: Int => fn h: Int =>
   let _ = poke64 out 0 in
   let tbuf = g_utf8z title in
   let ok = igui_open_child tbuf (g_utf8_len title) out w h in
-  if ok == 0 then 0 else peek64 out
+  let r = if ok == 0 then 0 else peek64 out in
+  let _ = g_free tbuf in
+  let _ = g_free out in
+  r
 in
 
 -- Draw `text` at (x, y) in the active batch, in the given colour, at a default
@@ -204,11 +215,14 @@ let g_draw_text =
   fn child: Int => fn x: Float => fn y: Float => fn s: String =>
   fn r: Float => fn g: Float => fn b: Float => fn a: Float =>
     let tbuf = g_utf8z s in
-    igui_emit_draw_text_run
-      tbuf (g_utf8_len s) x y 16.0
-      0 0 400 0 5
-      0 0 (0.0 - 1.0) 0 0
-      r g b a
+    let _ =
+      igui_emit_draw_text_run
+        tbuf (g_utf8_len s) x y 16.0
+        0 0 400 0 5
+        0 0 (0.0 - 1.0) 0 0
+        r g b a
+    in
+    g_free tbuf
 in
 
 ()

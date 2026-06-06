@@ -27,8 +27,20 @@ let win_CloseHandle = extern "CloseHandle" : Ptr -> I32 in
 let win_GetFileSizeEx = extern "GetFileSizeEx" : Ptr -> Ptr -> I32 in
 let win_GetFileAttributesW = extern "GetFileAttributesW" : Ptr -> U32 in
 
+let win_VirtualFree = extern "VirtualFree" : Int -> Int -> U32 -> I32 in
+
 let win_alloc = fn bytes: Int =>
   win_VirtualAlloc 0 bytes 0x3000 0x04
+in
+
+-- Release a `win_alloc` buffer (VirtualFree, dwSize 0 = MEM_RELEASE). The
+-- console I/O helpers free their transient marshalling buffers right after the
+-- WriteFile/ReadConsole call rather than leaking a page per line — these run
+-- on every `print`, the hottest FFI path. (Buffers that are *returned* to a
+-- caller, e.g. `win_console_info`, are the caller's to release.)
+let win_free = fn p: Int =>
+  let _ = win_VirtualFree p 0 0x8000 in
+  ()
 in
 
 let win_utf16z = fn s: String =>
@@ -204,6 +216,8 @@ let win_write_file_string = fn out: Int => fn s: String =>
   in
   let written = win_alloc 8 in
   let _ = win_WriteFile out buf bytes written 0 in
+  let _ = win_free buf in
+  let _ = win_free written in
   ()
 in
 
@@ -227,6 +241,8 @@ let win_write_file_unit = fn out: Int => fn ch: Int =>
   in
   let written = win_alloc 8 in
   let _ = win_WriteFile out buf bytes written 0 in
+  let _ = win_free buf in
+  let _ = win_free written in
   ()
 in
 
@@ -237,6 +253,8 @@ let win_write_console = fn s: String =>
   let out = win_GetStdHandle (0 - 11) in
   let ok = win_WriteConsoleW out buf n written 0 in
   let _ = if ok == 0 then win_write_file_string out s else () in
+  let _ = win_free buf in
+  let _ = win_free written in
   ()
 in
 
@@ -248,6 +266,8 @@ let win_write_unit = fn ch: Int =>
   let _ = poke16 (buf + 2) 0 in
   let ok = win_WriteConsoleW out buf 1 written 0 in
   let _ = if ok == 0 then win_write_file_unit out ch else () in
+  let _ = win_free buf in
+  let _ = win_free written in
   ()
 in
 
@@ -256,7 +276,10 @@ let win_read_unit = fn u: Unit =>
   let read = win_alloc 8 in
   let inp = win_GetStdHandle (0 - 10) in
   let _ = win_ReadConsoleW inp buf 1 read 0 in
-  peek16 buf
+  let v = peek16 buf in
+  let _ = win_free buf in
+  let _ = win_free read in
+  v
 in
 
 let win_read_line = fn u: Unit =>
@@ -277,7 +300,10 @@ let win_read_line = fn u: Unit =>
     else
       0
   in
-  locus_string_from_utf16 buf units
+  let r = locus_string_from_utf16 buf units in
+  let _ = win_free buf in
+  let _ = win_free read in
+  r
 in
 
 let win_coord = fn x: Int => fn y: Int =>

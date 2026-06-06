@@ -27,6 +27,15 @@ let ev_alloc = fn bytes: Int =>
   ev_VirtualAlloc 0 bytes 0x3000 0x04
 in
 
+-- ONE reusable scratch block for the seven out-slots, allocated once when the
+-- module's binding chain runs (not per poll). `ev_poll_packed` is on the hot
+-- path — the event loop calls it every frame — so a fresh `VirtualAlloc` per
+-- slot per poll would leak ~7 pages/poll for the life of the process. The
+-- out-params are write-only scratch overwritten each call by the single polling
+-- thread, so one shared 64-byte block (8 slots, 8 B each) is correct and never
+-- needs freeing.
+let ev_scratch = ev_alloc 64 in
+
 -- Poll once with `timeout_ms` (< 0 blocks). Returns a packed Int describing the
 -- event so the service layer can build the sum without crossing the boundary
 -- again. Encoding (kept inside the boundary; the service decodes it):
@@ -36,13 +45,13 @@ in
 -- and a=x, b=y; for KEY a=vkey; for RESIZE a=width, b=height; TICK/CLOSE a=b=0.
 -- On timeout (no event) returns 0 (NONE kind).
 let ev_poll_packed = fn timeout_ms: Int =>
-  let k    = ev_alloc 8 in
-  let ch   = ev_alloc 8 in
-  let tm   = ev_alloc 8 in
-  let p1   = ev_alloc 8 in
-  let p2   = ev_alloc 8 in
-  let p3   = ev_alloc 8 in
-  let p4   = ev_alloc 8 in
+  let k    = ev_scratch in
+  let ch   = ev_scratch + 8 in
+  let tm   = ev_scratch + 16 in
+  let p1   = ev_scratch + 24 in
+  let p2   = ev_scratch + 32 in
+  let p3   = ev_scratch + 40 in
+  let p4   = ev_scratch + 48 in
   let got  = igui_next_event k ch tm p1 p2 p3 p4 timeout_ms in
   if got == 0 then
     0

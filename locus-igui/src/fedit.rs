@@ -1838,6 +1838,14 @@ impl FeditState {
     /// `run_buffer` this does not execute the program — the host
     /// elaborates it and renders an effect/capability report.
     fn analyze_buffer(&self) {
+        // As in `lowering_buffer`: analyzing a result/output pane (a synthetic
+        // `title_override`) is meaningless — only analyze a real source pane.
+        if self.title_override.is_some() {
+            super::log_view::append(
+                "[fedit] Analyze applies to a Locus source pane — focus the program's editor",
+            );
+            return;
+        }
         let (src, scope) = {
             let sel = self.selected_text();
             if sel.is_empty() {
@@ -1860,6 +1868,19 @@ impl FeditState {
     /// 0=ANF, 1=LLVM, 2=asm). Like `analyze_buffer`, but the worker renders the
     /// lowering dump rather than the effect report.
     fn lowering_buffer(&self, kind: i64) {
+        // Only lower a real Locus SOURCE pane. The ANF/LLVM/Assembly result
+        // panes are themselves editable fedit panes (`load_text` → a synthetic
+        // `title_override`), so if one is focused, "Show Assembly" would try to
+        // lower the *dump's* text (a ~1000-line ANF listing, not a program) and
+        // fail to parse. Guard on the synthetic title: an output view never
+        // re-lowers itself; focus the program's editor instead.
+        if self.title_override.is_some() {
+            super::log_view::append(
+                "[fedit] Show ANF/LLVM/Assembly applies to a Locus source pane, \
+                 not a lowering view — focus the program's editor",
+            );
+            return;
+        }
         let src = {
             let sel = self.selected_text();
             if sel.is_empty() {

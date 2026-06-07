@@ -923,6 +923,40 @@ mod tests {
     // GUI shell itself is not unit-testable, but the pipeline wiring is.
 
     #[test]
+    fn compiler_views_run_back_to_back() {
+        // The bug: running one compiler-explorer view (ANF/ASM/LLVM) breaks the
+        // next — a process-global consumed on first use. Reproduce by running
+        // several in sequence and asserting EACH lowers.
+        // (The reported "ANF breaks ASM" was a UI bug — the result pane re-
+        // lowering its own dump, fixed in fedit. The pipeline itself is fine:
+        // run several views back-to-back, after a JIT eval, and assert each.)
+        let mut s = LocusSession::new();
+        let _ = s.eval("let x = 40 in x + 2");
+        let src = "let p = open_window \"t\" in \
+                   let _ = gfx_begin p in \
+                   let _ = fill_rect 1.0 1.0 9.0 9.0 0.2 0.4 0.7 1.0 in \
+                   let _ = gfx_submit () in 0";
+        for (i, view) in [
+            CompilerView::Anf,
+            CompilerView::Asm,
+            CompilerView::Anf,
+            CompilerView::Llvm,
+            CompilerView::Asm,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let v = compiler_view(src, view);
+            assert!(
+                v.diagnostics.is_empty(),
+                "view #{i} ({}) did not lower: {:?}",
+                view.title(),
+                v.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn eval_pure_expression_returns_value_with_empty_effects() {
         let mut s = LocusSession::new();
         let out = s.eval("let x = 40 in x + 2");

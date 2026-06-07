@@ -46,6 +46,8 @@ USAGE:
 
 OPTIONS:
   --trace-stack-usage            print compiler tree-depth / spine metrics to stderr
+  --brk-enable                   allow the `brk` debug-crash expression (off by
+                                 default; a `brk` traps to exercise a crash handler)
 
 `run`'s exit code is the program's i64 result; effects print as they execute.
 `asm` writes to stdout unless `-o` is given — the same code the .exe contains.
@@ -64,7 +66,15 @@ mints in `boundary` modules (baked in) and authorizes user ones via `locus.toml
 ";
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--brk-enable` is a global gate (it changes what the parser accepts), so
+    // handle it here for every subcommand and strip it before dispatch — the
+    // per-command flag parsers never see it. Off by default: without it, a
+    // program's `brk` is a parse error, so a deliberate crash can't ship.
+    if let Some(i) = args.iter().position(|a| a == "--brk-enable") {
+        args.remove(i);
+        locus::set_brk_enabled(true);
+    }
     let code = std::thread::Builder::new()
         .name("locusc-main".into())
         .stack_size(locus::PIPELINE_STACK_BYTES)

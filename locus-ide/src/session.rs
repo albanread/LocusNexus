@@ -562,7 +562,7 @@ fn walk<'a>(t: &'a locus::Typed, f: &mut impl FnMut(&'a locus::Typed)) {
     f(t);
     match &t.node {
         Node::Var(_) | Node::Int(_) | Node::Float(_) | Node::Bool(_) | Node::Unit
-        | Node::Str(_) | Node::Extern(..) => {}
+        | Node::Brk | Node::Str(_) | Node::Extern(..) => {}
         Node::Bin(_, a, b) => {
             walk(a, f);
             walk(b, f);

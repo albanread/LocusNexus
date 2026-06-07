@@ -1940,6 +1940,19 @@ impl Parser {
                     // Native names (console, fs, …) canonicalise to `World`.
                     Ok(Term::Perform(crate::prelude::op_label(&op), Box::new(arg)))
                 }
+                // `brk` — a deliberate debug crash. Gated: it only parses when
+                // the host enabled it (`locusc --brk-enable`, or the IDE), so a
+                // crash can never ship in an ordinary build by accident.
+                "brk" => {
+                    if !crate::brk_enabled() {
+                        return Err(self.err(
+                            "`brk` is a debug-only crash expression; pass `--brk-enable` to use it"
+                                .to_string(),
+                        ));
+                    }
+                    self.bump();
+                    Ok(Term::Brk)
+                }
                 "quote" => {
                     self.bump();
                     self.eat(&Tok::LParen)?;
@@ -2484,6 +2497,19 @@ mod tests {
         assert_eq!(parse("1.0e-3").unwrap(), Term::Float(1.0e-3f64.to_bits()));
         assert_eq!(parse("true").unwrap(), Term::Bool(true));
         assert_eq!(parse("()").unwrap(), Term::Unit);
+    }
+
+    #[test]
+    fn brk_is_gated_by_brk_enable() {
+        // `brk` is the only construct in the language touching the global
+        // brk-enable flag, and no other program uses the identifier `brk`, so
+        // toggling it here is race-safe. Off (the default): rejected.
+        crate::set_brk_enabled(false);
+        assert!(parse("brk").is_err(), "`brk` must be rejected when disabled");
+        // On: parses to the debug-crash leaf.
+        crate::set_brk_enabled(true);
+        assert_eq!(parse("brk").unwrap(), Term::Brk);
+        crate::set_brk_enabled(false); // restore the secure default
     }
 
     #[test]

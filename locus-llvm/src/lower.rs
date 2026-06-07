@@ -348,6 +348,7 @@ fn comp_preserves_raw_heap_ptrs(comp: &Comp) -> bool {
     match comp {
         Comp::Atom(Atom::Str(_)) => false,
         Comp::Atom(_)
+        | Comp::Brk
         | Comp::Extern(_, _)
         | Comp::Bin(_, _, _)
         | Comp::FloatBin(_, _, _)
@@ -972,6 +973,7 @@ impl<'ctx> Cg<'ctx, '_> {
     fn lower_comp(&mut self, comp: &Comp) -> Result<BasicValueEnum<'ctx>, String> {
         match comp {
             Comp::Atom(a) => self.lower_atom(a),
+            Comp::Brk => self.lower_brk(),
             Comp::Bin(op, lhs, rhs) => self.lower_bin(*op, lhs, rhs),
             Comp::FloatBin(op, lhs, rhs) => self.lower_float_bin(*op, lhs, rhs),
             Comp::Cast(op, a) => self.lower_cast(*op, a),
@@ -3019,6 +3021,32 @@ impl<'ctx> Cg<'ctx, '_> {
         };
         let value = self.lower_block(ir)?;
         self.return_with_frame(frame, value)
+    }
+
+    /// `brk` — a deliberate debug crash. Emits `llvm.trap` (an illegal-
+    /// instruction fault → the host's crash handler / crash view), marks the
+    /// block unreachable, then opens a fresh dead block so any (never-executed)
+    /// continuation still has a valid insert point. The value is `undef` — the
+    /// trap diverges, so it is never observed.
+    fn lower_brk(&mut self) -> Result<BasicValueEnum<'ctx>, String> {
+        let func = self
+            .builder
+            .get_insert_block()
+            .and_then(|b| b.get_parent())
+            .ok_or_else(|| "codegen: no enclosing function for `brk`".to_string())?;
+        let trap = self.module.get_function("llvm.trap").unwrap_or_else(|| {
+            self.module
+                .add_function("llvm.trap", self.ctx.void_type().fn_type(&[], false), None)
+        });
+        self.builder
+            .build_call(trap, &[], "brk")
+            .map_err(|e| e.to_string())?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| e.to_string())?;
+        let dead = self.ctx.append_basic_block(func, "brk.dead");
+        self.builder.position_at_end(dead);
+        Ok(self.ctx.i64_type().get_undef().into())
     }
 
     fn trap_if(&mut self, cond: IntValue<'ctx>, label: &str) -> Result<(), String> {
@@ -5602,6 +5630,7 @@ fn fv_ir(ir: &Ir, bound: &mut Vec<String>, free: &mut HashSet<String>) {
 fn fv_comp(comp: &Comp, bound: &mut Vec<String>, free: &mut HashSet<String>) {
     match comp {
         Comp::Atom(a) => fv_atom(a, bound, free),
+        Comp::Brk => {}
         Comp::Extern(_, _) => {}
         Comp::Foreign(_, args, _) => {
             for a in args {

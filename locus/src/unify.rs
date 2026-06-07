@@ -894,6 +894,7 @@ pub fn zonk(store: &UnifStore, t: &crate::sema::Typed) -> crate::sema::Typed {
         Node::Float(bits) => Node::Float(*bits),
         Node::Bool(b) => Node::Bool(*b),
         Node::Unit => Node::Unit,
+        Node::Brk => Node::Brk,
         Node::Str(s) => Node::Str(s.clone()),
         Node::Extern(s, abi) => Node::Extern(s.clone(), abi.clone()),
 

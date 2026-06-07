@@ -37,6 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     igui::crash_handler::install();
 
+    // The IDE is a development environment, so enable the `brk` debug-crash
+    // expression here (the CLI keeps it behind `--brk-enable`). Drop a `brk`
+    // into a program and run it to exercise the crash view above on demand.
+    locus::set_brk_enabled(true);
+
     // The VEH above catches hardware SEH (access violations, etc.). A *Rust
     // panic* — an unwrap / poisoned-lock / `expect` on the worker thread —
     // unwinds silently instead: the worker dies, `eval` never returns, and the

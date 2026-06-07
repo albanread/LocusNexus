@@ -221,6 +221,7 @@ impl Staging {
             | Node::Float(_)
             | Node::Bool(_)
             | Node::Unit
+            | Node::Brk
             | Node::Str(_)
             | Node::Extern(..) => t.clone(),
 

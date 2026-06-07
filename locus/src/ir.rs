@@ -50,6 +50,8 @@ pub struct LoopVar {
 pub enum Comp {
     /// Return a trivial value.
     Atom(Atom),
+    /// `brk` — a debug crash. Lowers to a trap (`llvm.trap`); diverges.
+    Brk,
     /// `f a` — both already atoms, with the source-level argument/result types
     /// retained so codegen can choose a typed ABI for unboxed values.
     App {
@@ -635,6 +637,7 @@ impl Lower {
             Node::Float(bits) => Comp::Atom(Atom::Float(*bits)),
             Node::Bool(b) => Comp::Atom(Atom::Bool(*b)),
             Node::Unit => Comp::Atom(Atom::Unit),
+            Node::Brk => Comp::Brk,
             Node::Str(s) => Comp::Atom(Atom::Str(s.clone())),
             // Representation coercion at a `Var` boundary (T3 lowering, gated by
             // T0). `Tag` shifts a concrete scalar into a uniform word (`value<<2`,
@@ -1545,6 +1548,7 @@ fn write_comp(s: &mut String, prefix: &str, row: &Row, comp: &Comp, depth: usize
     let mut line = |body: String| s.push_str(&format!("{pad}{prefix}{body}{tag}\n"));
     match comp {
         Comp::Atom(a) => line(atom_str(a)),
+        Comp::Brk => line("brk".to_string()),
         Comp::App { fun, arg, .. } => line(format!("{} {}", atom_str(fun), atom_str(arg))),
         Comp::Call { fun, args, .. } => {
             let arglist = args

@@ -259,7 +259,7 @@ pub fn first_mint(t: &Term) -> Option<String> {
         Poke(..) => Some("a raw memory write (`poke`)".into()),
         Fill(..) => Some("a raw memory fill (`fill`)".into()),
         Copy(..) => Some("a raw memory copy (`copy`)".into()),
-        Var(_) | Int(_) | Float(_) | Bool(_) | Unit | Str(_) => None,
+        Var(_) | Int(_) | Float(_) | Bool(_) | Unit | Brk | Str(_) => None,
         Lam(_, _, a)
         | Perform(_, a)
         | Quote(a)

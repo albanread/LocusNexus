@@ -93,6 +93,9 @@ pub enum Node {
     Float(u64),
     Bool(bool),
     Unit,
+    /// `brk` — the debug-crash leaf (see [`Term::Brk`]). A diverging leaf with
+    /// no children; lowers to a trap.
+    Brk,
     Str(String),
     /// `extern "symbol" : T` — a foreign function reference. The declared
     /// widths are erased to `Int` for the value world; the native [`ExternAbi`]
@@ -440,6 +443,7 @@ impl Typed {
             | Node::Float(_)
             | Node::Bool(_)
             | Node::Unit
+            | Node::Brk
             | Node::Str(_)
             | Node::Extern(..) => false,
             Node::Bin(_, a, b)
@@ -2825,6 +2829,7 @@ fn map_children(node: &Node, f: &dyn Fn(&Typed) -> Typed) -> Node {
         | Node::Float(_)
         | Node::Bool(_)
         | Node::Unit
+        | Node::Brk
         | Node::Str(_)
         | Node::Extern(..) => node.clone(),
         Node::Bin(op, a, c) => Node::Bin(*op, b(a), b(c)),
@@ -3692,6 +3697,7 @@ fn captured_in_closure(name: &str, node: &Node) -> bool {
         | Node::Float(_)
         | Node::Bool(_)
         | Node::Unit
+        | Node::Brk
         | Node::Str(_)
         | Node::Extern(..) => false,
 
@@ -3846,6 +3852,7 @@ fn occurs_free(name: &str, node: &Node) -> bool {
         | Node::Float(_)
         | Node::Bool(_)
         | Node::Unit
+        | Node::Brk
         | Node::Str(_)
         | Node::Extern(..) => false,
 
@@ -4353,6 +4360,16 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
         )),
         Term::Bool(b) => Ok(Typed::at(Type::Bool, Row::pure(), stage, Node::Bool(*b))),
         Term::Unit => Ok(Typed::at(Type::Unit, Row::pure(), stage, Node::Unit)),
+        // `brk` diverges, so it inhabits any expected type — a fresh variable
+        // that unifies with the context (like a bottom). Pure row: it never
+        // returns, so there is no observable effect to attribute. Parsing
+        // already gated it behind `--brk-enable`; reaching here means it's on.
+        Term::Brk => Ok(Typed::at(
+            unify::with_store(|s| s.fresh_ty()),
+            Row::pure(),
+            stage,
+            Node::Brk,
+        )),
         Term::Str(s) => Ok(Typed::at(
             Type::Str,
             Row::single(Label::Gc),
@@ -6574,6 +6591,7 @@ impl Typed {
             Node::Float(bits) => format!("float {}", f64::from_bits(*bits)),
             Node::Bool(b) => format!("bool {b}"),
             Node::Unit => "unit".into(),
+            Node::Brk => "brk".into(),
             Node::Str(s) => format!("str {s:?}"),
             Node::Extern(sym, _) => format!("extern {sym:?}"),
             Node::Bin(op, ..) => format!("bin {}", op.symbol()),
@@ -6650,6 +6668,7 @@ impl Typed {
             Node::Float(_) => "float",
             Node::Bool(_) => "bool",
             Node::Unit => "unit",
+            Node::Brk => "brk",
             Node::Str(_) => "str",
             Node::Extern(..) => "extern",
             Node::Bin(..) => "bin",
@@ -6726,6 +6745,7 @@ impl Typed {
             | Node::Float(_)
             | Node::Bool(_)
             | Node::Unit
+            | Node::Brk
             | Node::Str(_)
             | Node::Extern(..) => {}
             Node::Coerce { inner: child, .. } => child.write_text(s, inner),
@@ -7061,6 +7081,7 @@ impl Typed {
                 );
             }
             Node::Unit => {}
+            Node::Brk => {}
             Node::Lam {
                 param,
                 param_ty,

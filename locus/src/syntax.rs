@@ -826,6 +826,11 @@ pub enum Term {
     Float(u64),
     Bool(bool),
     Unit,
+    /// `brk` — a **debug-crash** expression: lowers to a trap (`llvm.trap` → an
+    /// illegal-instruction fault) so a deliberate crash can be inserted to
+    /// exercise the host crash handler. Diverges, so it types at any expected
+    /// type (a fresh variable). Gated: only parses under `--brk-enable`.
+    Brk,
     /// A string literal `"…"`.
     Str(String),
     /// `a op b` - a primitive binary op ([`BinOp`]).

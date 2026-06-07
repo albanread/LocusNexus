@@ -191,6 +191,7 @@ fn walk_comp(c: &Comp, ev: &[Ev], sites: &mut Vec<Site>) {
         // perform site. (An extern's `winapi` effect is latent on its type,
         // surfaced by the *row*, not as a perform — see the type, not here.)
         Comp::Atom(_)
+        | Comp::Brk
         | Comp::App { .. }
         | Comp::Call { .. }
         | Comp::Bin(_, _, _)
@@ -363,6 +364,7 @@ pub(crate) fn count_var_comp(name: &str, c: &Comp) -> usize {
     let is = |a: &Atom| usize::from(matches!(a, Atom::Var(x) if x == name));
     match c {
         Comp::Atom(a) => is(a),
+        Comp::Brk => 0,
         Comp::App { fun, arg, .. } => is(fun) + is(arg),
         Comp::Call { fun, args, .. } => is(fun) + args.iter().map(|(a, _)| is(a)).sum::<usize>(),
         Comp::Extern(_, _) => 0,

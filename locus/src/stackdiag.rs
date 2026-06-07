@@ -208,6 +208,7 @@ pub fn ir_shape(ir: &Ir) -> ShapeMetrics {
                         stack.push(Work::Ir(body, depth + 1, 0));
                     }
                     Comp::Atom(_)
+                    | Comp::Brk
                     | Comp::Extern(..)
                     | Comp::Foreign(..)
                     | Comp::Bin(..)
@@ -314,6 +315,7 @@ fn observe_term_into(out: &mut ShapeMetrics, root: &Term) {
             | Term::Float(_)
             | Term::Bool(_)
             | Term::Unit
+            | Term::Brk
             | Term::Str(_) => {}
             Term::Extern(_, ty, _) => {
                 if let Some(ty) = ty {
@@ -520,6 +522,7 @@ fn observe_typed_into(out: &mut ShapeMetrics, root: &Typed) {
             | Node::Float(_)
             | Node::Bool(_)
             | Node::Unit
+            | Node::Brk
             | Node::Str(_)
             | Node::Extern(..) => {}
             Node::Bin(_, a, b)

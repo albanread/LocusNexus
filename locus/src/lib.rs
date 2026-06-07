@@ -120,6 +120,24 @@ pub use syntax::{
 pub use tagcheck::{check_tags, TagError};
 pub use unify::{unify, unify_row, zonk, UnifStore};
 
+/// The `brk` debug-crash expression is **off by default** — a program may only
+/// use it when this is set (the `locusc --brk-enable` flag, or the IDE which
+/// enables it as a dev tool). Off, the parser rejects `brk` with a clear error,
+/// so a deliberate crash can never ship by accident. Process-global because the
+/// gate is a deployment decision, not a per-call one — same shape as the
+/// mint-gate's "locked compiler" model.
+static BRK_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable (or disable) the `brk` debug-crash expression. Call before parsing.
+pub fn set_brk_enabled(on: bool) {
+    BRK_ENABLED.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Is the `brk` debug-crash expression currently allowed?
+pub fn brk_enabled() -> bool {
+    BRK_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The stack a full pipeline run (parse → **elaborate** → stage → lower) should
 /// be given. Elaboration recurses deeply over the nested stdlib graft (a
 /// ~10-module `let … in let … in …` chain) and staging is a native tree-walker,

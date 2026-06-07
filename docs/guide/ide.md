@@ -1,7 +1,9 @@
 # The Locus IDE
 
+**Locus is a language for humans and agents, this feature is for the humans among us.**
+
 Locus comes with a small integrated desktop **IDE** — a little app you download
-and run to write a Locus program, press **Run**, and immediately see what it
+and run to write a Locus program, press **F5**, and immediately see what it
 does. Output and errors appear in panes; graphical programs open their own
 windows and draw into them. There is nothing to install and nothing you can
 break, which makes it the friendliest way to try the language and learn it by
@@ -44,7 +46,7 @@ to set up.
 
 It is **Windows-only today** — it draws with Direct2D / DirectWrite. (The Locus
 *compiler* itself also runs on Linux; the windowed IDE is the Windows-specific
-piece.)
+piece.) A macos version is in the works.
 
 ## What you see
 

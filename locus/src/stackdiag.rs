@@ -301,6 +301,21 @@ fn observe_block_item<'a>(
                 stack.push((&method.body, child, 0, 0));
             }
         }
+        BlockItem::Scope { .. } => {
+            unreachable!("Scope items are flattened by the Term::Block arm before observation")
+        }
+    }
+}
+
+/// Splice the runtime-transparent `BlockItem::Scope` graft markers into their leaf
+/// items, so the shape diagnostic measures the *flattened* structure elaboration
+/// actually sees (Scope adds no node/level — `elaborate_block` flattens it).
+fn flatten_scope_items<'a>(items: &'a [BlockItem], out: &mut Vec<&'a BlockItem>) {
+    for it in items {
+        match it {
+            BlockItem::Scope { items, .. } => flatten_scope_items(items, out),
+            other => out.push(other),
+        }
     }
 }
 
@@ -421,10 +436,12 @@ fn observe_term_into(out: &mut ShapeMetrics, root: &Term) {
                 stack.push((bound, child, 0, 0));
             }
             Term::Block(items, body) => {
-                let spine = binding_spine + items.len();
+                let mut flat: Vec<&BlockItem> = Vec::new();
+                flatten_scope_items(items, &mut flat);
+                let spine = binding_spine + flat.len();
                 out.observe_binding_spine(spine);
                 stack.push((body, child, spine, 0));
-                for item in items {
+                for item in flat {
                     observe_block_item(out, &mut stack, item, child);
                 }
             }

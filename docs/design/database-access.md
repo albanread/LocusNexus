@@ -3,7 +3,7 @@
 *Drafted 2026-06-07; revised the same day after an adversarial design review (the
 fixes are tagged inline and summarized in §8/§10). A **working proposal** (OPEN).
 Companion to
-[the capabilities model](../guide/modules-and-capabilities.md) (the layer/seal model) and the
+[`../capabilities.md`](../capabilities.md) (the layer/seal model) and the
 service-plugin design [`rust-service-plugins.md`](rust-service-plugins.md) (how a
 Rust crate becomes a sealed Locus effect). This document specializes both to one
 domain: talking to databases.*
@@ -61,7 +61,7 @@ domain: talking to databases.*
 Read it top-down as *delegation* and bottom-up as *trust*. Each arrow is a call
 into the layer below; each layer is a transparent wrapper that seals the power
 beneath it so the layer above cannot utter its name
-([modules and capabilities](../guide/modules-and-capabilities.md): "seal makes the name private").
+([`capabilities.md`](../capabilities.md): "seal makes the name private").
 
 ---
 
@@ -402,9 +402,27 @@ process* is a separate question, answered in §10.
 
 ## 9. SQLite reference: what exists, what to build
 
-**Exists today** (committed, `exit=42` end-to-end): the `sqlite_access` plugin
-(`rusqlite`, bundled), a flat service surface (`sql_open/exec/query/get_*`), and a
-working demo. See [`rust-service-plugins.md`](rust-service-plugins.md) §9.
+**Built & verified so far** (committed; full suite green):
+- The `rusqlite` plugin, hardened: every shim entry `catch_unwind`-guarded;
+  prepared/parameterized statements; NULL fidelity; the in-memory sandbox
+  (authorizer denies `ATTACH`/file-PRAGMA). *(steps 0–1)*
+- `SqliteMem` / `SqliteFs` split with the distinct `sqlite_fs` effect minted at a
+  dedicated on-disk boundary. *(step 2)*
+- The generic **`Database`** service: phantom-typed `Conn[b]`, capability-honest
+  rows (`db_open_memory → {sqlite}`, `db_open_file → {sqlite, sqlite_fs}`),
+  backend-mix rejected by the type checker, generic `db_*` ops. *(step 3)*
+- The **`vault_access`** credential layer: connect by profile name
+  (`db_open_profile`), credential = JSON parameter dictionary split into a public
+  `ConnMeta` and an unreadable `Secret`; verified that a password never reaches
+  app scope. Runtime-dispatched connections are `Conn[Dyn]` with the honest
+  worst-case row `{cred_access, sqlite, sqlite_fs}`. *(step 4)*
+- Demos: `examples/{sqlite_demo, sqlite_prepared, db_layer, db_credentials}.locus`.
+
+**Refinements still open:** a `Credentials` *service* that seals `cred_access`
+and restricts provisioning (today the vault boundary is exposed directly); BLOB
+support (needs a bytes ABI); `with_db`/`with_query`/`with_transaction` scope
+combinators; the cross-DBMS generic op (awaits a backend-generic effect, i.e.
+associated effects). The original flat `sql_*` surface also remains.
 
 **To build for this design** (review fixes folded in):
 0. **Harden the existing shim first:** wrap every `#[no_mangle]` entry in

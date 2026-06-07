@@ -6,6 +6,63 @@ Principle: **write small assurance tests before any never-tested code.** Docs
 describe; the checker decides. Run each probe with `locusc effects FILE` (type-level)
 — it infers + prints the row without needing a runtime handler.*
 
+## Second finding (2026-06-07) — a T0 coercion gap blocks the scope combinators
+
+Building the `with_memory`/`with_file`/`with_query`/`with_transaction` combinators
+(design Q3) surfaced a **second compiler bug**, distinct from the trait one below.
+Passing a phantom-typed handle `Conn[SqliteMem]` (a single-field constructor,
+scalar-repr'd) into a polymorphic combinator body trips tag-completeness (T0):
+
+```
+locusc: tag-completeness (compiler bug): app arg -> parameter — a `ToPtr` coercion
+is required to move a `Conn[SqliteMem]` across a `?N` (Var) cell boundary, but none
+is present
+```
+
+T0 (the memory-safety gate) demands a `ToPtr` (box the scalar into the uniform
+cell) at the body-application boundary, but sema's coercion-insertion did not place
+one — a genuine gap, classified by T0 itself as a compiler bug. Notes:
+- The analogous combinator over **`Int`** bodies works (the D-series probes), so the
+  trigger is specifically a **constructor-typed argument** crossing the body's
+  polymorphic slot.
+- It fires only when a combinator is **called**; merely defining them in `Database`
+  does not break other users (verified — all committed demos still pass).
+- Minimal repro: [`assurance-scope-combinators.locus`](assurance-scope-combinators.locus).
+
+**Root cause (pinned 2026-06-07 via `LOCUS_T0_DEBUG` instrumentation).** The
+failing application is a **beta-redex synthesized by `wrap_callback`** (sema.rs —
+the lowering that adapts a *concrete* callback to a *uniform* callee ABI when a
+constructor-typed value flows through a polymorphic body param). The debug print:
+
+```
+T0 app: fun.node=Lam  fun.ty = ?6 -> Int ! {gc}   dom(raw)=?6   dom(resolved)=Box[?7]
+        arg.node=Var($cbw0)   arg.ty=Box[Tag]
+```
+
+So `f`'s domain `?6` is a **store-bound** unification var that *resolves to a
+concrete `Box`*, but T0 (running pre-zonk) reads the **literal** `?6` as a uniform
+cell and demands a `ToPtr`. `wrap_callback` decided no coercion (it effectively
+sees the resolved `Box`); T0 checks the literal `Var`. Insertion and checking
+**diverge** — the very thing the module claims they never do.
+
+**Why T0 can't simply resolve the slot (the trap).** The `id 5` case has the same
+shape — `id`'s param var is also store-bound to the scalar `Int` arg — but there a
+`ToPtr` genuinely *is* needed (a generic's param cell is uniform) and *is* inserted.
+If T0 resolved the App-param slot, it would compute `coercion(Int, Int) = None` and
+**silently miss a missing box** at exactly the scalar→uniform boundary that is the
+heap-corruption hazard T0 exists to catch. Boundness doesn't distinguish the two
+cases; only "is this function a generic with a uniform param" does, which isn't on
+the slot var. **So the fix belongs in `wrap_callback`** (emit a T0-consistent
+tree — record the resolved param type, or insert exactly the coercion T0 derives),
+not in T0.
+
+**Decision:** combinators **deferred** (removed from `Database`; bare open/close
+remain) until `wrap_callback` is made T0-consistent. T0 is the sole memory-safety
+mechanism, so this is a careful, dedicated change — not rushed alongside feature
+work. The diagnosis above is the starting point.
+
+---
+
 ## The question
 
 Fix B needs an operation whose **effect row is determined by a type parameter** (the

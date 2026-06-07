@@ -128,6 +128,14 @@ fn walk_block_item(item: BlockItem, d: &mut Demanded) -> Result<BlockItem, Strin
                 .collect::<Result<Vec<_>, _>>()?,
             module,
         },
+        BlockItem::Scope { depth, home, items } => BlockItem::Scope {
+            depth,
+            home,
+            items: items
+                .into_iter()
+                .map(|it| walk_block_item(it, d))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
         BlockItem::Effect { .. } | BlockItem::TypeDef { .. } | BlockItem::Trait { .. } => item,
     })
 }

@@ -2852,9 +2852,30 @@ fn diagnostic_explanation(code: &str) -> (&'static str, &'static str, &'static s
         ),
         "RN-E0405" => (
             "capability",
-            "cap.asm-gc-type",
-            "An extern-asm signature crosses a GC-managed type.",
-            "Keep asm signatures GC-blind: scalars and raw pointers only.",
+            "cap.asm-gc-type / capability.level-out-of-layer",
+            "Either: an extern-asm signature crosses a GC-managed type; OR a \
+             level-visibility OUT-OF-LAYER reference (a use site names a binding \
+             bound only at a layer it cannot reach — e.g. an app naming a boundary \
+             binding two layers down, or any upward reference).",
+            "For asm: keep signatures GC-blind (scalars/raw pointers). For level: \
+             reach the binding through a sealed service that exposes a capability.",
+        ),
+        "RN-E0406" => (
+            "capability",
+            "capability.level-not-exposed",
+            "A level-visibility NOT-EXPOSED reference: the named binding IS at a \
+             reachable layer but is private (not in its module's `exposing`).",
+            "Add the name to its module's `exposing (…)`, or reach it through an \
+             exposed capability.",
+        ),
+        "RN-E0407" => (
+            "capability",
+            "capability.non-sealable-effect",
+            "A never-sealable effect (`gc`, `exn`, or `Insert`) was named in a \
+             module `seals (…)` clause or a region `seal L { … }` — the inverted \
+             denylist; sealing one would hide a fault or break let-insertion.",
+            "Drop `gc`/`exn`/`insert` from the seal; seal only native powers \
+             (`winapi`/`mem`/…) you actually discharge.",
         ),
         "RN-E0600" => (
             "module",

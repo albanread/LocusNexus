@@ -1,5 +1,9 @@
-module Crt at boundary mints (crt) exposing () =
+module Crt at boundary mints (crt) exposing
+  (crt_sin, crt_cos, crt_tan, crt_asin, crt_acos, crt_atan, crt_exp, crt_log, crt_log10,
+   crt_log2, crt_ceil, crt_fabs, crt_pow, crt_atan2, crt_fmod, crt_hypot) =
 -- stdlib LAYER 0: crt — the raw UCRT math imports, backed by `ucrtbase.dll`.
+-- Exposed surface = the pure `Float -> Float` math primitives the layer-1 `Math`
+-- service aliases (it relabels `{crt}`); no memory, process, or FFI-handle power.
 --
 -- Like `winapi`, this is a boundary layer (world > winapi/crt > services > app):
 -- only a layer-0 module may name `extern`. The `math.*` layer aliases these and

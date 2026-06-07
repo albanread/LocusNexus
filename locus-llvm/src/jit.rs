@@ -131,10 +131,58 @@ unsafe fn define_absolute_symbols(
     Ok(())
 }
 
+/// Dedupe `(name, addr)` pairs keeping the **last** occurrence of each name
+/// (first-seen order otherwise). Host-injected `extra` symbols are appended
+/// last, so last-wins lets them override a same-named runtime/Win32 default —
+/// and a duplicate name never reaches `LLVMOrcJITDylibDefine`, which rejects it.
+fn dedupe_last_wins(symbols: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<(String, u64)> = Vec::with_capacity(symbols.len());
+    for pair in symbols.into_iter().rev() {
+        if seen.insert(pair.0.clone()) {
+            out.push(pair);
+        }
+    }
+    out.reverse();
+    out
+}
+
 /// Lower `ir` to LLVM, JIT it, run `__locus_main`, and return its `i64` result.
 ///
 /// (v1: the program must be in the pure fragment — see [`crate::lower`].)
+///
+/// This is the Phase-1 entry point; it delegates to
+/// [`jit_run_i64_with_symbols`] with no extra symbols, so its behavior is
+/// unchanged. The IDE host uses the with-symbols variant to inject the `igui_*`
+/// C-ABI addresses a graphical program resolves.
 pub fn jit_run_i64(ir: &Ir, apis: &crate::winapi_resolve::Demanded) -> Result<i64, String> {
+    jit_run_i64_with_symbols(ir, apis, &[])
+}
+
+/// Like [`jit_run_i64`], but also registers `extra` as **additional absolute
+/// symbols** in the JIT dylib — alongside the prelowered runtime
+/// ([`crate::runtime::runtime_symbols`]) and the resolved Win32 apis — so a
+/// JIT'd `call @name` binds to a host-provided address for each `(name, addr)`
+/// in `extra`.
+///
+/// This is the **one engine seam** the Locus IDE needs: the host (`locus-ide`)
+/// passes the `igui_*` GUI C-ABI's `(export-name, function-pointer-as-u64)`
+/// table here, so a graphical Locus program's `extern "iGui.…"` externs resolve
+/// to the linked shell. The `extra` symbols are defined in the *same* absolute-
+/// symbol manifold as the runtime/winapi ones (reusing [`define_absolute_symbols`]).
+///
+/// `extra` is appended **last** and the table is deduped **last-wins**, so a host
+/// symbol may deliberately *override* a same-named runtime/Win32 default. The IDE
+/// uses this for more than the disjoint `iGui.*` names: it redirects
+/// `WriteConsoleW`/`ReadConsoleW` to its own console-pane shims, so a program's
+/// console I/O lands in the IDE pane instead of the (absent) OS console — the
+/// program still resolves the same *name*; only the address differs. Passing
+/// `&[]` makes this identical to the historical `jit_run_i64`.
+pub fn jit_run_i64_with_symbols(
+    ir: &Ir,
+    apis: &crate::winapi_resolve::Demanded,
+    extra: &[(String, u64)],
+) -> Result<i64, String> {
     init_target();
 
     // Build with inkwell, then transfer ownership of the module + its context
@@ -199,6 +247,12 @@ pub fn jit_run_i64(ir: &Ir, apis: &crate::winapi_resolve::Demanded) -> Result<i6
             return Err(e);
         }
     }
+    // Host-injected extras (the IDE's `igui_*` GUI C-ABI + its console-pane
+    // `WriteConsoleW`/`ReadConsoleW` overrides). Appended last, then deduped
+    // last-wins so an extra may override a same-named default. With the default
+    // `&[]` this is a no-op and the table is exactly the historical one.
+    symbols.extend(extra.iter().cloned());
+    let symbols = dedupe_last_wins(symbols);
     if let Err(e) = unsafe { define_absolute_symbols(jit, jd, &symbols) } {
         unsafe { LLVMOrcDisposeLLJIT(jit) };
         return Err(e);

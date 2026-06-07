@@ -1,6 +1,8 @@
-module ArrayRt at boundary mints (gc) exposing () =
--- Private bridge for allocation-shaped array helpers. Public array services keep
--- the useful surface small while this module owns the raw managed-heap edge.
+module ArrayRt at boundary mints (gc) exposing (locus_array_new_int) =
+-- LAYER 0 boundary bridge for allocation-shaped array helpers. The single
+-- exposed binding `locus_array_new_int` returns a MANAGED `Array[Int]` — the
+-- safe runtime-call surface the layer-1 `Array` service builds on. `mints (gc)`
+-- is the only raw power and is discharged into the managed heap.
 
 let locus_array_new_int = extern "locus_array_new_int" : Int -> Int -> Array[Int] in
 

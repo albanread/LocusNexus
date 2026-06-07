@@ -117,6 +117,32 @@ pub fn emit_asm_opt(ir: &Ir) -> Result<String, String> {
     emit_asm_inner(ir, true)
 }
 
+/// Lower `ir` and emit the **LLVM IR** (textual `.ll`) for the program — the
+/// mid-level view between the ANF IR and the host assembly: the same module the
+/// JIT and AOT build, printed. The honest *lowering* view (what the front end
+/// emits, pre-optimization).
+pub fn emit_llvm_ir(ir: &Ir) -> Result<String, String> {
+    emit_llvm_ir_inner(ir, false)
+}
+
+/// Like [`emit_llvm_ir`], but runs the **`-O2` IR pipeline** first — the LLVM IR
+/// after optimization, closer to what the assembly is generated from.
+pub fn emit_llvm_ir_opt(ir: &Ir) -> Result<String, String> {
+    emit_llvm_ir_inner(ir, true)
+}
+
+fn emit_llvm_ir_inner(ir: &Ir, optimize: bool) -> Result<String, String> {
+    let ctx = Context::create();
+    let module = emit_module(&ctx, ir, false)?;
+    let (tm, triple) = host_target_machine()?;
+    module.set_triple(&triple);
+    module.set_data_layout(&tm.get_target_data().get_data_layout());
+    if optimize {
+        run_opt_pipeline(&module, &tm)?;
+    }
+    Ok(module.print_to_string().to_string())
+}
+
 fn emit_asm_inner(ir: &Ir, optimize: bool) -> Result<String, String> {
     let ctx = Context::create();
     // The asm dump neither links nor runs, so the gc policy is irrelevant here.

@@ -1,5 +1,9 @@
-module Libm at boundary mints (libm) exposing () =
--- stdlib LAYER 0: libm boundary for Linux.
+module Libm at boundary mints (libm) exposing
+  (libm_sin, libm_cos, libm_tan, libm_asin, libm_acos, libm_atan, libm_exp, libm_log, libm_log10,
+   libm_log2, libm_ceil, libm_fabs, libm_pow, libm_atan2, libm_fmod, libm_hypot) =
+-- stdlib LAYER 0: libm boundary for Linux. Exposed surface = the pure
+-- `Float -> Float` math primitives the layer-1 `Math` service aliases (relabels
+-- `{libm}`); no memory, process, or FFI-handle power.
 
 let libm_sin   = extern "sin"   : Float -> Float in
 let libm_cos   = extern "cos"   : Float -> Float in

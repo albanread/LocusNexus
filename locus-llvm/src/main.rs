@@ -901,7 +901,11 @@ fn cmd_effects(args: &[String]) -> Result<i32, String> {
             trace_shape("user source", locus::program_source_shape(&program));
         }
     }
-    let term = locus::program(&src).map_err(|e| e.msg)?;
+    // Graft the stdlib **and the service plugins** (same module set as `run`),
+    // so `effects` can resolve plugin surfaces like `sql_open` and report their
+    // sealed effect (e.g. `{ sqlite }`) in the manifest.
+    let modules = plugin_grafted_modules();
+    let (term, _user_modules) = locus::program_with_stdlib(&src, &modules).map_err(|e| e.msg)?;
     if trace_stack {
         trace_shape("stdlib-grafted term", locus::term_shape(&term));
     }

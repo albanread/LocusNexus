@@ -34,9 +34,12 @@ pub mod runtime;
 pub mod winapi_resolve;
 
 #[cfg(feature = "windows-driver")]
-pub use aot::{build_exe, emit_asm, emit_asm_opt, emit_library_object, link_program};
+pub use aot::{
+    build_exe, emit_asm, emit_asm_opt, emit_library_object, emit_llvm_ir, emit_llvm_ir_opt,
+    link_program,
+};
 #[cfg(feature = "windows-driver")]
-pub use jit::jit_run_i64;
+pub use jit::{jit_run_i64, jit_run_i64_with_symbols};
 pub use lower::{emit_library_module, LibExport};
 
 #[cfg(all(test, feature = "windows-driver"))]
@@ -1826,6 +1829,21 @@ let out = alloc 0 256 0x3000 0x04 in
             run("console_write_float (1.5 + 2.25)").unwrap(),
             0,
             "console_write_float : Float -> Unit"
+        );
+    }
+
+    #[test]
+    fn jits_unhandled_perform_console_via_the_native_default_handler() {
+        // `perform console s` with NO handler in scope now routes to the native
+        // runtime (`locus_write_console_line`) — the prelude declares `console`
+        // as a native op, so an unhandled perform default-handles (writes the
+        // line) rather than erroring at codegen. It yields Unit, so the program
+        // continues to its result. Regression for the native default handler
+        // (mirrors `console_float`); without it this was a hard codegen error.
+        assert_eq!(
+            run(r#"let _ = perform console "x" in 7"#).unwrap(),
+            7,
+            "unhandled `perform console` runs (writes a line) and yields Unit"
         );
     }
 

@@ -14,6 +14,9 @@ default = ["windows-driver"]
 # MSVC AOT, and the bundled MASM runtime. It stays default so current Windows
 # workflows keep building the same crate.
 windows-driver = ["dep:cc", "dep:locus-asm", "dep:locus-rt", "dep:locus-winapi", "dep:locus-plugin", "dep:locus-sqlite"]
+# Agent-facing compiler protocol. Kept opt-in so current Windows compiler builds
+# do not pull in the MCP stack unless a host wants `locusc mcp`.
+mcp = ["dep:rmcp", "dep:serde", "dep:serde_json", "dep:tokio"]
 
 # `locusc` — the Locus compiler driver: `run` (JIT) and `build` (AOT → .exe).
 # The mint-gate blocks app-level minting by default (no build-time toggle): the
@@ -22,6 +25,11 @@ windows-driver = ["dep:cc", "dep:locus-asm", "dep:locus-rt", "dep:locus-winapi",
 name = "locusc"
 path = "src/main.rs"
 required-features = ["windows-driver"]
+
+[[bin]]
+name = "locusc-mcp"
+path = "src/mcp_main.rs"
+required-features = ["windows-driver", "mcp"]
 
 [dependencies]
 locus = { path = "../locus" }
@@ -47,3 +55,7 @@ llvm-sys.workspace = true
 # Used only to locate MSVC `cl.exe` / `link.exe` with the SDK env (`%LIB%`,
 # `%INCLUDE%`) populated — the AOT path drives them to build a `.exe`.
 cc = { version = "1", optional = true }
+rmcp = { version = "1.7.0", default-features = false, features = ["server", "macros", "transport-io"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

@@ -1,0 +1,87 @@
+module Database at services
+  exposing (db_open_memory, db_open_file, db_open_profile, cred_provision,
+            db_exec, db_query, db_prepare,
+            db_bind_int, db_bind_text, db_bind_null, db_run_query, db_run_exec,
+            db_reset, db_finalize, db_rows, db_cols, db_get_int, db_get_text,
+            db_is_null, db_free, db_close, db_error) =
+-- LAYER 1 — the generic, backend-neutral database interface (design §5).
+--
+-- A connection is a **phantom-typed handle** `Conn[b]`: opening selects the
+-- backend, and from then on the connection directs the flow. The mem/fs split is
+-- visible BOTH in the type (`Conn[SqliteMem]` vs `Conn[SqliteFs]`, so the two
+-- can't be confused) AND in the effect row: `db_open_file` carries `{sqlite_fs}`
+-- (it calls the on-disk boundary), while `db_open_memory` does not — so a program
+-- that touches the filesystem says so, and an in-memory one provably doesn't.
+--
+-- The generic ops are `Conn[b]`-polymorphic; they unwrap to the raw handle and
+-- call the shared `{sqlite}` core service. (Cross-DBMS dispatch with per-backend
+-- *operation* effects is the next axis — it rides the variable-row trait support.)
+
+type SqliteMem = SqliteMem in
+type SqliteFs  = SqliteFs in
+-- `Dyn` is the backend tag for a connection whose backend was chosen at RUNTIME
+-- (from a credential profile), so it cannot be proven statically. Its effect row
+-- is the honest worst case — it read credentials and may have touched disk.
+type Dyn       = Dyn in
+type Conn[b]   = Conn(Int) in
+
+let unwrap = fn c: Conn[b] => match c with | Conn(h) => h in
+
+-- opens — each fixes the backend in the type and carries its effect in the row.
+-- (`let rec` is the binding form that takes a type annotation; these aren't
+-- recursive — the annotation is what pins the phantom backend tag.)
+let rec db_open_memory : Unit -> Conn[SqliteMem] ! {gc, sqlite} =
+  fn u: Unit => Conn(sql_open_memory ()) in
+let rec db_open_file : String -> Conn[SqliteFs] ! {gc, sqlite_fs} =
+  fn path: String => Conn(disk_open path) in
+
+-- connect by NAME (design §4): the named credential supplies every parameter, so
+-- this is the whole act of connecting. The backend is resolved at runtime from
+-- the vault, so the result is `Conn[Dyn]` (backend not statically known) and the
+-- effect row is the honest worst case: `{cred_access}` (read the vault) plus both
+-- `{sqlite}` and `{sqlite_fs}` (it MIGHT have opened a file). A password in the
+-- profile is confined to a `Secret` and never reaches here.
+let rec db_open_profile : String -> Conn[Dyn] ! {cred_access, gc, sqlite, sqlite_fs} =
+  fn profile: String =>
+    let m = cred_resolve profile in
+    if meta_backend m == 0
+      then Conn(sql_open_memory ())
+      else Conn(disk_open (meta_path m))
+  in
+
+-- provision a vault profile from a JSON blob (stand-in for the OS secret store)
+let cred_provision = fn name: String => fn json: String => cred_register name json in
+
+-- generic ops over any connection
+let db_exec    = fn c: Conn[b] => fn sql: String => sql_exec (unwrap c) sql in
+let db_query   = fn c: Conn[b] => fn sql: String => sql_query (unwrap c) sql in
+let db_prepare = fn c: Conn[b] => fn sql: String => sql_prepare (unwrap c) sql in
+let db_close   = fn c: Conn[b] => sql_close (unwrap c) in
+
+-- prepared-statement binding + run (values cross only via bind)
+let db_bind_int  = fn st: Int => fn v: Int => sql_bind_int st v in
+let db_bind_text = fn st: Int => fn s: String => sql_bind_text st s in
+let db_bind_null = fn st: Int => sql_bind_null st in
+let db_run_query = fn st: Int => sql_run_query st in
+let db_run_exec  = fn st: Int => sql_run_exec st in
+let db_reset     = fn st: Int => sql_reset st in
+let db_finalize  = fn st: Int => sql_finalize st in
+
+-- result-set readers
+let db_rows     = fn rs: Int => sql_rows rs in
+let db_cols     = fn rs: Int => sql_cols rs in
+let db_get_int  = fn rs: Int => fn row: Int => fn col: Int => sql_get_int rs row col in
+let db_get_text = fn rs: Int => fn row: Int => fn col: Int => sql_get_text rs row col in
+let db_is_null  = fn rs: Int => fn row: Int => fn col: Int => sql_is_null rs row col in
+let db_free     = fn rs: Int => sql_free rs in
+let db_error    = fn u: Unit => sql_error () in
+
+-- NOTE: the scope combinators (`with_memory`/`with_file`/`with_query`/
+-- `with_transaction`, design Q3) are DEFERRED — they trip a tag-completeness (T0)
+-- compiler bug: passing a phantom-typed `Conn[b]` into a polymorphic body
+-- parameter demands a `ToPtr` coercion that sema does not insert, so `check_tags`
+-- panics ("a `ToPtr` coercion is required to move a `Conn[SqliteMem]` across a Var
+-- cell boundary"). See docs/design/assurance-dispatch.md. They return once that
+-- coercion-insertion gap is fixed; the bare open/close are the surface until then.
+
+()

@@ -1,0 +1,9 @@
+-- SECURITY REPRO (sealing-enforcement-gap.md): privilege escalation via the graft.
+-- An app that uses only the harmless `console_writeln` service can ALSO invoke the
+-- OS credential-reading power `win_cred_read` directly — bypassing the `Console`
+-- seal over `winapi`. It type-checks and runs. Both this and a pure-console program
+-- carry the SAME row `{ mem, winapi, gc }`, so the manifest can't tell them apart.
+--   locusc effects docs/design/sealing-escalation-repro.locus   →  { mem, winapi, gc }
+let _ = console_writeln "hello" in
+let secret = win_cred_read "Git:https://github.com" in
+0

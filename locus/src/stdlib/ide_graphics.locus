@@ -1,4 +1,12 @@
-module IdeGraphics at boundary mints (graphics) exposing () =
+module IdeGraphics at boundary mints (graphics) exposing
+  (igui_begin_batch, igui_submit_batch, igui_canvas_open, igui_canvas_present, igui_close_child,
+   igui_emit_clear, igui_emit_fill_rect, igui_emit_stroke_rect, igui_emit_draw_line,
+   igui_emit_fill_circle, igui_emit_stroke_circle, g_canvas_set, g_open_child, g_draw_text) =
+-- Exposed to the layer-1 `Graphics` service only: the IDE-world drawing/canvas/
+-- window-lifecycle primitives, all of which mint/carry `{graphics}` (the service
+-- SEALS it). `g_canvas_set` is the SAFE wrapper over the raw `poke32` pixel write;
+-- the string-marshalling helpers and the raw `iGui.OpenChild`/`iGui.SetTitle`
+-- imports stay PRIVATE. No memory/credential/process power leaves this surface.
 -- stdlib LAYER 0: the IDE-world GRAPHICS boundary. Raw `iGui.*` C-ABI imports
 -- (the Direct2D/DirectWrite batch surface the IDE shell exposes) plus the
 -- private string-marshalling helper. These resolve only inside `locus-ide`,

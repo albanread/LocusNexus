@@ -819,6 +819,36 @@ pub extern "C" fn locus_write_float(bits: i64) {
     println!("{}", f64::from_bits(bits as u64));
 }
 
+/// Process-global sink for `perform console` lines. `None` → write the line to
+/// stdout (the CLI default). A host installs a sink to route console lines into
+/// its own surface instead of the OS console — the IDE points it at its console
+/// pane, so a JIT'd program's `perform console` lands there. A plain `fn(&str)`
+/// (the line is already decoded), so the host never touches the Locus heap.
+static CONSOLE_SINK: std::sync::Mutex<Option<fn(&str)>> = std::sync::Mutex::new(None);
+
+/// Install (`Some`) or clear (`None`) the console-line sink. See [`CONSOLE_SINK`].
+pub fn set_console_sink(sink: Option<fn(&str)>) {
+    if let Ok(mut g) = CONSOLE_SINK.lock() {
+        *g = sink;
+    }
+}
+
+/// The native `console` effect's default handler: write `s` as one line. The
+/// prelude declares `console : String -> Unit`, and codegen routes an unhandled
+/// `perform console s` here (mirroring `console_float` → [`locus_write_float`]).
+/// Decodes the managed Locus `String` (on the heap-owning thread — this is
+/// called from JIT'd code, never cross-thread) and routes it to the host sink if
+/// one is installed, else stdout. The trailing newline matches "write a *line*".
+#[no_mangle]
+pub extern "C" fn locus_write_console_line(s: i64) {
+    let line = managed_string_to_rust(s);
+    let sink = CONSOLE_SINK.lock().ok().and_then(|g| *g);
+    match sink {
+        Some(f) => f(&line),
+        None => println!("{line}"),
+    }
+}
+
 /// Fixed-signature FP helpers used to exercise the extern ABI from JIT tests.
 /// They are ordinary C ABI symbols: FP args/returns must travel through native
 /// FP registers, not through the uniform Locus `i64` cell representation.
@@ -905,6 +935,7 @@ pub fn runtime_symbols() -> Vec<(&'static str, u64)> {
         sym!("locus_gc_leave", locus_gc_leave),
         sym!("locus_gc_leave_with", locus_gc_leave_with),
         sym!("locus_write_float", locus_write_float),
+        sym!("locus_write_console_line", locus_write_console_line),
         sym!("locus_fp64_add", locus_fp64_add),
         sym!("locus_fp64_add_i64", locus_fp64_add_i64),
         sym!("locus_fp32_id", locus_fp32_id),

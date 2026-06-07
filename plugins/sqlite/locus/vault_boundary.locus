@@ -1,0 +1,48 @@
+module VaultAccess at boundary mints (cred_access)
+  exposing (cred_register, cred_resolve, meta_backend, meta_path, meta_field) =
+-- PLUGIN LAYER 0 — the credential **vault** boundary (design §4). Mints the
+-- `cred_access` effect: reading a secret store is its own named power, distinct
+-- from touching a database. A profile resolves to a PUBLIC `ConnMeta` handle
+-- (backend tag + path + non-secret fields, all readable here); any password is
+-- split off host-side into a `Secret` that has *no read accessor in the language*
+-- — it can be held and handed to a driver, never read back as a value. So a
+-- connection string's secret never becomes a Locus `String`.
+--
+-- `cred_register` is provisioning (a stand-in for the OS secret store); a real
+-- deployment populates the vault out-of-band.
+
+let str_to_cstr = extern "locus_string_to_cstr" : String -> Int in
+let cstr_free   = extern "locus_cstr_free"       : Int -> Unit in
+
+let v_register = extern "vault.Register" : Int -> Int -> Int in
+let v_resolve  = extern "cred.Resolve"   : Int -> Int in
+let m_backend  = extern "meta.Backend"   : Int -> Int in
+let m_path     = extern "meta.Path"      : Int -> String in
+let m_str      = extern "meta.Str"       : Int -> Int -> String in
+
+-- provision a profile from a JSON blob (1 = ok, 0 = bad JSON)
+let cred_register = fn name: String => fn json: String =>
+  let n = str_to_cstr name in
+  let j = str_to_cstr json in
+  let r = v_register n j in
+  let _ = cstr_free n in
+  let _ = cstr_free j in
+  r
+in
+-- resolve a profile name → a public ConnMeta handle (0 if unknown/invalid)
+let cred_resolve = fn name: String =>
+  let n = str_to_cstr name in
+  let h = v_resolve n in
+  let _ = cstr_free n in
+  h
+in
+let meta_backend = fn m: Int => m_backend m in
+let meta_path    = fn m: Int => m_path m in
+let meta_field = fn m: Int => fn key: String =>
+  let k = str_to_cstr key in
+  let s = m_str m k in
+  let _ = cstr_free k in
+  s
+in
+
+()

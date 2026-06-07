@@ -1,7 +1,25 @@
-module Winapi at boundary mints (winapi) exposing () =
+module Winapi at boundary mints (winapi) exposing
+  (win_write_console, win_write_unit, win_read_unit, win_read_line,
+   win_console_width, win_console_height, win_set_cursor, win_clear_screen,
+   win_clock_ticks, win_clock_frequency,
+   win_docs_exists, win_docs_write, win_docs_read_ok, win_docs_read_text,
+   win_locus_env_get_ok, win_locus_env_get_text, win_cred_read) =
 -- stdlib LAYER 0: raw Windows imports and private boundary helpers. Services
 -- call these helpers and seal `{winapi}`/`{mem}`; app code never gets a public
 -- memory, process, or arbitrary filesystem API.
+--
+-- The `exposing` list is the CURATED HELPER SURFACE (level-enforcement.md §1 H2):
+-- the safe `win_*` WRAPPERS the layer-1 services (Console/Time/DocsFs/LocusEnv/Db)
+-- consume one layer up. Every exposed name is a `fn …` wrapper whose body bottoms
+-- out in `{winapi}`/`{mem}` (the service seals both). The RAW POWERS stay PRIVATE
+-- and are NOT in this list: the bare imports `win_GetStdHandle`, `win_WriteConsoleW`,
+-- `win_ReadConsoleW`, `win_CredReadW`/`win_CredFree`, `win_CreateFileW`/`win_ReadFile`/
+-- `win_WriteFile`/`win_CloseHandle`, `win_VirtualAlloc`/`win_VirtualFree`,
+-- `win_GetEnvironmentVariableW`, the `win_alloc`/`win_free` raw-page allocator, and
+-- the `poke*`/`peek*` marshalling helpers (`win_utf16z`, `win_utf8_*`, `win_coord`,
+-- `win_documents_path`, `win_cred_target_name`, …). `win_cred_read` IS exposed (the
+-- Db service consumes it) but it is the wrapper that returns the credential to the
+-- sealing service — not the raw `win_CredReadW` FFI edge.
 
 let win_GetStdHandle = extern "GetStdHandle" : U32 -> Int in
 let win_WriteConsoleW = extern "WriteConsoleW" : Ptr -> Ptr -> U32 -> Ptr -> Ptr -> I32 in

@@ -17,7 +17,7 @@
 use crate::check::TypeErr;
 use crate::sema::{seal_escape, Node, Typed, TypedBlockItem};
 use crate::stdlib::{bound_names, first_mint};
-use crate::syntax::{ModuleDecl, Term, Type};
+use crate::syntax::{Label, ModuleDecl, Term, Type};
 use std::collections::{HashMap, HashSet};
 
 /// A capability-gate violation (the mint-gate half; the seal half reuses
@@ -35,6 +35,108 @@ pub enum CapError {
     /// `RN-E0404` — a module declares `at boundary` (claiming mint authority) but
     /// is not authorized by the project manifest (`locus.toml [boundary]`).
     UnauthorizedBoundary { module: String },
+    /// `RN-E0405` — a **level-visibility OUT-OF-LAYER** violation (D1,
+    /// `level-enforcement.md` §1, Sprint 2/3). A module / the entry at layer `at`
+    /// references the name `name`, but `name` is bound only at layer(s) the use
+    /// site **cannot reach by layer**: resolution sees a name only at the **same**
+    /// layer or **one below**, so an app naming a boundary binding (two-down) or
+    /// any upward reference fails here. This is the symbol-visibility barrier that
+    /// confines raw powers — the leak closed in Sprint 2 (an app naming a
+    /// boundary-only `win_cred_read` is rejected here, not silently grafted).
+    ///
+    /// Distinct from [`CapError::LevelNotExposed`] (RN-E0406): there the name *is*
+    /// bound at a reachable layer (`D`/`D-1`) but is private (not in `exposing`).
+    /// Here no reachable layer binds it at all — a strictly geometric failure.
+    ///
+    /// `at` is the use-site layer rank (0 boundary / 1 services / 2 app);
+    /// `defined_at` is the rank of the nearest layer that *does* bind `name`
+    /// (for the diagnostic), or `None` when the only bindings are upward / fully
+    /// out of reach.
+    LevelOutOfLayer {
+        name: String,
+        at: u8,
+        defined_at: Option<u8>,
+    },
+    /// `RN-E0406` — a **level-visibility NOT-EXPOSED** violation (D1, the privacy
+    /// half). The name `name` **is** bound at a layer the use site `at` can reach
+    /// (`D` or `D-1`), but that binding is **private** — it is not in its module's
+    /// `exposing (…)` list. Cross-module resolution requires `exposed ∧ level ∈
+    /// {D, D-1}`; the layer is fine, the privacy is the failure. Split out from
+    /// RN-E0405 (Sprint 3) so each distinct check carries its own code: out-of-layer
+    /// is geometric, not-exposed is an access-control decision the author made.
+    ///
+    /// `at` is the use-site layer rank; `defined_at` is the reachable layer that
+    /// binds (but does not expose) `name`.
+    LevelNotExposed {
+        name: String,
+        at: u8,
+        defined_at: u8,
+    },
+    /// `RN-E0407` — a **non-sealable effect** was named in a `seals (…)` clause
+    /// (or a `seal L { … }` region, `level-enforcement.md` §2.3 / `sealing-
+    /// semantics.md` §8.3, the **inverted denylist**). `gc`, `exn`, and `Insert`
+    /// are the caller's consent / fault / generativity signals and may **never** be
+    /// sealed away: no handler discharges allocation, and a sealed-undischarged
+    /// `exn` would *hide a fault* rather than encapsulate a serviced power. Sealing
+    /// one is a hard error — the safety review found `is_native` silently *allowed*
+    /// it, the wrong direction. (`st` stays sealable, routed through the existing
+    /// `seal_escape` cell-escape check; native `World` powers — `winapi`/`mem`/
+    /// `libc`/`crt`/`asm` — stay strippable.)
+    NonSealableEffect {
+        module: Option<String>,
+        label: String,
+    },
+}
+
+/// The **inverted denylist** ([`level-enforcement.md`] §2.3, [`sealing-
+/// semantics.md`] §8.3): may `label` *never* be sealed? `gc`, `exn` (any
+/// `exn[X]`, or a bare `exn` that surfaced as a `User` label), and the generative
+/// `Insert` are the caller's consent / fault / generativity signals — sealing
+/// them hides a fault or breaks let-insertion, so it is a hard `RN-E0407`.
+///
+/// Everything else stays sealable: native `World` powers (`winapi`/`mem`/`libc`/
+/// `crt`/`asm`) are *stripped* subtract-only at the module-seal edge, and `st` is
+/// routed through the existing [`seal_escape`] cell-escape check (so an *unhandled*
+/// `st`/user effect still fails `SealUnhandled`, never silently strips).
+pub fn is_never_sealable(label: &Label) -> bool {
+    use crate::syntax::Label::*;
+    match label {
+        Gc | Exn(_) | Insert => true,
+        // A bare `seals (exn)` / `seals (insert)` parses through `op_label`, which
+        // makes them `User("exn")` / `User("insert")` (not the dedicated enum
+        // variants) — catch those textual spellings too, so the denylist cannot be
+        // dodged by writing the name without the `[X]` / capitalization.
+        User(n) => n == "exn" || n == "insert",
+        _ => false,
+    }
+}
+
+/// The never-sealable denylist for the **region** form `seal L { e }` / `nogc`.
+/// Like [`is_never_sealable`] *minus* `gc`: a region `seal gc` (≡ `nogc`) is the
+/// sound `runST` discipline — it strips `gc` from the row **and** enforces the
+/// gc-datum no-escape check ([`seal_escape`]), so allocation liability cannot be
+/// laundered out of the region. (The unsound case is a *module* `seals (gc)`,
+/// whose strip propagates to callers with no datum check — that stays RN-E0407 via
+/// [`is_never_sealable`].) `exn`/`Insert` have no sound region form (a live `exn`
+/// is already `SealUnhandled`; sealing a discharged one hides nothing but is
+/// pointless and we reject it to keep the rule crisp).
+pub fn is_never_region_sealable(label: &Label) -> bool {
+    use crate::syntax::Label::*;
+    match label {
+        Exn(_) | Insert => true,
+        User(n) => n == "exn" || n == "insert",
+        _ => false,
+    }
+}
+
+/// The surface name of a layer rank, for diagnostics (boundary=0/services=1/app=2).
+fn layer_name(rank: u8) -> &'static str {
+    match rank {
+        0 => "boundary",
+        1 => "services",
+        2 => "app",
+        _ => "?",
+    }
 }
 
 impl CapError {
@@ -43,6 +145,9 @@ impl CapError {
         match self {
             CapError::MintOutsideBoundary { .. } => "RN-E0402",
             CapError::UnauthorizedBoundary { .. } => "RN-E0404",
+            CapError::LevelOutOfLayer { .. } => "RN-E0405",
+            CapError::LevelNotExposed { .. } => "RN-E0406",
+            CapError::NonSealableEffect { .. } => "RN-E0407",
         }
     }
 
@@ -51,6 +156,9 @@ impl CapError {
         match self {
             CapError::MintOutsideBoundary { .. } => "cap.mint-outside-boundary",
             CapError::UnauthorizedBoundary { .. } => "cap.unauthorized-boundary",
+            CapError::LevelOutOfLayer { .. } => "capability.level-out-of-layer",
+            CapError::LevelNotExposed { .. } => "capability.level-not-exposed",
+            CapError::NonSealableEffect { .. } => "capability.non-sealable-effect",
         }
     }
 
@@ -82,6 +190,58 @@ impl std::fmt::Display for CapError {
                 "module `{module}` declares `at boundary` (mint authority) but is not authorized \
                  by the project manifest — list it under `locus.toml [boundary] modules` to \
                  designate it part of the trusted base"
+            ),
+            CapError::LevelOutOfLayer {
+                name,
+                at,
+                defined_at,
+            } => match defined_at {
+                Some(d) => write!(
+                    f,
+                    "`{name}` is defined at layer {d} ({}) and is out of reach from layer {at} \
+                     ({}): a layer resolves a name only at its own layer or one below. Reach it \
+                     through a sealed service that exposes a capability for it, not by naming the \
+                     raw binding.",
+                    layer_name(*d),
+                    layer_name(*at),
+                ),
+                None => write!(
+                    f,
+                    "`{name}` is out of reach from layer {at} ({}): a layer resolves a name only \
+                     at its own layer or one below. Reach it through a sealed service that exposes \
+                     a capability for it, not by naming the raw binding.",
+                    layer_name(*at),
+                ),
+            },
+            CapError::LevelNotExposed {
+                name,
+                at,
+                defined_at,
+            } => write!(
+                f,
+                "`{name}` is defined at layer {defined_at} ({}) — within reach of layer {at} \
+                 ({}) — but is **private**: its module does not list it in `exposing (…)`. A \
+                 cross-module reference resolves only an exposed name; expose it from its module, \
+                 or reach it through a capability the module does expose.",
+                layer_name(*defined_at),
+                layer_name(*at),
+            ),
+            CapError::NonSealableEffect { module: None, label } => write!(
+                f,
+                "`{label}` may not be sealed: `gc`, `exn`, and `Insert` are the caller's \
+                 consent / fault / generativity signals — no handler discharges allocation, and a \
+                 sealed-undischarged `exn` would hide a fault rather than encapsulate a serviced \
+                 power. Remove it from the `seal`."
+            ),
+            CapError::NonSealableEffect {
+                module: Some(m),
+                label,
+            } => write!(
+                f,
+                "module `{m}` seals `{label}`, which may never be sealed: `gc`, `exn`, and \
+                 `Insert` are the caller's consent / fault / generativity signals — no handler \
+                 discharges allocation, and a sealed-undischarged `exn` would hide a fault rather \
+                 than encapsulate a serviced power. Drop it from the module's `seals (…)` clause."
             ),
         }
     }
@@ -227,6 +387,25 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_extern_cannot_smuggle_past_the_gate() {
+        // The mint-gate floor invariant (the one the safety review would not sign
+        // off without): `first_mint` recurses into staging bodies, so an `extern`
+        // hidden inside a `quote` in app code is still a mint and is rejected. There
+        // is no combinator that synthesizes an `Extern` node from non-`extern`
+        // source, so scanning source pre-stage is sufficient.
+        let err = gate(
+            r#"let sneaky = quote(extern "CredReadW" : Int -> Int) in 0"#,
+            &[],
+        )
+        .expect_err("a staged/quoted extern in app code is still a mint");
+        assert_eq!(err.code(), "RN-E0402");
+        assert!(matches!(
+            err,
+            CapError::MintOutsideBoundary { module: None, .. }
+        ));
+    }
+
+    #[test]
     fn an_extern_in_a_non_boundary_module_is_rejected() {
         let err = gate(
             r#"module Sneaky at services = let h = extern "WriteFile" : Ptr -> I32 in () 0"#,
@@ -309,13 +488,22 @@ mod tests {
             .spawn(move || {
                 let (term, user_mods) =
                     crate::stdlib::program_with_modules(&src).expect("test source parses");
-                let tree = crate::sema::elaborate(
+                // Elaboration may itself reject a leak: the module-seal STRIP (D2)
+                // wraps the grafted module in a `Term::Seal`, whose post-zonk
+                // no-escape obligation (`check_seal_obligations`) catches a sealed
+                // label escaping through the *result type* — also RN-E0403. Surface
+                // that as the seal-check result rather than panicking, so a leak
+                // caught at elaboration and a leak caught by the export-edge
+                // `check_module_seals` are both observable as RN-E0403.
+                let tree = match crate::sema::elaborate(
                     &crate::prelude::sig(),
                     &crate::check::Ctx::new(),
                     0,
                     &term,
-                )
-                .expect("test source elaborates");
+                ) {
+                    Ok(tree) => tree,
+                    Err(e) => return Err(e),
+                };
                 let mut all = crate::stdlib::stdlib_module_decls();
                 all.extend(user_mods);
                 check_module_seals(&all, &tree)
@@ -391,18 +579,26 @@ mod tests {
 
     #[test]
     fn a_raw_asm_wrapper_cannot_be_laundered_through_a_seal() {
-        // A boundary module mints `asm` (its job) and tries to EXPOSE a wrapper that
-        // still carries `{asm}` while sealing it. The seal is a *leak check*, not a
-        // strip: a pure `rotl : Int -> Int -> Int ! {asm}` arrow cannot be hidden
-        // this way (RN-E0403). To expose asm to the app you must discharge it behind
-        // an effect (the Console/winapi pattern), so the exported binding carries the
-        // service effect, never the raw boundary label. This is the design, not a
-        // gap — it is why the journal's first A3 sketch (`seals (asm) exposing
-        // (rotl)` over a raw wrapper) is intentionally rejected.
+        // A boundary module mints `asm` (its job) and EXPOSES the raw `rotl` one
+        // layer down to a services module; that service tries to re-export a
+        // wrapper that still carries `{asm}` while sealing it. The seal is a *leak
+        // check*, not a strip: a pure `rotl_svc : Int -> Int -> Int ! {asm}` arrow
+        // cannot be hidden this way (RN-E0403). To expose asm to the app you must
+        // discharge it behind an effect (the Console/winapi pattern), so the
+        // exported binding carries the service effect, never the raw boundary
+        // label. This is the design, not a gap — it is why the journal's first A3
+        // sketch (`seals (asm) exposing (rotl)` over a raw wrapper) is rejected.
+        //
+        // Structured to PASS the level check (D1, RN-E0405) so the seal-leak
+        // check (RN-E0403) is what fires: `rotl` is boundary-exposed → visible to
+        // the one-down `Asm` service, whose `rotl_svc` is visible to the app
+        // entry. The leak is the *type-level* `{asm}` escape, not a visibility one.
         let err = seals_check(
-            r#"module Bits at boundary mints (asm) seals (asm) =
+            r#"module Bits at boundary mints (asm) exposing (rotl) =
                  let rotl = extern asm "locus_asm_rotl64" : Int -> Int -> Int in ()
-               rotl 1 4"#,
+               module Asm at services seals (asm) exposing (rotl_svc) =
+                 let rotl_svc = fn a: Int => fn b: Int => rotl a b in ()
+               rotl_svc 1 4"#,
         )
         .expect_err("a raw asm wrapper carries {asm} and cannot be sealed away");
         assert_eq!(err.code(), "RN-E0403");
@@ -410,7 +606,7 @@ mod tests {
             err,
             TypeErr::ModuleSealLeak {
                 ref module, label: crate::syntax::Label::World(ref n), ..
-            } if module == "Bits" && n == "asm"
+            } if module == "Asm" && n == "asm"
         ));
     }
 
@@ -454,7 +650,13 @@ mod tests {
     #[test]
     fn a_module_seal_catches_a_label_hidden_in_a_tuple() {
         // Deep escape through DATA: the sealed label sits inside a tuple element's
-        // function type. seal_escape recurses structurally, so this is caught too.
+        // function type. seal_escape recurses structurally, so this is caught — now
+        // by the module-seal STRIP itself (Sprint 3): the entry `leak 1` returns
+        // the mem-carrying tuple as the *program result*, so the `Term::Seal(mem)`
+        // wrapping the grafted module fires its post-zonk no-escape obligation
+        // (`SealLeak`) at elaboration. Same law (RN-E0403, the sealed power may not
+        // escape through a value), caught one phase earlier than the export-edge
+        // `ModuleSealLeak` — both are the seal refusing to launder `mem`.
         let err = seals_check(
             "module Bad at app seals (mem) = \
                let leak = fn x: Int => (fn y: Int => poke8 x y, 0) in () \
@@ -462,12 +664,15 @@ mod tests {
         )
         .expect_err("a sealed label hidden in a tuple leaks");
         assert_eq!(err.code(), "RN-E0403");
-        assert!(matches!(
-            err,
-            TypeErr::ModuleSealLeak {
-                ref module, ref binding, label: crate::syntax::Label::World(ref n), ..
-            } if module == "Bad" && binding == "leak" && n == "mem"
-        ));
+        assert!(
+            matches!(
+                err,
+                TypeErr::SealLeak { label: crate::syntax::Label::World(ref n), .. }
+                    | TypeErr::ModuleSealLeak { label: crate::syntax::Label::World(ref n), .. }
+                if n == "mem"
+            ),
+            "the seal must refuse to launder mem through the tuple: {err:?}"
+        );
     }
 
     #[test]

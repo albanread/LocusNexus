@@ -1,6 +1,9 @@
-module AgentRt at boundary mints (agent) exposing () =
--- Private runtime edge for the MCP/agent text channel. The public Agent service
--- copies the response bytes into a managed String through StringRt.
+module AgentRt at boundary mints (agent) exposing
+  (locus_agent_ask_utf8, locus_agent_response_len, locus_agent_tell_text) =
+-- LAYER 0 runtime edge for the MCP/agent text channel. Exposed to the layer-1
+-- `Agent` service only (which seals `{agent}` and copies the response bytes into
+-- a managed String through StringRt). `mints (agent)` is the raw power; these
+-- bridges are the agent host channel, not a memory/FFI surface.
 
 let locus_agent_ask_utf8 = extern "locus_agent_ask_utf8" : String -> Ptr in
 let locus_agent_response_len = extern "locus_agent_response_len" : Unit -> Int in

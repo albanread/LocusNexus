@@ -199,6 +199,18 @@ pub enum TypeErr {
     SealUnhandled {
         label: Label,
     },
+    /// **Seal of a never-sealable effect (`RN-E0407 cap.non-sealable-effect`).** A
+    /// `seal L { e }` (or a module `seals (L)`) named `gc`, `exn`, or the
+    /// generative `Insert` — the caller's consent / fault / generativity signals.
+    /// No handler discharges allocation, and a sealed-undischarged `exn` would
+    /// *hide a fault* rather than encapsulate a serviced power, so removing one is
+    /// never sound (the **inverted denylist**, `level-enforcement.md` §2.3 /
+    /// `sealing-semantics.md` §8.3 — `is_native` previously *silently allowed* it).
+    /// Distinct from [`SealUnhandled`]: that fires when a *sealable* user effect is
+    /// still live; this fires on a label that may not be sealed *at all*.
+    SealNonSealable {
+        label: Label,
+    },
     /// **Module seal leak (`RN-E0403 cap.seal-leak`).** A module's `seals (L)`
     /// clause is violated: an **exported** binding's type carries the sealed label
     /// `L` — the kernel/service export boundary leaks the raw power it was meant to
@@ -428,6 +440,7 @@ impl TypeErr {
             TypeErr::WideTypeVariable { .. } => "WideTypeVariable",
             TypeErr::SealLeak { .. } => "SealLeak",
             TypeErr::SealUnhandled { .. } => "SealUnhandled",
+            TypeErr::SealNonSealable { .. } => "SealNonSealable",
             TypeErr::ModuleSealLeak { .. } => "ModuleSealLeak",
             TypeErr::DuplicateTypeParam { .. } => "DuplicateTypeParam",
             TypeErr::DuplicateConstructor { .. } => "DuplicateConstructor",
@@ -478,6 +491,7 @@ impl TypeErr {
             TypeErr::SealLeak { .. }
             | TypeErr::SealUnhandled { .. }
             | TypeErr::ModuleSealLeak { .. } => "RN-E0403",
+            TypeErr::SealNonSealable { .. } => "RN-E0407",
             TypeErr::DuplicateTypeParam { .. } | TypeErr::DuplicateConstructor { .. } => "RN-E0229",
             TypeErr::AsmGcType { .. } => "RN-E0405",
             // Canonical numbering (mutability.md §8): RN-E0241 `mut.escapes` is
@@ -545,6 +559,7 @@ impl TypeErr {
             TypeErr::SealLeak { .. }
             | TypeErr::SealUnhandled { .. }
             | TypeErr::ModuleSealLeak { .. } => "cap.seal-leak",
+            TypeErr::SealNonSealable { .. } => "cap.non-sealable-effect",
             TypeErr::DuplicateTypeParam { .. } | TypeErr::DuplicateConstructor { .. } => {
                 "type.malformed-decl"
             }
@@ -596,6 +611,9 @@ impl TypeErr {
             | TypeErr::SealUnhandled { .. }
             | TypeErr::ModuleSealLeak { .. } => {
                 "calculus §5 (SEAL) / capabilities (sealing rule 2)"
+            }
+            TypeErr::SealNonSealable { .. } => {
+                "level-enforcement §2.3 (inverted denylist) / sealing-semantics §8.3"
             }
             TypeErr::DuplicateTypeParam { .. } | TypeErr::DuplicateConstructor { .. } => {
                 "data types (type-declaration well-formedness)"
@@ -678,7 +696,13 @@ impl TypeErr {
             TypeErr::SealUnhandled { label } => Some(format!(
                 "`{label}` is a user effect / exception that escapes to the caller unless \
                  handled — `handle` it inside the region, or only seal runtime powers \
-                 (`gc`, `mem`, `winapi`) that discharge at the boundary"
+                 (`mem`, `winapi`) that discharge at the boundary"
+            )),
+            TypeErr::SealNonSealable { label } => Some(format!(
+                "`{label}` may never be sealed: `gc`, `exn`, and `Insert` are the caller's \
+                 consent / fault / generativity signals. No handler discharges allocation, and a \
+                 sealed-undischarged `exn` would hide a fault — remove `{label}` from the seal and \
+                 seal only the native powers (`winapi`/`mem`/…) you actually discharge"
             )),
             TypeErr::ModuleSealLeak {
                 module,
@@ -953,6 +977,12 @@ impl std::fmt::Display for TypeErr {
                 f,
                 "cannot seal `{label}`: it is still performed unhandled in the region, so \
                  removing it would hide an effect that escapes at runtime"
+            ),
+            TypeErr::SealNonSealable { label } => write!(
+                f,
+                "cannot seal `{label}`: `gc`, `exn`, and `Insert` are never-sealable — they \
+                 are the caller's consent / fault / generativity signals, so removing one would \
+                 hide a fault or break let-insertion, not encapsulate a serviced power"
             ),
             TypeErr::ModuleSealLeak {
                 module,
@@ -1835,6 +1865,11 @@ mod tests {
                 "cap.seal-leak",
             ),
             (
+                TypeErr::SealNonSealable { label: Label::Gc },
+                "RN-E0407",
+                "cap.non-sealable-effect",
+            ),
+            (
                 TypeErr::DuplicateTypeParam {
                     ty: "T".into(),
                     param: "a".into(),
@@ -2130,6 +2165,45 @@ mod tests {
         let (ty, row) = infer_src("seal mem { let buf = 1024 in poke8 buf 65 }")
             .expect("sealing a native power is sound");
         assert_eq!(ty, Type::Unit);
+        assert_eq!(row, Row::pure());
+    }
+
+    // ── the inverted denylist for the REGION seal (Sprint 3, RN-E0407) ──
+    //
+    // `gc` stays sealable as a region (`nogc` / `seal gc` is the sound runST
+    // discipline, tested above). `exn` and `Insert` are never region-sealable —
+    // they would hide a fault / break let-insertion. (The *module* `seals (gc)` is
+    // the rejected gc case, in `stdlib::tests`.)
+
+    #[test]
+    fn cannot_region_seal_exn() {
+        // `seal exn { … }` is RN-E0407 — a sealed-undischarged exception hides a
+        // fault. (Distinct from SealUnhandled: this rejects the label itself, not a
+        // live residue.)
+        let err = infer_src("seal exn { let x = 1 in x }")
+            .expect_err("exn may never be region-sealed");
+        assert_eq!(err.code(), "RN-E0407");
+        assert!(matches!(err, TypeErr::SealNonSealable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn cannot_region_seal_insert() {
+        // `seal insert { … }` is RN-E0407 — `Insert` is the generative
+        // let-insertion signal and may not be sealed away.
+        let err = infer_src("seal insert { let x = 1 in x }")
+            .expect_err("insert may never be region-sealed");
+        assert_eq!(err.code(), "RN-E0407");
+        assert!(matches!(err, TypeErr::SealNonSealable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn region_seal_gc_is_still_allowed() {
+        // `gc` is NOT region-denylisted — `nogc`/`seal gc` remains the sound runST
+        // region (it strips gc AND enforces the gc-datum no-escape). A scalar
+        // result seals gc out cleanly.
+        let (ty, row) = infer_src("seal gc { let a = [1] in len a }")
+            .expect("a region seal of gc (nogc) is the sound runST discipline");
+        assert_eq!(ty, Type::Int);
         assert_eq!(row, Row::pure());
     }
 

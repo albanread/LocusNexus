@@ -31,10 +31,11 @@
 //! from the library is returned untouched, so dumps stay clean and codegen emits no
 //! dead stdlib code.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use crate::capability::CapError;
 use crate::parse::{parse_module, ParseErr};
-use crate::syntax::{BlockItem, ModuleDecl, Term};
+use crate::syntax::{BlockItem, Label, ModuleDecl, Term};
 
 pub type ModuleSource = (u8, &'static str, &'static str);
 
@@ -49,7 +50,11 @@ const WINDOWS_MODULES: &[ModuleSource] = &[
     (0, "stringrt", include_str!("stdlib/stringrt.locus")),
     (0, "arrayrt", include_str!("stdlib/arrayrt.locus")),
     (0, "agentrt", include_str!("stdlib/agentrt.locus")),
+    (0, "ide_graphics", include_str!("stdlib/ide_graphics.locus")), // IDE-world graphics boundary
+    (0, "ide_event", include_str!("stdlib/ide_event.locus")),       // IDE-world event boundary
     (1, "console", include_str!("stdlib/console.locus")), // console services over winapi
+    (1, "graphics", include_str!("stdlib/graphics.locus")), // IDE-world graphics service (seals igui mint)
+    (1, "event", include_str!("stdlib/event.locus")),       // IDE-world event service (decoded sum)
     (1, "docsfs", include_str!("stdlib/docsfs.locus")),   // Documents-only FS service
     (1, "locusenv", include_str!("stdlib/locusenv.locus")), // read-only LOCUS_* env service
     (1, "time", include_str!("stdlib/time.locus")),       // monotonic timing service
@@ -215,23 +220,74 @@ pub fn program_with_stdlib(
         }
     }
 
+    // D1 — symbol-visibility enforcement (level-enforcement.md §1, Sprint 2).
+    // BEFORE the graft (which is unchanged), statically reject any cross-layer
+    // reference that would let a use site name a binding it must not reach: a
+    // module resolves a name only at its own layer or one below, and only if that
+    // binding is exposed. This is what confines raw powers — it closes the
+    // escalation where app code named `win_cred_read` directly. A violation is a
+    // compile error (RN-E0405), threaded out through the `ParseErr` channel the
+    // driver already surfaces (no panic, nonzero exit).
+    if let Err(level_err) = check_levels(&parsed_modules, &included, &prog.modules, &prog.entry) {
+        return Err(ParseErr {
+            msg: format!("[{}] {level_err}", level_err.code()),
+            span: None,
+        });
+    }
+
+    // D2 — the never-sealable denylist (level-enforcement.md §2.3, Sprint 3).
+    // Reject `seals (gc)` / `seals (exn)` / `seals (insert)` in ANY user module
+    // BEFORE the graft wraps a `Term::Seal` around the module — a hard RN-E0407, so
+    // the strip below only ever wraps *strippable* labels. (The bundled stdlib seals
+    // only native `World` powers, so it is denylist-clean by construction; we check
+    // the user modules, where an author could otherwise hide a fault.)
+    if let Err(seal_err) = check_seals_denylist(&prog.modules) {
+        return Err(ParseErr {
+            msg: format!("[{}] {seal_err}", seal_err.code()),
+            span: None,
+        });
+    }
+
     // Graft, innermost-out: the entry, wrapped by the user modules (last-declared
     // innermost, so a later user module's bindings are in scope for the entry and
     // an earlier one's are in scope for the later — user-land layering by
     // declaration order), then by the stdlib (services first, the boundary
-    // `winapi`/`crt` outermost — closest to the world, in scope for everyone).
+    // `winapi`/`crt` outermost — closest to the world, in scope for everyone). Each
+    // module's `seals` STRIP (subtract-only, D2) — `graft_in` wraps the grafted
+    // contribution in a `Term::Seal` per sealed label, so the stripped row
+    // propagates outward to every caller and the program entry.
     let user_modules = prog.modules.clone();
     let mut result = prog.entry;
     for m in prog.modules.into_iter().rev() {
-        result = graft_in(m.body, result, Some(&m.name));
+        let depth = m.layer.rank();
+        result = graft_in(m.body, result, Some(&m.name), depth, &m.seals);
     }
     let mut order: Vec<usize> = (0..modules.len()).filter(|&i| included[i]).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(modules[i].0));
     for i in order {
         let decl = parsed_modules[i].1.clone();
-        result = graft_in(decl.body, result, Some(&decl.name));
+        let depth = decl.layer.rank();
+        result = graft_in(decl.body, result, Some(&decl.name), depth, &decl.seals);
     }
     Ok((result, user_modules))
+}
+
+/// D2 denylist (level-enforcement.md §2.3 / sealing-semantics.md §8.3): no module
+/// may `seals (gc)` / `seals (exn)` / `seals (insert)` — the caller's consent /
+/// fault / generativity signals. Returns the first offending module's seal as
+/// `RN-E0407`. (`st` and native `World` powers are sealable and pass.)
+fn check_seals_denylist(user_modules: &[ModuleDecl]) -> Result<(), CapError> {
+    for m in user_modules {
+        for label in &m.seals {
+            if crate::capability::is_never_sealable(label) {
+                return Err(CapError::NonSealableEffect {
+                    module: Some(m.name.clone()),
+                    label: format!("{label}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn exposed_names(m: &ModuleDecl) -> HashSet<String> {
@@ -345,6 +401,7 @@ fn first_mint_item(item: &BlockItem) -> Option<String> {
         | BlockItem::LetMut(_, e)
         | BlockItem::LetTuple(_, e) => first_mint(e),
         BlockItem::Instance { methods, .. } => methods.iter().find_map(|m| first_mint(&m.body)),
+        BlockItem::Scope { items, .. } => items.iter().find_map(first_mint_item),
         BlockItem::Effect { .. } | BlockItem::TypeDef { .. } | BlockItem::Trait { .. } => None,
     }
 }
@@ -412,6 +469,36 @@ fn code_only(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
+/// The binder names a single block item introduces (recursing through the
+/// transparent [`BlockItem::Scope`] graft markers).
+fn collect_block_item_names(item: &BlockItem, names: &mut HashSet<String>) {
+    match item {
+        BlockItem::Let(n, _) | BlockItem::LetRec(n, _, _) | BlockItem::LetMut(n, _) => {
+            names.insert(n.clone());
+        }
+        BlockItem::LetTuple(tuple_names, _) => {
+            names.extend(tuple_names.iter().cloned());
+        }
+        BlockItem::TypeDef { name, variants, .. } => {
+            names.insert(name.clone());
+            for (ctor, _) in variants {
+                names.insert(ctor.clone());
+            }
+        }
+        BlockItem::Trait { methods, .. } => {
+            for m in methods {
+                names.insert(m.name.clone());
+            }
+        }
+        BlockItem::Scope { items, .. } => {
+            for it in items {
+                collect_block_item_names(it, names);
+            }
+        }
+        BlockItem::Effect { .. } | BlockItem::Instance { .. } => {}
+    }
+}
+
 /// The top-level names a module binds — `let`/`let rec` bindings, and `type`
 /// declarations (the type name *and* each constructor). Used both as the
 /// inclusion trigger and (implicitly) to document the module's surface.
@@ -426,28 +513,7 @@ pub(crate) fn bound_names(t: &Term) -> HashSet<String> {
             }
             Term::Block(items, body) => {
                 for item in items {
-                    match item {
-                        BlockItem::Let(n, _)
-                        | BlockItem::LetRec(n, _, _)
-                        | BlockItem::LetMut(n, _) => {
-                            names.insert(n.clone());
-                        }
-                        BlockItem::LetTuple(tuple_names, _) => {
-                            names.extend(tuple_names.iter().cloned());
-                        }
-                        BlockItem::TypeDef { name, variants, .. } => {
-                            names.insert(name.clone());
-                            for (ctor, _) in variants {
-                                names.insert(ctor.clone());
-                            }
-                        }
-                        BlockItem::Trait { methods, .. } => {
-                            for m in methods {
-                                names.insert(m.name.clone());
-                            }
-                        }
-                        BlockItem::Effect { .. } | BlockItem::Instance { .. } => {}
-                    }
+                    collect_block_item_names(item, &mut names);
                 }
                 cur = body;
             }
@@ -494,6 +560,418 @@ pub(crate) fn bound_names(t: &Term) -> HashSet<String> {
     names
 }
 
+/// The **free variables** of `t`: every name used as a [`Term::Var`] (or as the
+/// target of a [`Term::Assign`]) that is **not bound within `t`**. Binders are
+/// removed from scope correctly — a `let`/`let rec`/`let mut` binds its name in
+/// the body (and, for `let rec`, in its own bound expression), a `λ` binds its
+/// parameter in the body, a `match` arm's pattern binds its fields in the arm
+/// body, a `handle` clause binds its `arg`/`resume` (and the return clause its
+/// `var`), a `loop` binds its accumulator names across `cond`/`steps`/`result`,
+/// and a `Block`'s items bind their names for the *subsequent* items and the
+/// body (a `TypeDef` binds its type name + constructors, a `Trait` its method
+/// names, a `Scope` recurses with the same block discipline).
+///
+/// This is the engine of the level-visibility check
+/// ([`docs/design/level-enforcement.md`] §1, Sprint 2): a module's `free_vars`
+/// are exactly the names it *reaches out* for, which must resolve at the module's
+/// own layer or one below (and be exposed).
+pub(crate) fn free_vars(t: &Term) -> HashSet<String> {
+    let mut acc = HashSet::new();
+    free_vars_into(t, &mut acc);
+    acc
+}
+
+/// Accumulate the free variables of `t` into `acc`. A small local recursion: a
+/// binder is handled by recursing into the sub-term and then **removing** the
+/// names it binds (set difference), which is correct because a name free in the
+/// body but bound by the construct is not free in the whole.
+fn free_vars_into(t: &Term, acc: &mut HashSet<String>) {
+    use Term::*;
+    // Recurse into `inner`, then drop `bound` — the binder's names are not free
+    // in the construct even if they appear free in `inner`.
+    let bound_in = |inner: &Term, bound: &[&str], acc: &mut HashSet<String>| {
+        let mut sub = HashSet::new();
+        free_vars_into(inner, &mut sub);
+        for b in bound {
+            sub.remove(*b);
+        }
+        acc.extend(sub);
+    };
+    match t {
+        Var(n) => {
+            acc.insert(n.clone());
+        }
+        // An `x := v` USES `x` (its target) and the value `v`. `x` is a Var-like
+        // reference (a `let mut` cell in scope) — treat it as free here so the
+        // check sees the dependency; `v` recurses normally.
+        Assign(n, v) => {
+            acc.insert(n.clone());
+            free_vars_into(v, acc);
+        }
+        Int(_) | Float(_) | Bool(_) | Unit | Brk | Str(_) => {}
+        // `extern` / `extern asm` name foreign symbols, not Locus variables.
+        Extern(..) | ExternAsm(..) => {}
+        // λx[:A]. e — `x` is bound in the body.
+        Lam(param, _, body) => bound_in(body, &[param.as_str()], acc),
+        // let x = e1 in e2 — `x` scopes `e2` only (not its own `e1`).
+        Let(n, e1, e2) => {
+            free_vars_into(e1, acc);
+            bound_in(e2, &[n.as_str()], acc);
+        }
+        // let mut x = e1 in e2 — like `let`: `x` scopes the body only.
+        LetMut(n, e1, e2) => {
+            free_vars_into(e1, acc);
+            bound_in(e2, &[n.as_str()], acc);
+        }
+        // let rec f = e1 in e2 — `f` scopes BOTH its own `e1` and the body `e2`.
+        LetRec(n, _, e1, e2) => {
+            bound_in(e1, &[n.as_str()], acc);
+            bound_in(e2, &[n.as_str()], acc);
+        }
+        // let (x1, …, xn) = e in body — the tuple names scope the body only.
+        LetTuple(names, e, body) => {
+            free_vars_into(e, acc);
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            bound_in(body, &refs, acc);
+        }
+        // A flattened declaration sequence: each item's binders scope the
+        // *subsequent* items and the body. Handled by the block walker.
+        Block(items, body) => free_vars_block(items, body, acc),
+        Bin(_, a, b) | Dot(a, b) | App(a, b) | Index(a, b) => {
+            free_vars_into(a, acc);
+            free_vars_into(b, acc);
+        }
+        If(a, b, c) | IndexSet(a, b, c) | Fma(a, b, c) | Select(a, b, c) => {
+            free_vars_into(a, acc);
+            free_vars_into(b, acc);
+            free_vars_into(c, acc);
+        }
+        Cast(_, a)
+        | Sqrt(a)
+        | Sum(a)
+        | Length(a)
+        | MaskReduce(_, a)
+        | Len(a)
+        | Perform(_, a)
+        | Quote(a)
+        | Splice(a)
+        | Genlet(a)
+        | Letloc(a)
+        | Seal(_, a)
+        | RefNew(a)
+        | Deref(a)
+        | VectorSplat(_, a)
+        | Field(a, _) => free_vars_into(a, acc),
+        Loop {
+            vars,
+            cond,
+            steps,
+            result,
+        } => {
+            // Each accumulator's INIT is evaluated outside the loop scope, so its
+            // free vars are free in the loop. The loop var NAMES then scope
+            // `cond`, every `step`, and `result`.
+            for (_, init) in vars {
+                free_vars_into(init, acc);
+            }
+            let names: Vec<&str> = vars.iter().map(|(n, _)| n.as_str()).collect();
+            bound_in(cond, &names, acc);
+            for step in steps {
+                bound_in(step, &names, acc);
+            }
+            bound_in(result, &names, acc);
+        }
+        Tuple(es) | ArrayLit(es) | Construct(_, es) | VectorLit(_, es) => {
+            for e in es {
+                free_vars_into(e, acc);
+            }
+        }
+        VectorLoad { arr, idx, .. } => {
+            free_vars_into(arr, acc);
+            free_vars_into(idx, acc);
+        }
+        VectorStore {
+            arr, idx, value, ..
+        } => {
+            free_vars_into(arr, acc);
+            free_vars_into(idx, acc);
+            free_vars_into(value, acc);
+        }
+        Record(fields) => {
+            for (_, e) in fields {
+                free_vars_into(e, acc);
+            }
+        }
+        // Raw memory primitives — the address/value/count sub-terms recurse.
+        Peek(_, a) => free_vars_into(a, acc),
+        Poke(_, a, b) => {
+            free_vars_into(a, acc);
+            free_vars_into(b, acc);
+        }
+        Fill(a, b, c) | Copy(a, b, c) => {
+            free_vars_into(a, acc);
+            free_vars_into(b, acc);
+            free_vars_into(c, acc);
+        }
+        // An `effect` declaration binds no Var-referenced name; thread the body.
+        Effect { body, .. } => free_vars_into(body, acc),
+        // `type Name[..] = C1 | … in body` — the type name and constructors are
+        // binders that scope the body.
+        TypeDef {
+            name,
+            variants,
+            body,
+            ..
+        } => {
+            let mut bound: Vec<&str> = vec![name.as_str()];
+            bound.extend(variants.iter().map(|(c, _)| c.as_str()));
+            bound_in(body, &bound, acc);
+        }
+        // `trait Name a { m1 ; … } in body` — the method names are binders
+        // (minted as generic functions) that scope the body.
+        Trait { methods, body, .. } => {
+            let bound: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
+            bound_in(body, &bound, acc);
+        }
+        // `instance … { m = e ; … } in body` — recurse method bodies (they may
+        // reference free names) and the body. An instance binds nothing.
+        Instance { methods, body, .. } => {
+            for m in methods {
+                free_vars_into(&m.body, acc);
+            }
+            free_vars_into(body, acc);
+        }
+        Handle(scrutinee, h) => {
+            free_vars_into(scrutinee, acc);
+            // Each op clause binds `arg` and `resume` in its body.
+            for clause in &h.ops {
+                bound_in(&clause.body, &[clause.arg.as_str(), clause.resume.as_str()], acc);
+            }
+            // The return clause binds `var` in its body.
+            bound_in(&h.ret.body, &[h.ret.var.as_str()], acc);
+        }
+        Match { scrutinee, arms } => {
+            free_vars_into(scrutinee, acc);
+            for arm in arms {
+                match &arm.pat {
+                    crate::syntax::Pattern::Ctor(_, fields) => {
+                        let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                        bound_in(&arm.body, &refs, acc);
+                    }
+                    crate::syntax::Pattern::Wild => free_vars_into(&arm.body, acc),
+                }
+            }
+        }
+    }
+}
+
+/// Free variables of a [`Term::Block`]: walk the items front-to-back, tracking
+/// the names bound so far. Each item's binders scope the *subsequent* items and
+/// the trailing body; an item's *bound expression* sees only the names bound by
+/// **earlier** items (a `let rec`/`Scope` additionally sees its own name(s)).
+fn free_vars_block(items: &[crate::syntax::BlockItem], body: &Term, acc: &mut HashSet<String>) {
+    use crate::syntax::BlockItem;
+    // The free vars of the whole block, computed in a local set we then prune of
+    // every name the block binds before merging into `acc`.
+    let mut sub: HashSet<String> = HashSet::new();
+    // Names bound by items processed so far — already removed from `sub`, but we
+    // also need them to prune later items' contributions.
+    let mut bound_so_far: HashSet<String> = HashSet::new();
+
+    // Add `inner`'s free vars to `sub`, minus the names already in `bound_so_far`
+    // and any `extra` (an item's own self-binders, e.g. `let rec`).
+    let add = |inner: &Term, extra: &[&str], sub: &mut HashSet<String>, bound: &HashSet<String>| {
+        let mut fv = HashSet::new();
+        free_vars_into(inner, &mut fv);
+        for b in bound {
+            fv.remove(b);
+        }
+        for e in extra {
+            fv.remove(*e);
+        }
+        sub.extend(fv);
+    };
+
+    for item in items {
+        match item {
+            BlockItem::Let(n, e) => {
+                add(e, &[], &mut sub, &bound_so_far);
+                bound_so_far.insert(n.clone());
+            }
+            BlockItem::LetMut(n, e) => {
+                add(e, &[], &mut sub, &bound_so_far);
+                bound_so_far.insert(n.clone());
+            }
+            BlockItem::LetRec(n, _, e) => {
+                // `let rec` sees its own name in its bound expression.
+                add(e, &[n.as_str()], &mut sub, &bound_so_far);
+                bound_so_far.insert(n.clone());
+            }
+            BlockItem::LetTuple(names, e) => {
+                add(e, &[], &mut sub, &bound_so_far);
+                bound_so_far.extend(names.iter().cloned());
+            }
+            BlockItem::TypeDef { name, variants, .. } => {
+                bound_so_far.insert(name.clone());
+                for (ctor, _) in variants {
+                    bound_so_far.insert(ctor.clone());
+                }
+            }
+            BlockItem::Trait { methods, .. } => {
+                for m in methods {
+                    bound_so_far.insert(m.name.clone());
+                }
+            }
+            BlockItem::Instance { methods, .. } => {
+                for m in &methods.iter().map(|m| m.body.clone()).collect::<Vec<_>>() {
+                    add(m, &[], &mut sub, &bound_so_far);
+                }
+            }
+            BlockItem::Effect { .. } => {}
+            BlockItem::Scope { items: inner, .. } => {
+                // A nested graft scope: its own items bind within it. Compute the
+                // scope's free vars (recursively block-disciplined) over a `()`
+                // tail, prune the names bound so far, and fold in. The scope's
+                // own binders also become visible to subsequent items.
+                let mut scope_fv = HashSet::new();
+                free_vars_block(inner, &Term::Unit, &mut scope_fv);
+                for b in &bound_so_far {
+                    scope_fv.remove(b);
+                }
+                sub.extend(scope_fv);
+                for it in inner {
+                    collect_block_item_names(it, &mut bound_so_far);
+                }
+            }
+        }
+    }
+    // Finally the trailing body, in scope of every binder.
+    add(body, &[], &mut sub, &bound_so_far);
+
+    acc.extend(sub);
+}
+
+/// **D1 — symbol-visibility enforcement** (`level-enforcement.md` §1, Sprint 2),
+/// run *before* the graft. Considers only the **included** stdlib/plugin modules,
+/// the user modules, and the entry. A use site at layer `D` may reference a name
+/// only when some binding of it lives at layer `D` or `D-1` **and is exposed**
+/// there; otherwise it is `RN-E0405`. Names not bound by any considered module
+/// (prelude / native / builtin like `console_writeln`'s ops, `Int`-arithmetic,
+/// `len`, …) are resolved elsewhere and skipped here.
+///
+/// **Soundness of the pre-graft check** (`level-enforcement.md` §1 SOUNDNESS
+/// NOTE): the graft inserts boundary OUTERMOST, so under the flat last-wins
+/// resolution a name collision shadows boundary with the *higher* (allowed)
+/// layer — a reference never resolves DOWN to boundary. Only a boundary-ONLY
+/// name reaches boundary, and that is exactly what this check rejects. So no
+/// collision handling is needed.
+fn check_levels(
+    parsed_modules: &[(u8, ModuleDecl, &'static str)],
+    included: &[bool],
+    user_modules: &[ModuleDecl],
+    entry: &Term,
+) -> Result<(), CapError> {
+    // bindings: name -> [(depth, exposed)] across every CONSIDERED module. A
+    // `None` exposing = expose-all (every bound name is exposed).
+    let mut bindings: HashMap<String, Vec<(u8, bool)>> = HashMap::new();
+    let mut record = |decl: &ModuleDecl| {
+        let depth = decl.layer.rank();
+        let own = bound_names(&decl.body);
+        for name in &own {
+            let exposed = match &decl.exposing {
+                None => true,
+                Some(list) => list.contains(name),
+            };
+            bindings
+                .entry(name.clone())
+                .or_default()
+                .push((depth, exposed));
+        }
+    };
+    for (i, (_, decl, _)) in parsed_modules.iter().enumerate() {
+        if included[i] {
+            record(decl);
+        }
+    }
+    for m in user_modules {
+        record(m);
+    }
+
+    // A reference at use-site depth `D` to `name` is OK iff `name` is unknown
+    // here (resolved elsewhere) OR some binding has depth ∈ {D, D-1} AND exposed.
+    // On failure, distinguish the two DISTINCT checks (Sprint 3, own code each):
+    //   * RN-E0406 NOT-EXPOSED — a binding IS within reach (`D`/`D-1`) but is
+    //     private (not in its module's `exposing`). The layer is fine; privacy is
+    //     the failure. We prefer this code when any reachable layer binds it,
+    //     because it is the more specific, actionable diagnostic (expose the name).
+    //   * RN-E0405 OUT-OF-LAYER — no reachable layer binds it at all (two-down,
+    //     e.g. an app naming a boundary `win_cred_read`, or an upward reference). A
+    //     strictly geometric failure. This is the Sprint-2 escalation code — it
+    //     must stay RN-E0405.
+    let check_ref = |name: &str, d: u8| -> Result<(), CapError> {
+        let Some(sites) = bindings.get(name) else {
+            return Ok(()); // prelude / native / builtin — not our concern
+        };
+        let in_reach = |bd: u8| bd == d || (d >= 1 && bd == d - 1);
+        if sites.iter().any(|&(bd, exposed)| exposed && in_reach(bd)) {
+            return Ok(());
+        }
+        // Reachable by layer but every such binding is private → NOT-EXPOSED.
+        if let Some(&(bd, _)) = sites.iter().find(|&&(bd, exposed)| !exposed && in_reach(bd)) {
+            return Err(CapError::LevelNotExposed {
+                name: name.to_string(),
+                at: d,
+                defined_at: bd,
+            });
+        }
+        // No reachable layer binds it → OUT-OF-LAYER. Report the nearest defining
+        // layer for the diagnostic (the smallest depth that binds it — usually the
+        // boundary it tried to reach).
+        let defined_at = sites.iter().map(|&(bd, _)| bd).min();
+        Err(CapError::LevelOutOfLayer {
+            name: name.to_string(),
+            at: d,
+            defined_at,
+        })
+    };
+
+    // Each considered module M at depth D: for every free var of its body not
+    // bound by M itself, apply the rule.
+    let check_module = |decl: &ModuleDecl| -> Result<(), CapError> {
+        let d = decl.layer.rank();
+        let own = bound_names(&decl.body);
+        let mut fvs: Vec<String> = free_vars(&decl.body)
+            .into_iter()
+            .filter(|fv| !own.contains(fv))
+            .collect();
+        fvs.sort(); // deterministic diagnostics
+        for fv in &fvs {
+            check_ref(fv, d)?;
+        }
+        Ok(())
+    };
+    for (i, (_, decl, _)) in parsed_modules.iter().enumerate() {
+        if included[i] {
+            check_module(decl)?;
+        }
+    }
+    for m in user_modules {
+        check_module(m)?;
+    }
+
+    // The ENTRY is app code (depth 2); its own bindings are in scope for itself.
+    let entry_own = bound_names(entry);
+    let mut entry_fvs: Vec<String> = free_vars(entry)
+        .into_iter()
+        .filter(|fv| !entry_own.contains(fv))
+        .collect();
+    entry_fvs.sort();
+    for fv in &entry_fvs {
+        check_ref(fv, crate::syntax::Layer::App.rank())?;
+    }
+    Ok(())
+}
+
 /// Replace a module's innermost (placeholder `()`) body with `user`, threading
 /// through `let` / `let rec` / `type` declarations **and a handler's scrutinee**
 /// — so a layer can *wrap* the app in `handle … with { … }`, not just prepend
@@ -508,17 +986,57 @@ pub(crate) fn bound_names(t: &Term) -> HashSet<String> {
 /// stdlib module's name likewise. A bare program (no modules) grafts with `None`,
 /// leaving the stamps empty so the orphan check is a no-op (nothing can be an
 /// orphan without a module structure).
-fn graft_in(module: Term, user: Term, home: Option<&str>) -> Term {
+fn graft_in(module: Term, user: Term, home: Option<&str>, depth: u8, seals: &[Label]) -> Term {
+    let grafted = graft_body(module, user, home, depth);
+    // D2 — effect ceiling, SUBTRACT-ONLY (level-enforcement.md §2, Sprint 3). A
+    // module that `seals (E)` STRIPS E from the row its callers see: the strip is
+    // a `Term::Seal` wrapping the WHOLE grafted module contribution — the let
+    // bindings AND the `handle … with { … }` tail whose op clauses union the raw
+    // boundary row (this is exactly how `winapi`/`mem` entered: `elaborate_handle`
+    // unions the handler body's row). `Term::Seal` removes the label from the
+    // OUTWARD row, so the stripped row PROPAGATES to every outer graft and to the
+    // program entry / the manifest — not a post-hoc check. `elaborate_handle`
+    // itself stays general; the strip is this module-seal property at the edge.
+    //
+    // Only *strippable* labels are wrapped here. `gc`/`exn`/`Insert` are rejected
+    // up front (RN-E0407, `check_seals_denylist`), so they never reach this point.
+    // A native `World` power (`winapi`/`mem`/…) strips cleanly (it bottoms out in a
+    // runtime call). A non-native `st`/user effect still in the body's row hits the
+    // existing `SealUnhandled` guard inside `Term::Seal` — it must be discharged,
+    // never silently stripped.
+    seals.iter().fold(grafted, |t, label| {
+        Term::Seal(label.clone(), Box::new(t))
+    })
+}
+
+/// The graft proper (unchanged Sprint-1/2 shape): replace the module's
+/// placeholder `()` body with `user`, threading the let/type chain and a
+/// handler's scrutinee, wrapping the module's items in the transparent
+/// [`BlockItem::Scope`] marker. [`graft_in`] wraps the result with the D2 seal
+/// strip.
+fn graft_body(module: Term, user: Term, home: Option<&str>, depth: u8) -> Term {
     let (items, tail) = peel_block_items(module, home);
     let body = match tail {
         Term::Handle(scrutinee, handler) => {
-            Term::Handle(Box::new(graft_in(*scrutinee, user, home)), handler)
+            Term::Handle(Box::new(graft_body(*scrutinee, user, home, depth)), handler)
         }
         _ => user, // the placeholder body (`()`)
     };
     if items.is_empty() {
         body
     } else {
+        // Wrap the module's items in a runtime-transparent `Scope` carrying its
+        // layer depth + home, so name resolution can enforce one-level-down
+        // visibility + module privacy (level-enforcement Sprint 2). A module-less
+        // graft (`home == None`) splices flat as before.
+        let items = match home {
+            Some(h) => vec![BlockItem::Scope {
+                depth,
+                home: h.to_string(),
+                items,
+            }],
+            None => items,
+        };
         Term::Block(items, Box::new(body))
     }
 }
@@ -675,6 +1193,25 @@ mod tests {
                                     v.push(m.name.clone());
                                 }
                             }
+                            BlockItem::Scope { items: inner, .. } => {
+                                for it in inner {
+                                    match it {
+                                        BlockItem::Let(n, _)
+                                        | BlockItem::LetRec(n, _, _)
+                                        | BlockItem::LetMut(n, _) => v.push(n.clone()),
+                                        BlockItem::LetTuple(names, _) => {
+                                            v.extend(names.iter().cloned())
+                                        }
+                                        BlockItem::TypeDef { name, .. } => v.push(name.clone()),
+                                        BlockItem::Trait { methods, .. } => {
+                                            for m in methods {
+                                                v.push(m.name.clone());
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             BlockItem::Effect { .. } | BlockItem::Instance { .. } => {}
                         }
                     }
@@ -698,6 +1235,9 @@ mod tests {
                 }
                 Term::Effect { body, .. } => cur = body,
                 Term::Handle(scrutinee, _) => cur = scrutinee,
+                // A module-seal STRIP (D2) wraps the grafted module in `Seal` —
+                // walk through it transparently to the bindings underneath.
+                Term::Seal(_, body) => cur = body,
                 _ => break,
             }
         }
@@ -733,21 +1273,37 @@ mod tests {
         );
     }
 
-    /// The console layer SEALS winapi: `console_writeln` performs `console`, the layer's
-    /// handler discharges it via the Win32 calls. So the whole program performs
-    /// `{winapi}` (handled by the world) and `console` is GONE from the row —
-    /// the app demanded `{console}`, never `{winapi}`.
+    /// The console layer SEALS winapi (D2 effect ceiling, Sprint 3 — SUBTRACT-ONLY).
+    /// `console_writeln` performs `console_writeln_op`; the layer's handler
+    /// discharges it via the Win32 calls, whose row is `{winapi, mem, gc}`. The
+    /// Console module `seals (winapi, mem)`, so the graft wraps a `Term::Seal`
+    /// around the whole module that STRIPS `winapi` and `mem` from the row the
+    /// caller sees. So a console app's row is just `{gc}` — `winapi`/`mem` are
+    /// GONE (the strip propagates to the program entry / the manifest), and
+    /// `console_writeln_op` is discharged. This is the WHOLE POINT: the app demands
+    /// no raw boundary power, only the ambient `gc`. (Was: this test asserted
+    /// `winapi` PRESENT — that leak is exactly what Sprint 3 closes.)
     #[test]
     fn console_layer_seals_winapi() {
         let t = ty_of(r#"console_writeln "hi""#);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
         assert!(
-            labels.iter().any(|l| l == "winapi"),
-            "winapi present (the handler): {labels:?}"
+            !labels.iter().any(|l| l == "winapi"),
+            "winapi must be STRIPPED by Console's seal, not propagate to the app: {labels:?}"
         );
         assert!(
-            !labels.iter().any(|l| l == "console"),
-            "console discharged: {labels:?}"
+            !labels.iter().any(|l| l == "mem"),
+            "mem must be STRIPPED by Console's seal: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "console_writeln_op"),
+            "the console op is discharged by the handler: {labels:?}"
+        );
+        // Subtract-only: nothing positive is minted — only `gc` (ceiling 2,
+        // unsealed) remains. The app row is honest at capability granularity.
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "the ambient gc effect (ceiling 2, not sealed) survives: {labels:?}"
         );
     }
 
@@ -861,19 +1417,23 @@ mod tests {
         let t = ty_of("let start = clock_ticks () in (elapsed_millis start) + (ticks_to_micros 0)");
         assert_eq!(t.ty, crate::syntax::Type::Int);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        // D2 (Sprint 3): Time `seals (winapi, mem)`, so the Windows boundary
+        // powers are STRIPPED from the row a timing user sees — the strip
+        // propagates outward, exactly as for Console. Was: this asserted winapi/mem
+        // PRESENT (the leak Sprint 3 closes).
         assert!(
-            labels.iter().any(|l| l == "winapi"),
-            "Windows timing bottoms out in winapi: {labels:?}"
+            !labels.iter().any(|l| l == "winapi"),
+            "Time's seal strips the Windows boundary from its callers: {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == "mem"),
-            "Windows timing uses private boundary scratch memory: {labels:?}"
+            !labels.iter().any(|l| l == "mem"),
+            "Time's seal strips the private boundary scratch memory: {labels:?}"
         );
         assert!(
             !labels
                 .iter()
-                .any(|l| l == "clock_ticks" || l == "clock_frequency"),
-            "service-level timing effects should be discharged: {labels:?}"
+                .any(|l| l == "clock_ticks_op" || l == "clock_frequency_op"),
+            "service-level timing ops should be discharged: {labels:?}"
         );
     }
 
@@ -884,19 +1444,22 @@ mod tests {
         );
         assert_eq!(t.ty, crate::syntax::Type::Int);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        // D2 (Sprint 3): the Linux Time service `seals (libc, mem)`, so both are
+        // STRIPPED from the caller's row — same subtract-only discipline as the
+        // Windows boundary. Was: this asserted libc/mem PRESENT.
         assert!(
-            labels.iter().any(|l| l == "libc"),
-            "Linux timing bottoms out in libc: {labels:?}"
+            !labels.iter().any(|l| l == "libc"),
+            "Time's seal strips the libc boundary from its callers: {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == "mem"),
-            "Linux timing uses private boundary scratch memory: {labels:?}"
+            !labels.iter().any(|l| l == "mem"),
+            "Time's seal strips the private boundary scratch memory: {labels:?}"
         );
         assert!(
             !labels
                 .iter()
-                .any(|l| l == "clock_ticks" || l == "clock_frequency"),
-            "service-level timing effects should be discharged: {labels:?}"
+                .any(|l| l == "clock_ticks_op" || l == "clock_frequency_op"),
+            "service-level timing ops should be discharged: {labels:?}"
         );
     }
 
@@ -975,6 +1538,114 @@ mod tests {
         );
     }
 
+    /// The IDE-world Graphics service grafts over its `iGui.*` boundary and
+    /// leaves `graphics` visible in the row (the boundary mint), discharging
+    /// the raw `igui_*` names. A pure-numeric draw call's row is `{graphics}`.
+    #[test]
+    fn graphics_service_grafts_and_tracks_graphics_effect() {
+        let t = ty_of("fill_circle 10.0 10.0 4.0 1.0 1.0 1.0 1.0");
+        assert_eq!(t.ty, crate::syntax::Type::Unit);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "graphics"),
+            "Graphics service must leave the IDE-world capability visible: {labels:?}"
+        );
+        // A numeric draw primitive touches no raw memory and allocates nothing.
+        assert!(
+            !labels.iter().any(|l| l == "winapi"),
+            "Graphics is the IDE boundary, not Win32: {labels:?}"
+        );
+
+        let order = chain_order(&program("clear 0.0 0.0 0.0 1.0").unwrap());
+        assert!(
+            order.iter().any(|n| n == "igui_emit_clear"),
+            "IdeGraphics boundary should be pulled in: {order:?}"
+        );
+        assert!(
+            order.iter().any(|n| n == "clear"),
+            "public Graphics service should be grafted: {order:?}"
+        );
+        // boundary grafts OUTERMOST (closest to world), like winapi.
+        let boundary = order.iter().position(|n| n == "igui_emit_clear");
+        let service = order.iter().position(|n| n == "clear");
+        assert!(
+            boundary < service,
+            "IdeGraphics boundary must wrap the public Graphics service: {order:?}"
+        );
+    }
+
+    /// The Event service decodes `iGui.NextEvent` into a sum, leaving `event`
+    /// (the boundary mint), `gc` (sum allocation), and `mem` (the scratch
+    /// out-slots) visible. A `match` over the decoded event type-checks.
+    #[test]
+    fn event_service_grafts_and_tracks_event_effect() {
+        let t = ty_of(
+            "match next_event () with \
+             | MouseDown(x, y) => x + y \
+             | Resize(w, h) => w + h \
+             | Tick => 0 \
+             | Close => 0 \
+             | _ => 0",
+        );
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "event"),
+            "Event service must leave the IDE-world input capability visible: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "decoding into the Event sum allocates: {labels:?}"
+        );
+
+        let order = chain_order(&program("poll_event 0").unwrap());
+        assert!(
+            order.iter().any(|n| n == "igui_next_event"),
+            "IdeEvent boundary should be pulled in: {order:?}"
+        );
+        assert!(
+            order.iter().any(|n| n == "poll_event"),
+            "public Event service should be grafted: {order:?}"
+        );
+    }
+
+    /// The Othello-shaped minimal interaction — open a pane, set a tick rate,
+    /// and a frame that clears + draws a rect grid + a circle, switching on a
+    /// decoded event — elaborates with BOTH `graphics` and `event` in its row.
+    /// This is the Phase-2a gate: the services carry the right effect labels.
+    #[test]
+    fn graphical_demo_elaborates_with_graphics_and_event() {
+        let src = r#"
+          let pane = open_window "demo" in
+          let _ = set_redraw_rate pane 16 in
+          let _ = gfx_begin pane in
+          let _ = clear 0.1 0.1 0.12 1.0 in
+          let _ = fill_rect 4.0 4.0 40.0 40.0 0.2 0.5 0.9 1.0 in
+          let _ = fill_circle 80.0 80.0 12.0 1.0 0.8 0.2 1.0 in
+          let _ = gfx_submit () in
+          match poll_event 16 with
+          | MouseDown(x, y) => pane
+          | Tick => pane
+          | Close => 0
+          | _ => pane
+        "#;
+        let t = ty_of(src);
+        assert_eq!(t.ty, crate::syntax::Type::Int);
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            labels.iter().any(|l| l == "graphics"),
+            "the demo draws — `graphics` must be in the manifest: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "event"),
+            "the demo reads input — `event` must be in the manifest: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "gc"),
+            "the demo allocates (the event sum, the title): {labels:?}"
+        );
+    }
+
     #[test]
     fn linux_agent_text_service_is_the_same_surface() {
         let t = linux_ty_of(r#"string_len (agent_ask_text "move?")"#);
@@ -999,13 +1670,17 @@ mod tests {
         let t = linux_ty_of(r#"docs_write_text "note.txt" "hello""#);
         assert_eq!(t.ty, crate::syntax::Type::Unit);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        // D2 (Sprint 3): DocsFs `seals (libc, mem)` — both STRIPPED from the
+        // caller's row. (The boundary IS still grafted — the chain_order check
+        // below confirms it — but its raw powers do not propagate up.) Was: this
+        // asserted libc/mem PRESENT.
         assert!(
-            labels.iter().any(|l| l == "libc"),
-            "Linux DocsFs bottoms out in libc: {labels:?}"
+            !labels.iter().any(|l| l == "libc"),
+            "DocsFs's seal strips libc from its callers: {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == "mem"),
-            "Linux DocsFs uses private boundary scratch memory: {labels:?}"
+            !labels.iter().any(|l| l == "mem"),
+            "DocsFs's seal strips the private boundary scratch memory: {labels:?}"
         );
         assert!(
             !labels
@@ -1043,13 +1718,16 @@ mod tests {
             linux_ty_of("match locus_env_get LocusHome with | None => 0 | Some(s) => string_len s");
         assert_eq!(t.ty, crate::syntax::Type::Int);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        // D2 (Sprint 3): LocusEnv `seals (libc, mem)` — libc is STRIPPED from the
+        // caller's row (the boundary getenv is still grafted, per chain_order
+        // below). Was: this asserted libc PRESENT.
         assert!(
-            labels.iter().any(|l| l == "libc"),
-            "Linux LocusEnv bottoms out in libc getenv: {labels:?}"
+            !labels.iter().any(|l| l == "libc"),
+            "LocusEnv's seal strips libc from its callers: {labels:?}"
         );
         assert!(
-            !labels.iter().any(|l| l == "locus_env_get"),
-            "LocusEnv service effect should be discharged: {labels:?}"
+            !labels.iter().any(|l| l == "locus_env_get_op"),
+            "LocusEnv service op should be discharged: {labels:?}"
         );
 
         let order = chain_order(&linux_program("locus_env_get LocusHome").unwrap());
@@ -1076,17 +1754,23 @@ mod tests {
         let t = ty_of(r#"if db_mock_connect "test.api.key" then 1 else 0"#);
         assert_eq!(t.ty, crate::syntax::Type::Int);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        // D2 (Sprint 3): the Db mock `seals (winapi, mem)`, so the raw WinAPI/mem
+        // powers it consumes internally are STRIPPED from the caller's row — the
+        // credential read happens behind the seal and is not visible as a raw power
+        // (the chain_order check below confirms CredReadW is still grafted). `gc`
+        // (ceiling 2, unsealed) survives — the service materializes a String. Was:
+        // this asserted winapi/mem PRESENT.
         assert!(
-            labels.iter().any(|l| l == "winapi"),
-            "Db mock bottoms out in visible WinAPI calls: {labels:?}"
+            !labels.iter().any(|l| l == "winapi"),
+            "Db mock's seal strips the raw WinAPI from its callers: {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == "mem"),
-            "Db mock uses private boundary scratch memory: {labels:?}"
+            !labels.iter().any(|l| l == "mem"),
+            "Db mock's seal strips the private boundary scratch memory: {labels:?}"
         );
         assert!(
             labels.iter().any(|l| l == "gc"),
-            "Db mock materializes the private credential String today: {labels:?}"
+            "Db mock materializes the private credential String today (gc, unsealed): {labels:?}"
         );
         assert!(
             !labels.iter().any(|l| l == "db_mock_connect_op"),
@@ -1604,10 +2288,13 @@ mod tests {
 
     #[test]
     fn a_user_module_pulls_in_the_stdlib_and_the_seal_holds_through_it() {
-        // A user module body naming `console_writeln` pulls in `console` — and the
-        // console module's handler wraps the user module too, so `console` is
-        // discharged into `winapi`: the seal holds *through* the user-module
-        // layer (winapi present, console gone — just like app-level code).
+        // SOUNDNESS / re-leak (Sprint 3): a user module body naming
+        // `console_writeln` pulls in `console` — and the console module's handler
+        // wraps the user module too, so the raw `{winapi, mem}` the handler unions
+        // is STRIPPED by Console's `seals (winapi, mem)` even though the use site is
+        // a *user module one layer down*. The strip holds THROUGH the user-module
+        // layer: winapi/mem absent, the console op discharged — exactly like
+        // app-level code. (Was: this asserted winapi PRESENT.)
         let t = ty_of(
             "module Greet at app = let hi = fn u: Unit => console_writeln \"hi\" in () \
              hi ()",
@@ -1615,12 +2302,16 @@ mod tests {
         assert_eq!(t.ty, crate::syntax::Type::Unit);
         let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
         assert!(
-            labels.iter().any(|l| l == "winapi"),
-            "the seal discharges console into winapi through the user module: {labels:?}"
+            !labels.iter().any(|l| l == "winapi"),
+            "the seal strips winapi even through the user module: {labels:?}"
         );
         assert!(
-            !labels.iter().any(|l| l == "console"),
-            "console is sealed even when used from a user module: {labels:?}"
+            !labels.iter().any(|l| l == "mem"),
+            "the seal strips mem even through the user module: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "console_writeln_op"),
+            "the console op is discharged even when used from a user module: {labels:?}"
         );
     }
 
@@ -1639,6 +2330,471 @@ mod tests {
             !labels.iter().any(|l| l == "winapi"),
             "crt is distinct from winapi: {labels:?}"
         );
+    }
+
+    // ── free_vars unit tests (the engine of the level check) ─────────────
+
+    fn fv(src: &str) -> std::collections::BTreeSet<String> {
+        super::free_vars(&parse(src).unwrap()).into_iter().collect()
+    }
+
+    #[test]
+    fn free_vars_a_lambda_removes_its_parameter() {
+        // `fn x => x` has NO free var (x is bound); `fn f => x` has {x} not {f}.
+        assert!(fv("fn x => x").is_empty());
+        assert_eq!(fv("fn f => x"), ["x"].map(String::from).into());
+    }
+
+    #[test]
+    fn free_vars_let_scopes_the_body_only() {
+        // `let a = b in a + c` — `a` is bound (body), `b`/`c` are free.
+        assert_eq!(fv("let a = b in a + c"), ["b", "c"].map(String::from).into());
+    }
+
+    #[test]
+    fn free_vars_let_rec_self_scopes_its_own_body() {
+        // `let rec f : Int -> Int = fn n => f g in f` — `f` is bound in BOTH its
+        // own body and the trailing expr; `g` is the only free var.
+        assert_eq!(
+            fv("let rec f : Int -> Int = fn n => f g in f"),
+            ["g"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn free_vars_match_binds_pattern_fields() {
+        // `match s with | Cons(h, t) => h e | _ => z` — `h`/`t` bound in the arm,
+        // so free = {s, e, z}; `Cons` is a constructor (a Construct, not a Var).
+        assert_eq!(
+            fv("match s with | Cons(h, t) => h e | _ => z"),
+            ["s", "e", "z"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn free_vars_loop_binds_its_accumulators() {
+        // `loop i = a while i < n do i + 1 else i` — `i` bound across cond/step/
+        // result; the INIT `a` and `n` are free.
+        assert_eq!(
+            fv("loop i = a while i < n do i + 1 else i"),
+            ["a", "n"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn free_vars_let_tuple_binds_all_names() {
+        // `let (x, y) = p in x + y + z` — x,y bound; free = {p, z}.
+        assert_eq!(
+            fv("let (x, y) = p in x + y + z"),
+            ["p", "z"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn free_vars_block_binds_left_to_right() {
+        // A let-chain (which the parser keeps nested, but the principle holds):
+        // earlier binders scope later exprs.
+        assert_eq!(
+            fv("let a = w in let b = a in a + b + v"),
+            ["w", "v"].map(String::from).into()
+        );
+    }
+
+    #[test]
+    fn free_vars_assign_target_is_free() {
+        // `let mut x = 0 in (x := y)` — `x` bound by `let mut`, `y` free; and the
+        // assign target `x` is correctly removed by the binder.
+        assert_eq!(fv("let mut x = 0 in (x := y)"), ["y"].map(String::from).into());
+        // A bare assign with no binder: both the target and value are free.
+        assert_eq!(fv("p := q"), ["p", "q"].map(String::from).into());
+    }
+
+    // ── RN-E0405 level-visibility: rejection (the whole point) ───────────
+
+    fn level_err(src: &str) -> ParseErr {
+        program(src).expect_err("a level violation must be rejected")
+    }
+
+    #[test]
+    fn the_escalation_repro_is_now_rejected() {
+        // sealing-escalation-repro.locus: an app using `console_writeln` (legit)
+        // then `win_cred_read` (a boundary-only name) must be REJECTED — this is
+        // the leak Sprint 2 closes. (It used to compile.)
+        let err = level_err(
+            r#"let _ = console_writeln "hello" in
+               let secret = win_cred_read "Git:https://github.com" in
+               0"#,
+        );
+        assert!(err.msg.contains("RN-E0405"), "{}", err.msg);
+        assert!(err.msg.contains("win_cred_read"), "{}", err.msg);
+    }
+
+    #[test]
+    fn an_app_naming_a_boundary_only_name_two_levels_down_is_rejected() {
+        // `win_write_console` is a Winapi (boundary, layer 0) binding. Naming it
+        // from the app (layer 2) is two-down → RN-E0405. We pull the boundary in
+        // via a legit console call so the name is actually in the bindings table.
+        let err = level_err(
+            r#"let _ = console_writeln "hi" in win_write_console "x""#,
+        );
+        assert!(err.msg.contains("RN-E0405"), "{}", err.msg);
+        assert!(err.msg.contains("win_write_console"), "{}", err.msg);
+    }
+
+    #[test]
+    fn a_services_module_naming_an_app_binding_upward_is_rejected() {
+        // Upward never resolves: a services module that names a binding defined in
+        // an app-layer user module is RN-E0405. `app_secret` lives at layer 2; the
+        // services module is layer 1 → it cannot see one layer UP.
+        let err = level_err(
+            "module Up at app = let app_secret = 7 in () \
+             module Svc at services = let leak = fn u: Unit => app_secret in () \
+             leak ()",
+        );
+        assert!(err.msg.contains("RN-E0405"), "{}", err.msg);
+        assert!(err.msg.contains("app_secret"), "{}", err.msg);
+    }
+
+    #[test]
+    fn an_app_naming_a_non_exposed_service_binding_is_rejected() {
+        // Privacy (NOT-EXPOSED): a services module binds `helper` but does NOT
+        // expose it; the app (one-down, so the LEVEL is fine) still cannot name it
+        // — exposed∧level is required. Sprint 3 gives this its OWN code: the layer
+        // is reachable, the privacy is the failure → **RN-E0406** (distinct from
+        // the OUT-OF-LAYER RN-E0405, where no reachable layer binds the name).
+        let err = level_err(
+            "module Svc at services exposing (pub) = \
+               let helper = 1 in let pub = fn u: Unit => helper in () \
+             helper",
+        );
+        assert!(err.msg.contains("RN-E0406"), "{}", err.msg);
+        assert!(!err.msg.contains("RN-E0405"), "must be the privacy code: {}", err.msg);
+        assert!(err.msg.contains("helper"), "{}", err.msg);
+    }
+
+    // ── DISTINCT CODES: RN-E0405 vs RN-E0406 vs RN-E0407 (Sprint 3) ──────
+    //
+    // Every distinct check carries its own code. These three are the level /
+    // sealing checks, and the test proves the codes DIFFER for three different
+    // failures from the same family.
+
+    #[test]
+    fn level_and_seal_checks_have_three_distinct_codes() {
+        // OUT-OF-LAYER (geometric: no reachable layer binds it). The escalation —
+        // an app naming a boundary `win_cred_read`, two-down.
+        let out_of_layer = level_err(
+            r#"let _ = console_writeln "hi" in win_cred_read "x""#,
+        );
+        // NOT-EXPOSED (privacy: bound one-down, reachable layer, but private).
+        let not_exposed = level_err(
+            "module Svc at services exposing (pub) = \
+               let helper = 1 in let pub = fn u: Unit => helper in () \
+             helper",
+        );
+        // NON-SEALABLE-EFFECT (a module seals `gc` — never allowed).
+        let non_sealable = level_err(
+            "module Bad at services seals (gc) = let f = fn x: Int => x in () \
+             f 1",
+        );
+
+        assert!(out_of_layer.msg.contains("RN-E0405"), "{}", out_of_layer.msg);
+        assert!(not_exposed.msg.contains("RN-E0406"), "{}", not_exposed.msg);
+        assert!(non_sealable.msg.contains("RN-E0407"), "{}", non_sealable.msg);
+
+        // The whole point: three different checks, three different codes.
+        let codes = [
+            out_of_layer.msg.contains("RN-E0405"),
+            not_exposed.msg.contains("RN-E0406"),
+            non_sealable.msg.contains("RN-E0407"),
+        ];
+        assert!(codes.iter().all(|&c| c), "each failure carries its own code");
+        // And none of them collides with another's code.
+        assert!(!out_of_layer.msg.contains("RN-E0406") && !out_of_layer.msg.contains("RN-E0407"));
+        assert!(!not_exposed.msg.contains("RN-E0405") && !not_exposed.msg.contains("RN-E0407"));
+        assert!(!non_sealable.msg.contains("RN-E0405") && !non_sealable.msg.contains("RN-E0406"));
+    }
+
+    // ── RN-E0407 the never-sealable denylist (the inverted denylist) ─────
+
+    #[test]
+    fn a_module_sealing_gc_is_rejected() {
+        // `gc` may NEVER be sealed: no handler discharges allocation, and stripping
+        // it from a caller's row would launder allocation liability. RN-E0407.
+        let err = level_err(
+            "module Bad at services seals (gc) = let f = fn x: Int => x in () \
+             f 1",
+        );
+        assert!(err.msg.contains("RN-E0407"), "{}", err.msg);
+        assert!(err.msg.contains("gc"), "{}", err.msg);
+    }
+
+    #[test]
+    fn a_module_sealing_exn_is_rejected() {
+        // `exn` may NEVER be sealed: a sealed-undischarged exception hides a fault.
+        // RN-E0407.
+        let err = level_err(
+            "module Bad at services seals (exn) = let f = fn x: Int => x in () \
+             f 1",
+        );
+        assert!(err.msg.contains("RN-E0407"), "{}", err.msg);
+        assert!(err.msg.contains("exn"), "{}", err.msg);
+    }
+
+    #[test]
+    fn a_module_sealing_insert_is_rejected() {
+        // `insert` (the generative let-insertion signal) may NEVER be sealed.
+        // RN-E0407.
+        let err = level_err(
+            "module Bad at services seals (insert) = let f = fn x: Int => x in () \
+             f 1",
+        );
+        assert!(err.msg.contains("RN-E0407"), "{}", err.msg);
+    }
+
+    #[test]
+    fn a_module_sealing_a_native_world_power_is_allowed() {
+        // The flip side: native `World` powers (`winapi`/`mem`) ARE strippable —
+        // this is the whole console pattern. A services module sealing them over a
+        // boundary-exposed wrapper compiles (and strips them from its callers).
+        let (_t, _m) = program_with_modules(
+            "module MyC at services seals (winapi, mem) = \
+               let say = fn s: String => win_write_console s in () \
+             say \"hi\"",
+        )
+        .expect("a services module may seal native World powers (winapi/mem)");
+    }
+
+    // ── SOUNDNESS / re-leak: the seal holds through traits + staging ─────
+    //
+    // §8.5 of sealing-semantics.md: the relabel/strip must flow through trait
+    // dispatch and staging, or a sealed boundary power re-leaks. Because the strip
+    // is a `Term::Seal` wrapping the WHOLE grafted Console module (and the app /
+    // user-modules / staged splices it wraps), the boundary power is unioned at the
+    // handler and stripped at the seal edge regardless of HOW the use site reaches
+    // `console_writeln`. These guard against the re-leak.
+
+    #[test]
+    fn the_seal_holds_through_a_trait_method() {
+        // A trait method whose instance body calls a sealed service: the call
+        // dispatches through a dictionary, but `winapi`/`mem` are STILL stripped
+        // from the program row (the Console seal wraps the dispatch site). The
+        // sealed boundary power never surfaces via trait dispatch.
+        let t = ty_of(
+            "trait Greeter a { greet : a -> Unit ! {| e} } in \
+             instance Greeter Int { greet = fn n: Int => console_writeln \"hi\" } in \
+             greet 5",
+        );
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            !labels.iter().any(|l| l == "winapi"),
+            "a sealed winapi must not re-leak through trait dispatch: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "mem"),
+            "a sealed mem must not re-leak through trait dispatch: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_seal_holds_through_staging() {
+        // A staged action: `quote(console_writeln …)` carries the console object
+        // effect inside its `Code[…]` type, and `splice` pulls it back to the
+        // caller's row. The seal must strip `winapi`/`mem` even across this
+        // boundary, or a staged action launders the seal (sealing-semantics §8.5).
+        // `${ e }` is splice-at-top; the spliced body is inside the Console handler
+        // + seal.
+        let t = ty_of(
+            "${ quote(console_writeln \"hi\") }",
+        );
+        let labels: Vec<String> = t.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            !labels.iter().any(|l| l == "winapi"),
+            "a sealed winapi must not re-leak through quote/splice: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "mem"),
+            "a sealed mem must not re-leak through quote/splice: {labels:?}"
+        );
+    }
+
+    // ── the REGION seal `seal gc` / `nogc` is NOT denylisted ─────────────
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn the_region_seal_gc_is_still_the_sound_runST_discipline() {
+        // The denylist is about a *module* `seals (gc)` (whose strip would launder
+        // allocation to callers). The REGION form `seal gc { e }` (≡ `nogc`) stays
+        // valid — it strips `gc` AND runs the gc-datum no-escape check, so it cannot
+        // launder. A scalar-returning region type-checks and seals gc out.
+        let j = ty_of("nogc { let a = [1] in len a }");
+        let labels: Vec<String> = j.row.labels().map(|l| format!("{l}")).collect();
+        assert!(
+            !labels.iter().any(|l| l == "gc"),
+            "nogc must still seal gc out of the row: {labels:?}"
+        );
+    }
+
+    // ── RN-E0405 level-visibility: POSITIVE guards (must still compile) ──
+
+    #[test]
+    fn a_services_module_naming_a_boundary_exposed_name_compiles() {
+        // The legitimate one-down reference: a user services module names
+        // `win_write_console`, which Winapi (boundary) now EXPOSES. It parses +
+        // grafts (the level check passes); this is exactly what Console does.
+        let (_t, _m) = program_with_modules(
+            "module MyConsole at services = \
+               let say = fn s: String => win_write_console s in () \
+             say \"hi\"",
+        )
+        .expect("a services module may name a boundary-exposed wrapper");
+    }
+
+    #[test]
+    fn an_app_using_console_writeln_compiles() {
+        // The bread-and-butter positive case — app code uses the service surface.
+        program(r#"console_writeln "hi""#).expect("console_writeln is app-visible");
+    }
+
+    #[test]
+    fn an_app_naming_a_service_exposed_binding_compiles() {
+        // App (layer 2) names a services (layer 1) EXPOSED binding — one-down,
+        // exposed: legal.
+        let (_t, _m) = program_with_modules(
+            "module Svc at services exposing (pub) = \
+               let helper = 1 in let pub = helper in () \
+             pub",
+        )
+        .expect("an app may name a service-exposed binding");
+    }
+
+    // ── H2 denylist: a boundary `exposing` list must not leak a RAW POWER ─
+
+    /// The body of the top-level `let`/`let rec` binding named `name` in a module
+    /// body, if present (walks the let-chain; ignores handler wraps).
+    fn binding_body<'a>(mut t: &'a Term, name: &str) -> Option<&'a Term> {
+        loop {
+            match t {
+                Term::Let(n, e, body) | Term::LetMut(n, e, body) => {
+                    if n == name {
+                        return Some(e);
+                    }
+                    t = body;
+                }
+                Term::LetRec(n, _, e, body) => {
+                    if n == name {
+                        return Some(e);
+                    }
+                    t = body;
+                }
+                Term::LetTuple(_, _, body)
+                | Term::TypeDef { body, .. }
+                | Term::Effect { body, .. }
+                | Term::Trait { body, .. }
+                | Term::Instance { body, .. } => t = body,
+                Term::Handle(scrutinee, _) => t = scrutinee,
+                _ => return None,
+            }
+        }
+    }
+
+    /// Is `t` a body that is a RAW MEMORY power directly — a bare `peek`/`poke`/
+    /// `fill`/`copy` at the head, the powers that must NEVER reach a service/app
+    /// even via a boundary `exposing` list. (A `fn …` wrapper that *uses* poke
+    /// internally is fine — it is the safe surface; we look only at a body that
+    /// IS the raw primitive.)
+    fn is_bare_raw_memory(t: &Term) -> bool {
+        matches!(
+            t,
+            Term::Peek(..) | Term::Poke(..) | Term::Fill(..) | Term::Copy(..)
+        )
+    }
+
+    /// Known RAW OS POWER extern symbols that must never be exposed from a
+    /// boundary — the memory/process/credential/file/console primitives whose
+    /// confinement is the whole point. A boundary may expose *safe wrappers* over
+    /// these, but not the bare `extern "Sym"` binding itself.
+    const RAW_POWER_EXTERNS: &[&str] = &[
+        // memory / process
+        "VirtualAlloc",
+        "VirtualFree",
+        "malloc",
+        // console / file handles
+        "GetStdHandle",
+        "WriteConsoleW",
+        "ReadConsoleW",
+        "CreateFileW",
+        "ReadFile",
+        "WriteFile",
+        "CloseHandle",
+        "open",
+        "read",
+        "close",
+        "lseek",
+        // credentials / environment / fs metadata
+        "CredReadW",
+        "CredFree",
+        "GetEnvironmentVariableW",
+        "getenv",
+        "GetFileAttributesW",
+        "GetFileSizeEx",
+        "access",
+    ];
+
+    /// The bare `extern "Sym"` of a body, if the body IS directly an extern (not
+    /// a wrapper that calls one).
+    fn bare_extern_symbol(t: &Term) -> Option<&str> {
+        match t {
+            Term::Extern(sym, _, _) => Some(sym.as_str()),
+            Term::ExternAsm(sym, _) => Some(sym.as_str()),
+            _ => None,
+        }
+    }
+
+    fn assert_no_raw_power_exposed(mods: &[ModuleSource], label: &str) {
+        for (_, _, src) in mods {
+            let decl = parse_module(src).expect("a bundled module parses");
+            if decl.layer != crate::syntax::Layer::Boundary {
+                continue;
+            }
+            // expose-all (`None`) over a boundary module would be a blanket leak;
+            // the migrated stdlib always uses an explicit curated list. (A bare
+            // RT-bridge boundary with `None` is allowed only if it binds no raw
+            // power; none of ours do, but we still assert per exposed name.)
+            let exposed: Vec<String> = match &decl.exposing {
+                Some(list) => list.clone(),
+                None => bound_names(&decl.body).into_iter().collect(),
+            };
+            for name in &exposed {
+                let Some(body) = binding_body(&decl.body, name) else {
+                    continue;
+                };
+                assert!(
+                    !is_bare_raw_memory(body),
+                    "[{label}] boundary `{}` exposes `{name}`, whose body is a RAW MEMORY \
+                     power (peek/poke/fill/copy) — never expose raw memory; wrap it",
+                    decl.name
+                );
+                if let Some(sym) = bare_extern_symbol(body) {
+                    assert!(
+                        !RAW_POWER_EXTERNS.contains(&sym),
+                        "[{label}] boundary `{}` exposes `{name}` = `extern {sym:?}`, a RAW OS \
+                         POWER that must stay private — expose only a sealing wrapper over it",
+                        decl.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_exposing_lists_never_leak_a_raw_power() {
+        // The security assertion (level-enforcement.md §5 H2): the migrated
+        // `exposing` lists expose curated SAFE wrappers / managed-value bridges,
+        // never a bare raw-memory primitive or a dangerous raw OS extern. If a
+        // future edit adds `win_VirtualAlloc` / `extern "CredReadW"` / a bare
+        // `poke` to a boundary `exposing`, this fails loudly.
+        assert_no_raw_power_exposed(WINDOWS_MODULES, "WINDOWS");
+        assert_no_raw_power_exposed(LINUX_MODULES, "LINUX");
     }
 
     #[test]

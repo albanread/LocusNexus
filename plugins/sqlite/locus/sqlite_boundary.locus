@@ -1,6 +1,8 @@
 module SqliteFfi at boundary mints (sqlite)
-  exposing (db_open, db_close, db_exec, db_query,
-            q_rows, q_cols, q_int, q_text, q_free, db_error) =
+  exposing (raw_open, raw_open_memory, raw_close, raw_exec, raw_query,
+            q_rows, q_cols, q_int, q_text, q_is_null, q_free, raw_error,
+            raw_prepare, b_bind_int, b_bind_text, b_bind_null,
+            st_query, st_exec, st_reset, st_finalize) =
 -- PLUGIN LAYER 0: the SQLite boundary. Raw `extern` to the `rusqlite` shim
 -- (`sqlite.*`) plus the runtime string marshalling (`locus_string_to_cstr` /
 -- `locus_cstr_free`). These resolve only inside the worker (the plugin's shim
@@ -27,23 +29,35 @@ let s_int   = extern "sqlite.Int"       : Int -> Int -> Int -> Int in
 let s_text  = extern "sqlite.Text"      : Int -> Int -> Int -> String in
 let s_free  = extern "sqlite.Free"      : Int -> Unit in
 let s_err   = extern "sqlite.LastError" : Unit -> String in
+-- in-memory open (sandboxed by an authorizer that denies ATTACH/file-PRAGMA)
+let s_open_mem = extern "sqlite.OpenMemory" : Unit -> Int in
+let s_is_null  = extern "sqlite.IsNull"     : Int -> Int -> Int -> Int in
+-- prepared statements: compile once, bind values to ?n placeholders, run
+let s_prepare   = extern "sqlite.Prepare"   : Int -> Int -> Int in
+let s_bind_int  = extern "sqlite.BindInt"   : Int -> Int -> Unit in
+let s_bind_text = extern "sqlite.BindText"  : Int -> Int -> Unit in
+let s_bind_null = extern "sqlite.BindNull"  : Int -> Unit in
+let s_st_query  = extern "sqlite.StmtQuery" : Int -> Int in
+let s_st_exec   = extern "sqlite.StmtExec"  : Int -> Int in
+let s_st_reset  = extern "sqlite.StmtReset" : Int -> Unit in
+let s_finalize  = extern "sqlite.Finalize"  : Int -> Unit in
 
 -- marshalling wrappers: the ONLY place a Locus String becomes a C string, and
 -- it is freed on the same line it is consumed.
-let db_open = fn path: String =>
+let raw_open = fn path: String =>
   let c = str_to_cstr path in
   let h = s_open c in
   let _ = cstr_free c in
   h
 in
-let db_close = fn conn: Int => s_close conn in
-let db_exec = fn conn: Int => fn sql: String =>
+let raw_close = fn conn: Int => s_close conn in
+let raw_exec = fn conn: Int => fn sql: String =>
   let c = str_to_cstr sql in
   let n = s_exec conn c in
   let _ = cstr_free c in
   n
 in
-let db_query = fn conn: Int => fn sql: String =>
+let raw_query = fn conn: Int => fn sql: String =>
   let c = str_to_cstr sql in
   let rs = s_query conn c in
   let _ = cstr_free c in
@@ -54,6 +68,30 @@ let q_cols = fn rs: Int => s_cols rs in
 let q_int  = fn rs: Int => fn row: Int => fn col: Int => s_int rs row col in
 let q_text = fn rs: Int => fn row: Int => fn col: Int => s_text rs row col in
 let q_free = fn rs: Int => s_free rs in
-let db_error = fn u: Unit => s_err () in
+let q_is_null = fn rs: Int => fn row: Int => fn col: Int => s_is_null rs row col in
+let raw_error = fn u: Unit => s_err () in
+
+-- in-memory open: no path to marshal
+let raw_open_memory = fn u: Unit => s_open_mem () in
+
+-- prepared statements. `raw_prepare` marshals the SQL once; binds take plain
+-- Ints, or a String marshalled to a cstr (freed on the same line).
+let raw_prepare = fn conn: Int => fn sql: String =>
+  let c = str_to_cstr sql in
+  let st = s_prepare conn c in
+  let _ = cstr_free c in
+  st
+in
+let b_bind_int = fn st: Int => fn v: Int => s_bind_int st v in
+let b_bind_text = fn st: Int => fn s: String =>
+  let c = str_to_cstr s in
+  let _ = s_bind_text st c in
+  cstr_free c
+in
+let b_bind_null = fn st: Int => s_bind_null st in
+let st_query = fn st: Int => s_st_query st in
+let st_exec  = fn st: Int => s_st_exec st in
+let st_reset = fn st: Int => s_st_reset st in
+let st_finalize = fn st: Int => s_finalize st in
 
 ()

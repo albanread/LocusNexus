@@ -1,0 +1,13 @@
+-- MINIMAL REPRO — T0 tag-completeness panic (a compiler bug, not a user error).
+-- Passing a phantom-typed single-field handle `Conn[SqliteMem]` into a polymorphic
+-- scope-combinator body demands a `ToPtr` coercion that sema does not insert, so
+-- `check_tags` panics at sema.rs:1899. Run:  locusc run <thisfile>
+--   panic: "a `ToPtr` coercion is required to move a `Conn[SqliteMem]` across a
+--            `?N` (Var) cell boundary, but none is present"
+-- Note: the analogous combinator over `Int` bodies works (assurance D-series), so
+-- the trigger is a CONSTRUCTOR-typed argument crossing the body's polymorphic slot.
+let wm = fn body: (Conn[SqliteMem] -> a ! {|e}) =>
+  let c = db_open_memory () in
+  body c
+in
+wm (fn c => db_exec c "CREATE TABLE t (n INTEGER)")

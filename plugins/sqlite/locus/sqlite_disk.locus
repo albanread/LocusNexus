@@ -1,0 +1,25 @@
+module SqliteDisk at boundary mints (sqlite_fs)
+  exposing (disk_open) =
+-- PLUGIN LAYER 0 — the **on-disk** SQLite door. A separate boundary from the
+-- core (`sqlite`) one for a single reason: it mints a distinct **`sqlite_fs`**
+-- effect, so opening a database *file* is visible in a program's row. The core
+-- ops (exec/query/prepare/…) stay `{sqlite}`; only this door adds `{sqlite_fs}`,
+-- so a program that touches the filesystem says so in its type, while an
+-- in-memory program (which never calls `disk_open`) provably does not.
+--
+-- (One boundary == one minted effect: the parser stamps a module's first mint
+-- onto its externs, so the file-open lives here, alone.)
+
+let str_to_cstr = extern "locus_string_to_cstr" : String -> Int in
+let cstr_free   = extern "locus_cstr_free"       : Int -> Unit in
+let s_open_file = extern "sqlite.OpenFile"       : Int -> Int in
+
+-- open (or create) a database file; the result carries `{sqlite_fs}`.
+let disk_open = fn path: String =>
+  let c = str_to_cstr path in
+  let h = s_open_file c in
+  let _ = cstr_free c in
+  h
+in
+
+()

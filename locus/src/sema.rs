@@ -4128,6 +4128,20 @@ fn wrap_block_suffix(item: &TypedBlockItem, suffix: Typed, stage: Stage) -> Type
     }
 }
 
+/// Flatten the runtime-transparent [`BlockItem::Scope`] wrappers (the level-
+/// enforcement graft markers) into a flat list of their leaf items, in order.
+/// **Sprint 1: transparent** — elaboration treats a `Scope` exactly as if its
+/// items were spliced inline (same single scope). Sprint 2 will instead recurse
+/// with the `depth`/`home` threaded for visibility enforcement.
+fn flatten_scopes<'a>(items: &'a [BlockItem], out: &mut Vec<&'a BlockItem>) {
+    for it in items {
+        match it {
+            BlockItem::Scope { items, .. } => flatten_scopes(items, out),
+            other => out.push(other),
+        }
+    }
+}
+
 fn elaborate_block(
     sig: &Sig,
     ctx: &Ctx,
@@ -4143,8 +4157,13 @@ fn elaborate_block(
         let mut ctx2 = ctx.clone();
         let mut pending = Vec::with_capacity(items.len());
 
-        for item in items {
+        let mut flat: Vec<&BlockItem> = Vec::new();
+        flatten_scopes(items, &mut flat);
+        for item in flat {
             match item {
+                BlockItem::Scope { .. } => {
+                    unreachable!("Scope items are flattened by flatten_scopes before the loop")
+                }
                 BlockItem::Let(x, e1) => {
                     unify::with_store(|s| s.enter_level());
                     let t1 = elaborate_inner(&sig2, &ctx2, stage, e1);
@@ -6193,12 +6212,28 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
         // its body, but adjusting the row.)
         Term::Seal(label, body) => {
             let b = elaborate_inner(sig, ctx, stage, body)?;
+            // The **inverted denylist** (level-enforcement.md §2.3 / sealing-
+            // semantics.md §8.3, Sprint 3): `exn` and the generative `Insert` may
+            // NEVER be region-sealed — a sealed-undischarged `exn` would *hide a
+            // fault* and `Insert` is the staging let-insertion signal. This is a
+            // hard RN-E0407. `gc` is NOT rejected for the *region* form: `seal gc`
+            // (≡ `nogc`) is the sound `runST` discipline — it strips `gc` AND runs
+            // the gc-datum no-escape check below, so allocation liability cannot
+            // escape. (The unsound `gc` case is a *module* `seals (gc)`, whose strip
+            // would propagate to callers with no datum guard — rejected up front in
+            // `stdlib::check_seals_denylist`, also RN-E0407.)
+            if crate::capability::is_never_region_sealable(label) {
+                return Err(TypeErr::SealNonSealable {
+                    label: label.clone(),
+                });
+            }
             // D-S3: a seal may only *remove* a label that discharges at the
-            // boundary. Native powers (`gc`, `World` syscalls) bottom out in a
-            // runtime call; a non-native effect (`User`/`Exn`) still in the body's
-            // row is unhandled and would escape at runtime, so sealing it would
-            // hide a fault. (A handled user effect is already gone from the row,
-            // so this permits the design's "local user-effect scoping" use.)
+            // boundary. Native powers (`World` syscalls) bottom out in a runtime
+            // call; a non-native effect (`User`/`Exn`/`st`) still in the body's row
+            // is unhandled and would escape at runtime, so sealing it would hide a
+            // fault. (A handled user effect is already gone from the row, so this
+            // permits the design's "local user-effect scoping" use; `st` routes
+            // through this guard + the post-zonk `seal_escape` cell check.)
             if !label.is_native() && b.row.labels().any(|l| l == label) {
                 return Err(TypeErr::SealUnhandled {
                     label: label.clone(),

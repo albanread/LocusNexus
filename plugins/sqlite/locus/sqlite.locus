@@ -1,6 +1,8 @@
 module Sqlite at services
-  exposing (sql_open, sql_close, sql_exec, sql_query, sql_free,
-            sql_rows, sql_cols, sql_get_int, sql_get_text, sql_error) =
+  exposing (sql_open, sql_open_memory, sql_close, sql_exec, sql_query, sql_free,
+            sql_rows, sql_cols, sql_get_int, sql_get_text, sql_is_null, sql_error,
+            sql_prepare, sql_bind_int, sql_bind_text, sql_bind_null,
+            sql_run_query, sql_run_exec, sql_reset, sql_finalize) =
 -- PLUGIN LAYER 1: the SQLite SERVICE over the `SqliteFfi` boundary. The
 -- app-facing surface; carries `{sqlite}` in the row, provably confined to the
 -- database. A handle (connection, result set) is an `Int`.
@@ -12,16 +14,31 @@ module Sqlite at services
 -- (`Int -> a ! e`), which currently trips a repr-polymorphism checker edge; once
 -- that is resolved they replace the bare `open`/`close` as the front door.
 
-let sql_open  = fn path: String => db_open path in
-let sql_close = fn conn: Int => db_close conn in
-let sql_exec  = fn conn: Int => fn sql: String => db_exec conn sql in
-let sql_query = fn conn: Int => fn sql: String => db_query conn sql in
+let sql_open  = fn path: String => raw_open path in
+let sql_close = fn conn: Int => raw_close conn in
+let sql_exec  = fn conn: Int => fn sql: String => raw_exec conn sql in
+let sql_query = fn conn: Int => fn sql: String => raw_query conn sql in
 let sql_free  = fn rs: Int => q_free rs in
 
 let sql_rows     = fn rs: Int => q_rows rs in
 let sql_cols     = fn rs: Int => q_cols rs in
 let sql_get_int  = fn rs: Int => fn row: Int => fn col: Int => q_int rs row col in
 let sql_get_text = fn rs: Int => fn row: Int => fn col: Int => q_text rs row col in
-let sql_error    = fn u: Unit => db_error () in
+let sql_is_null  = fn rs: Int => fn row: Int => fn col: Int => q_is_null rs row col in
+let sql_error    = fn u: Unit => raw_error () in
+
+-- in-memory database (sandboxed: cannot ATTACH a file)
+let sql_open_memory = fn u: Unit => raw_open_memory () in
+
+-- prepared / parameterized statements. Values cross ONLY via bind, never via
+-- string-building — the injection-safe path (design §6).
+let sql_prepare   = fn conn: Int => fn sql: String => raw_prepare conn sql in
+let sql_bind_int  = fn st: Int => fn v: Int => b_bind_int st v in
+let sql_bind_text = fn st: Int => fn s: String => b_bind_text st s in
+let sql_bind_null = fn st: Int => b_bind_null st in
+let sql_run_query = fn st: Int => st_query st in
+let sql_run_exec  = fn st: Int => st_exec st in
+let sql_reset     = fn st: Int => st_reset st in
+let sql_finalize  = fn st: Int => st_finalize st in
 
 ()

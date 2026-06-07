@@ -1,8 +1,18 @@
-module Libc at boundary mints (libc) exposing () =
+module Libc at boundary mints (libc) exposing
+  (libc_write_console_line, libc_clock_ticks, libc_clock_frequency,
+   libc_docs_exists, libc_docs_write, libc_docs_read_ok, libc_docs_read_text,
+   libc_locus_env_get_ok, libc_locus_env_get_text) =
 -- stdlib LAYER 0: libc/POSIX boundary for Linux.
 --
 -- Only this layer names raw libc symbols. Services wrap these bindings and seal
--- the `libc` label before app code sees a stable service API.
+-- the `libc` label before app code sees a stable service API. The `exposing`
+-- list is the curated surface of SAFE `fn …` WRAPPERS the layer-1 services
+-- consume (Console/Time/DocsFs/LocusEnv); each seals `{libc}`/`{mem}`. Every raw
+-- import — `libc_malloc`/`libc_alloc`, `libc_write`, `libc_clock_gettime`,
+-- `libc_getenv`, `libc_strlen`, `libc_open`/`libc_read`/`libc_close`/`libc_lseek`/
+-- `libc_access` — and the `poke8`/`peek8` marshalling helpers stay PRIVATE: the
+-- raw byte-buffer allocator and fd write never escape this layer (the Console
+-- service marshals through `libc_write_console_line`, not `malloc`/`write`).
 
 let libc_malloc = extern "malloc" : Int -> Ptr in
 let libc_alloc = extern "malloc" : Int -> Int in
@@ -209,6 +219,18 @@ let libc_locus_env_get_text = fn name: String =>
     locus_string_from_utf8 0 0
   else
     locus_string_from_utf8 p (libc_strlen p)
+in
+
+-- Safe console wrapper (the curated boundary surface the Console service uses):
+-- marshal `s` to a fresh UTF-8 buffer, append '\n', and write it to stdout (fd
+-- 1). Keeps the raw `malloc`/`write` edge PRIVATE — the service names only this
+-- wrapper, exactly as the Windows Console names `win_write_console`.
+let libc_write_console_line = fn s: String =>
+  let buf = libc_utf8z s in
+  let n = libc_strlen buf in
+  let _ = poke8 (buf + n) 10 in
+  let _ = libc_write 1 buf (n + 1) in
+  ()
 in
 
 ()

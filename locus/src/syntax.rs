@@ -1133,6 +1133,17 @@ pub enum BlockItem {
     LetRec(String, Type, Term),
     LetMut(String, Term),
     LetTuple(Vec<String>, Term),
+    /// **A grafted module's bindings, wrapped with its layer + home (level
+    /// enforcement, `docs/design/level-enforcement.md`).** Runtime-transparent —
+    /// eval/IR/stage flatten it by recursing into `items` over the same single
+    /// scope; it exists only so name resolution can thread the use-site's
+    /// `depth`/`home` to enforce one-level-down visibility + module privacy.
+    /// `depth` is the module's `Layer::rank` (boundary=0, services=1, app=2).
+    Scope {
+        depth: u8,
+        home: String,
+        items: Vec<BlockItem>,
+    },
     Effect {
         name: String,
         ops: Vec<OpDecl>,

@@ -5138,14 +5138,29 @@ impl<'ctx> Cg<'ctx, '_> {
                 .map(|c| (c.clone(), frame.exit))
         });
         let Some((c, exit)) = found else {
-            if matches!(label, Label::World(name) if name == "console_float") {
-                let bits = self.lower_atom(arg)?.into_int_value();
-                self.gc_call("locus_write_float", &[bits], false)?;
-                return Ok(self.ctx.i64_type().const_zero().into());
+            // Native World ops with a prelowered default handler: the prelude
+            // declares `console`/`console_float` as native effect operations, so
+            // an *unhandled* perform routes to the runtime rather than erroring.
+            // (A user `handle … with { console(s) => … }` still intercepts —
+            // it's found above; this is only the fall-through default.)
+            if let Label::World(name) = label {
+                if name == "console" {
+                    // `console : String -> Unit` — write the managed string as
+                    // a line. The runtime decodes it and routes to the host's
+                    // console sink (the IDE's pane) if installed, else stdout.
+                    let sv = self.lower_atom(arg)?.into_int_value();
+                    self.gc_call("locus_write_console_line", &[sv], false)?;
+                    return Ok(self.ctx.i64_type().const_zero().into());
+                }
+                if name == "console_float" {
+                    let bits = self.lower_atom(arg)?.into_int_value();
+                    self.gc_call("locus_write_float", &[bits], false)?;
+                    return Ok(self.ctx.i64_type().const_zero().into());
+                }
             }
             return Err(format!(
-                "codegen: unhandled effect `{label}` — no handler in scope, and there is no \
-                 native runtime (output is the `console_writeln` prelude)"
+                "codegen: unhandled effect `{label}` — no handler in scope, and it is not a \
+                 native op with a default runtime (only `console`/`console_float` are)"
             ));
         };
         let argv = self.lower_atom(arg)?;

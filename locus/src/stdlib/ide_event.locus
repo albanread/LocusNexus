@@ -1,4 +1,9 @@
-module IdeEvent at boundary mints (event) exposing () =
+module IdeEvent at boundary mints (event) exposing (ev_poll_packed, igui_set_redraw_rate) =
+-- Exposed to the layer-1 `Event` service only: the packed-poll wrapper and the
+-- raw redraw-rate control. Both mint/carry `{event}` (the IDE-world input
+-- capability), which the service SEALS. The raw event-buffer allocator
+-- (`ev_VirtualAlloc`/`ev_alloc`) and scratch decode stay PRIVATE — app/services
+-- never get the raw memory edge.
 -- stdlib LAYER 0: the IDE-world EVENT boundary. Raw `iGui.*` C-ABI imports for
 -- the input/animation channel the shell drives, plus the private scratch-buffer
 -- decode of `iGui.NextEvent`'s seven packed VAR out-params. Like `IdeGraphics`,

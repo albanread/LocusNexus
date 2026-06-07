@@ -13,7 +13,7 @@ default = ["windows-driver"]
 # Existing Windows compiler surface: Win32 oracle, Windows JIT import table,
 # MSVC AOT, and the bundled MASM runtime. It stays default so current Windows
 # workflows keep building the same crate.
-windows-driver = ["dep:cc", "dep:locus-asm", "dep:locus-rt", "dep:locus-winapi"]
+windows-driver = ["dep:cc", "dep:locus-asm", "dep:locus-rt", "dep:locus-winapi", "dep:locus-plugin", "dep:locus-sqlite"]
 
 # `locusc` — the Locus compiler driver: `run` (JIT) and `build` (AOT → .exe).
 # The mint-gate blocks app-level minting by default (no build-time toggle): the
@@ -36,6 +36,12 @@ locus-rt = { path = "../locus-rt", optional = true }
 # The Win32 ABI oracle — resolves bare `extern "Sym"` signatures and supplies
 # the demanded DLLs' import libs to the AOT linker.
 locus-winapi = { path = "../locus-winapi", optional = true }
+# Service plugins (compile-time, platform-team-owned). `locus-plugin` is the
+# support layer; each plugin crate (e.g. `locus-sqlite`) wraps a Rust crate
+# behind a sealed Locus effect. The driver grafts their modules + injects their
+# symbols. See locusnexus docs/design/rust-service-plugins.md.
+locus-plugin = { path = "../locus-plugin", optional = true }
+locus-sqlite = { path = "../plugins/sqlite", optional = true }
 inkwell.workspace = true
 llvm-sys.workspace = true
 # Used only to locate MSVC `cl.exe` / `link.exe` with the SDK env (`%LIB%`,

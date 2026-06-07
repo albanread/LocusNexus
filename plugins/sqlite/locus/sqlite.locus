@@ -1,0 +1,27 @@
+module Sqlite at services
+  exposing (sql_open, sql_close, sql_exec, sql_query, sql_free,
+            sql_rows, sql_cols, sql_get_int, sql_get_text, sql_error) =
+-- PLUGIN LAYER 1: the SQLite SERVICE over the `SqliteFfi` boundary. The
+-- app-facing surface; carries `{sqlite}` in the row, provably confined to the
+-- database. A handle (connection, result set) is an `Int`.
+--
+-- These are flat, concretely-typed wrappers. The *intended* headline surface is
+-- scope-by-default — `with_db path (fn conn => …)` / `with_query conn sql
+-- (fn rs => …)` that open, run the body, and ALWAYS release the handle (the
+-- runtime mirror of `seal`'s no-escape). Those need a row-polymorphic body type
+-- (`Int -> a ! e`), which currently trips a repr-polymorphism checker edge; once
+-- that is resolved they replace the bare `open`/`close` as the front door.
+
+let sql_open  = fn path: String => db_open path in
+let sql_close = fn conn: Int => db_close conn in
+let sql_exec  = fn conn: Int => fn sql: String => db_exec conn sql in
+let sql_query = fn conn: Int => fn sql: String => db_query conn sql in
+let sql_free  = fn rs: Int => q_free rs in
+
+let sql_rows     = fn rs: Int => q_rows rs in
+let sql_cols     = fn rs: Int => q_cols rs in
+let sql_get_int  = fn rs: Int => fn row: Int => fn col: Int => q_int rs row col in
+let sql_get_text = fn rs: Int => fn row: Int => fn col: Int => q_text rs row col in
+let sql_error    = fn u: Unit => db_error () in
+
+()

@@ -604,6 +604,37 @@ pub extern "C" fn locus_string_from_utf8(ptr: *const u8, len: i64) -> i64 {
     materialize_utf16_units(&units)
 }
 
+/// Marshal a managed Locus `String` **out** to a fresh host-owned, NUL-terminated
+/// UTF-8 C string; returns its pointer (`0` on failure). The inbound path for FFI
+/// service plugins (a SQL query, a file path) — centralized here so a plugin's
+/// boundary never hand-rolls the UTF-16→UTF-8 conversion (and can't leak it: the
+/// service pairs every call with [`locus_cstr_free`]). Interior NULs are stripped
+/// (a C string can't hold them). The Locus side stays a sealed `String`.
+#[no_mangle]
+pub extern "C" fn locus_string_to_cstr(s: i64) -> i64 {
+    let units = HEAP.with(|h| read_utf16_units(&h.borrow(), s));
+    let text = String::from_utf16_lossy(&units);
+    let cleaned: String = text.chars().filter(|&c| c != '\0').collect();
+    match std::ffi::CString::new(cleaned) {
+        Ok(c) => c.into_raw() as i64,
+        Err(_) => 0,
+    }
+}
+
+/// Free a C string from [`locus_string_to_cstr`]. Idempotent on `0`.
+#[no_mangle]
+pub extern "C" fn locus_cstr_free(ptr: i64) {
+    if ptr == 0 {
+        return;
+    }
+    // SAFETY: `ptr` came from `CString::into_raw`; reclaim and drop it.
+    unsafe {
+        drop(std::ffi::CString::from_raw(
+            ptr as *mut std::os::raw::c_char,
+        ));
+    }
+}
+
 /// Return a fresh empty managed string.
 #[no_mangle]
 pub extern "C" fn locus_string_empty() -> i64 {
@@ -854,6 +885,8 @@ pub fn runtime_symbols() -> Vec<(&'static str, u64)> {
         sym!("locus_array_new_int", locus_array_new_int),
         sym!("locus_string_from_utf16", locus_string_from_utf16),
         sym!("locus_string_from_utf8", locus_string_from_utf8),
+        sym!("locus_string_to_cstr", locus_string_to_cstr),
+        sym!("locus_cstr_free", locus_cstr_free),
         sym!("locus_string_empty", locus_string_empty),
         sym!("locus_string_unit", locus_string_unit),
         sym!("locus_string_slice", locus_string_slice),

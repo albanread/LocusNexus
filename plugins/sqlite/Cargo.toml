@@ -1,0 +1,18 @@
+# locus-sqlite: a reference SERVICE PLUGIN — wraps `rusqlite` (bundled SQLite, no
+# system dependency) as the sealed Locus `{sqlite}` effect. See the design at
+# locusnexus docs/design/rust-service-plugins.md. Linked into the worker; reached
+# only through the sealed Sqlite service.
+[package]
+name = "locus-sqlite"
+version = "0.0.0"
+edition = "2021"
+description = "Reference service plugin: SQLite (rusqlite, bundled) behind the sealed {sqlite} Locus effect."
+publish = false
+
+[lib]
+name = "locus_sqlite"
+crate-type = ["rlib"]
+
+[dependencies]
+locus-plugin = { path = "../../locus-plugin" }
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -203,7 +203,13 @@ pub fn program_with_stdlib(
                 .any(|n| !user_bound.contains(n) && mentions_word(&active_user, n));
             if mentioned_by_included || mentioned_by_user {
                 included[i] = true;
-                active_modules.push_str(msrc);
+                // Blank comments + string literals before adding to the active
+                // source: a NAME must trigger inclusion only as a real identifier
+                // use, never because it appears inside a string (e.g. an extern
+                // symbol `"sqlite.Close"` must not drag in the Event service's
+                // `Close`). The user source is already `code_only`'d; module
+                // sources are too, here, for the same reason.
+                active_modules.push_str(&code_only(msrc));
                 changed = true;
             }
         }

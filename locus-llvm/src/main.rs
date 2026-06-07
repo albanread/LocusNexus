@@ -596,6 +596,36 @@ fn guard_layer2(src: &str, authorized: &HashSet<String>) -> Result<(), String> {
 /// Front end: source → ANF IR + the demanded Win32 DLLs. `program` grafts the
 /// prelude (e.g. `console_writeln`); the resolver fills bare `extern "Sym"` from the
 /// Win32 oracle and collects the DLLs the AOT linker will need.
+/// The compile-time **service plugins** linked into this driver — the grant
+/// list. Each entry contributes its boundary+service `.locus` modules (grafted
+/// alongside the stdlib) and its C-ABI symbols (injected into the JIT). See
+/// locusnexus docs/design/rust-service-plugins.md.
+fn service_plugins() -> Vec<locus_plugin::ServicePlugin> {
+    vec![locus_sqlite::plugin()]
+}
+
+/// Stdlib modules + every plugin's modules, for the graft. A plugin's modules
+/// auto-include only when a program names one of its exposed surface.
+fn plugin_grafted_modules() -> Vec<(u8, &'static str, &'static str)> {
+    let mut m: Vec<(u8, &'static str, &'static str)> = locus::stdlib_modules().to_vec();
+    for p in service_plugins() {
+        m.extend(p.modules);
+    }
+    m
+}
+
+/// Every plugin's C-ABI symbols (name → address), for the JIT's absolute-symbol
+/// manifold (passed to `jit_run_i64_with_symbols`).
+fn plugin_symbols() -> Vec<(String, u64)> {
+    let mut s = Vec::new();
+    for p in service_plugins() {
+        for (name, addr) in p.symbols {
+            s.push((name.to_string(), addr));
+        }
+    }
+    s
+}
+
 fn to_ir(
     src: &str,
     trace_stack: bool,
@@ -606,7 +636,9 @@ fn to_ir(
             trace_shape("user source", locus::program_source_shape(&program));
         }
     }
-    let (term, user_modules) = locus::program_with_modules(src).map_err(|e| e.msg)?;
+    let modules = plugin_grafted_modules();
+    let (term, user_modules) =
+        locus::program_with_stdlib(src, &modules).map_err(|e| e.msg)?;
     if trace_stack {
         trace_shape("stdlib-grafted term", locus::term_shape(&term));
     }
@@ -622,7 +654,7 @@ fn to_ir(
     // Enforce each module's `seals (…)` clause over the elaborated exports (S4):
     // no exposed binding may carry a sealed label. Covers the included stdlib
     // services (e.g. Console seals winapi) and the user modules.
-    let mut all_modules = locus::stdlib_module_decls();
+    let mut all_modules = locus::stdlib_module_decls_from(&modules);
     all_modules.extend(user_modules);
     locus::check_module_seals(&all_modules, &tree).map_err(|e| e.to_string())?;
     // Run the generators (staging) at compile time, leaving residual object code.
@@ -678,7 +710,8 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     guard_layer2(&src, &read_boundary_manifest(Path::new(&file)))?;
     let (ir, apis) = to_ir(&src, trace_stack)?;
     // The program runs here — its effects execute and its i64 is the exit code.
-    let result = locus_llvm::jit_run_i64(&ir, &apis)?;
+    // Inject the plugins' C-ABI symbols so a grafted boundary's `extern`s resolve.
+    let result = locus_llvm::jit_run_i64_with_symbols(&ir, &apis, &plugin_symbols())?;
     Ok(result as i32)
 }
 

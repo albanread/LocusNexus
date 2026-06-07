@@ -1,0 +1,17 @@
+# locus-plugin: host-side support for Rust SERVICE PLUGINS — the contract a crate
+# implements to be wrapped as a sealed Locus service. See the design at
+# locusnexus docs/design/rust-service-plugins.md. Linked into the worker; a
+# plugin crate depends on it for the handle Registry, string marshalling, the
+# per-thread error cell, and the ServicePlugin descriptor.
+[package]
+name = "locus-plugin"
+version = "0.0.0"
+edition = "2021"
+description = "Support layer for Rust service plugins: handle registry, marshalling, the ServicePlugin descriptor."
+publish = false
+
+[lib]
+name = "locus_plugin"
+crate-type = ["rlib"]
+
+[dependencies]

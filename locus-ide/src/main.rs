@@ -37,6 +37,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     igui::crash_handler::install();
 
+    // The VEH above catches hardware SEH (access violations, etc.). A *Rust
+    // panic* — an unwrap / poisoned-lock / `expect` on the worker thread —
+    // unwinds silently instead: the worker dies, `eval` never returns, and the
+    // IDE just looks frozen with no crash window. So also install a panic hook
+    // that formats the panic (message, location, thread, backtrace) and surfaces
+    // it in the SAME crash view (`crash_view::push` is thread-safe and posts a
+    // GUI-thread flush — it was built for exactly this), then chains to the
+    // default hook for stderr.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Box<dyn Any>".to_string());
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current();
+        let tname = thread.name().unwrap_or("<unnamed>").to_string();
+        let bt = std::backtrace::Backtrace::force_capture();
+        igui::crash_view::push(format!(
+            "kind:           Rust panic\n\
+             thread:         {tname}\n\
+             location:       {loc}\n\
+             message:        {msg}\n\n\
+             backtrace:\n{bt}"
+        ));
+        default_panic_hook(info);
+    }));
+
     // LocusNexus wallpaper: a violet ⁂ (asterism — "a locus of points")
     // tiled on a deep-indigo ground.  Distinct from the Factor IDE, and
     // the brand mark of the Locus world.

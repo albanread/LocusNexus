@@ -32,11 +32,16 @@ let frame = fn dotx: Int => fn doty: Int =>
 in
 
 -- Event loop: draw, poll one event, recurse with the new dot position.
+-- Exit on the pane's Close (the window's X) OR Escape (vkey 27); a click moves
+-- the dot; a resize re-centres it; everything else (ticks, mouse-move) just
+-- redraws. The Close path is what makes the X button end the program cleanly.
 let rec spin : Int -> Int -> Int ! {graphics, event, gc, mem} =
   fn dotx: Int => fn doty: Int =>
     let _ = frame dotx doty in
     match poll_event 16 with
     | MouseDown(x, y) => spin x y
+    | Key(k)          => if k == 27 then 0 else spin dotx doty
+    | Resize(w, h)    => spin (w / 2) (h / 2)
     | Close           => 0
     | _               => spin dotx doty
 in

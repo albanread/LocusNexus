@@ -242,11 +242,22 @@ pub fn push(ev: IGuiEvent) {
     };
     match mb.tx.try_send(ev) {
         Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            // Dropping is correct: the GUI thread cannot block on the
-            // language thread, and a stalled consumer means whatever
-            // we just lost is the least of the user's problems.
-            eprintln!("[igui] event mailbox full, dropping event");
+        Err(TrySendError::Full(ev)) => {
+            // The bounded channel is full because the consumer briefly stalled.
+            // The GUI thread must never block on the language thread, so we don't
+            // wait — but we must NOT blindly drop, either: a redraw `Tick` floods
+            // this channel ~60×/s, and if a one-shot `Close` lands while it's full
+            // it would be lost, so closing a pane never reaches the program and
+            // its event loop hangs (the "works until I click close" freeze). A
+            // `Tick` is coalesce-able — dropping one just skips a frame — so only
+            // it is dropped under back-pressure; EVERY other event (above all
+            // `Close`/`FrameClose`) is parked in the unbounded stash, which every
+            // consumer drains ahead of the channel.
+            if matches!(ev, IGuiEvent::Tick { .. }) {
+                // coalesced redraw tick — safe to drop while back-pressured
+            } else if let Ok(mut stash) = EVENT_STASH.lock() {
+                stash.push_back(ev);
+            }
         }
         Err(TrySendError::Disconnected(_)) => {
             // Receiver gone; mailbox is being torn down. Silently ignore.

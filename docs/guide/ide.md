@@ -76,6 +76,44 @@ program that draws shows `{graphics, event, gc, mem}`. You learn to read a
 program's footprint at a glance, which is the whole habit Locus is trying to
 teach.
 
+## Analysis is built in
+
+Running a program is one way to see its effects; the other needs no run at all.
+Press **F6** to **Analyze** the current buffer and the Report pane opens with the
+program's whole capability story — *without* executing it:
+
+- the **effect manifest** — every capability the program names;
+- a **confinement diagram** of those powers reaching the world;
+- a **function table** — for each function the program uses, its module, its
+  layer, its argument types, and the effect it carries;
+- and a **call graph** tracing the path from your code down to the service
+  functions that actually perform each effect.
+
+That is review-by-reading turned into a single key. You don't trace what the code
+*does*; you read what it is *allowed to touch*, and exactly where each power
+enters. Here is the report for an agent-driven Minesweeper — its entire reach is
+`{agent, gc}`:
+
+<img src="../selfie_analysis.png" alt="The F6 Analyze report: named effects, a confinement diagram, and the function table" width="720">
+
+*F6 — the integrated analysis: the named effects, the confinement diagram, and
+the function table showing where each power originates.*
+
+## The manual is built in
+
+The documentation is integrated too. Press **F1** and this guide — and the rest
+of the manual — opens *inside the IDE*, in a pane with a sidebar on the left. It
+renders Markdown and Mermaid diagrams with the very same engine that draws the
+analysis reports, so the world-boundary diagram you read about appears, drawn,
+right next to your code. There is no browser and no external viewer: the
+language, the standard library, the JIT, the GC, the analyzer, **and the manual**
+are all inside the one `locus-ide.exe`.
+
+<img src="../selfie_docs.png" alt="The F1 in-window manual: a sidebar and a rendered Graphics and input page" width="720">
+
+*F1 — the integrated manual: a browsable, diagram-rendering help pane (here, the
+Graphics and input page and its world-boundary diagram).*
+
 ## Your first graphics
 
 The smallest graphical program opens a pane, clears it, writes a word, and
@@ -188,6 +226,53 @@ The showcase is `othello` — a full graphical Reversi with an alpha-beta AI,
 played by clicking the board. It uses nothing but these same two services, which
 is the point: a real, interactive program built entirely from a small, sealed,
 auditable surface.
+
+<img src="../selfie_julia_analysis.png" alt="A Julia set drawing in a pane, with its Analyze report on the right" width="720">
+
+*A Julia set drawing in its pane (centre) with its **Analyze** report (right): a
+graphics-heavy program, and its whole reach — `{graphics, mem, event, gc, …}` —
+read straight off its type.*
+
+## Why the silly graphics demos?
+
+A compiler project full of fractals and board games can look unserious. The demos
+earn their place for two reasons.
+
+**An animation is a profiler your eye runs for free.** A program redrawing a
+Julia set sixty times a second runs the same tight numeric loop over and over,
+live, right in front of you. When the compiler lowers some path clumsily you do
+not have to read IR or rig a microbenchmark to find it — the picture *stutters*. A
+dropped frame is a slow path announcing itself. The loop closes both ways, too:
+change something and the motion either smooths out or it doesn't, so an animation
+is as good for *confirming* a speedup as for spotting the need for one. The IDE
+JITs your code quickly rather than grinding it through heavy optimisation, so what
+you are watching is largely the quality of the lowering itself — not an optimiser
+cleaning up afterwards.
+
+**They are the kind of computation Locus is meant to be good at.** A fractal is
+nothing but a hot scalar loop: unboxed `Int` and `Float` arithmetic, a
+fixed-iteration escape test, one pixel written per step. That is exactly the shape
+Locus aims to compile well — a `loop` lowers to LLVM phi-node iteration, the
+scalars never touch the heap, and the canvas lane writes pixels under `mem` with a
+single boundary crossing per frame. So each demo is a showcase and a stress test
+at once: a representative numeric workload that doubles as a regression canary.
+
+**This is not hypothetical.** The animated Julia set in this IDE once ran at three
+to seven frames a second — visibly, painfully choppy — and the stutter was the
+clue. The cost wasn't the float maths or the pixels: the escape-time kernel was a
+*curried recursive function*, and a recursive closure can't be devirtualised, so
+every iteration allocated. Rewritten as an inline multi-variable `loop` — same
+maths, same result — it lowered to a register phi with the coordinates resident in
+SSE registers and *zero* heap allocation; the frame time fell from about 150 ms to
+about 1.5 ms, roughly a hundredfold, and the picture went smooth. That demo then
+drove the compiler itself: saturated calls now lower to a single direct call
+instead of one allocation per argument (a per-pixel call went from 12.4 to 1.5
+ms/frame), and multi-argument tail recursion compiles to a constant-stack
+phi-loop — so the recursive form is fast now too. The slow paths had been hiding
+in plain sight; the animation is what made them impossible to ignore.
+
+So the "toys" are doing real work — a performance radar you read at a glance, and
+a benchmark you happen to enjoy looking at.
 
 ## The world boundary, made literal
 

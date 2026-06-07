@@ -275,6 +275,12 @@ pub const OPEN_TEXT_CMD_ID: u16 = 0x3060;
 /// Dumps queued by a worker thread via [`show_text`], awaiting the GUI thread.
 static PENDING_TEXT: Mutex<Vec<FeditTextLoad>> = Mutex::new(Vec::new());
 
+/// The last Locus SOURCE that was analyzed / lowered, so an Analyze / Show
+/// ANF·LLVM·Assembly invoked while a *result* pane (ANF/ASM/LLVM) is focused
+/// re-runs against the program — not the dump it's looking at. Set whenever the
+/// command fires on a real source pane; read when it fires on a result pane.
+static LAST_LOWERED_SOURCE: Mutex<Option<String>> = Mutex::new(None);
+
 /// Worker-safe: open a file-less text pane with `text` (a compiler-view dump).
 /// `lang` selects highlighting: `"anf"`, `"asm"`, `"masm"`, `"locus"`, else
 /// plain. Queues the payload and posts the open command to the frame, so the
@@ -1838,21 +1844,31 @@ impl FeditState {
     /// `run_buffer` this does not execute the program — the host
     /// elaborates it and renders an effect/capability report.
     fn analyze_buffer(&self) {
-        // As in `lowering_buffer`: analyzing a result/output pane (a synthetic
-        // `title_override`) is meaningless — only analyze a real source pane.
-        if self.title_override.is_some() {
-            super::log_view::append(
-                "[fedit] Analyze applies to a Locus source pane — focus the program's editor",
-            );
-            return;
-        }
-        let (src, scope) = {
+        // As in `lowering_buffer`: a result/output pane (synthetic `title_override`)
+        // has no program to analyze, so re-analyze the last source instead of its
+        // own dump. A real source pane analyzes its buffer/selection and is
+        // remembered.
+        let (src, scope) = if self.title_override.is_some() {
+            match LAST_LOWERED_SOURCE.lock().ok().and_then(|s| s.clone()) {
+                Some(s) => (s, "last source"),
+                None => {
+                    super::log_view::append(
+                        "[fedit] no Locus program to analyze yet — open one and Analyze from it",
+                    );
+                    return;
+                }
+            }
+        } else {
             let sel = self.selected_text();
-            if sel.is_empty() {
+            let pair = if sel.is_empty() {
                 (self.buffer.to_utf8(), "buffer")
             } else {
                 (sel, "selection")
+            };
+            if let Ok(mut last) = LAST_LOWERED_SOURCE.lock() {
+                *last = Some(pair.0.clone());
             }
+            pair
         };
         super::log_view::append(&format!(
             "[fedit] analyze {} ({} chars)",
@@ -1868,26 +1884,33 @@ impl FeditState {
     /// 0=ANF, 1=LLVM, 2=asm). Like `analyze_buffer`, but the worker renders the
     /// lowering dump rather than the effect report.
     fn lowering_buffer(&self, kind: i64) {
-        // Only lower a real Locus SOURCE pane. The ANF/LLVM/Assembly result
-        // panes are themselves editable fedit panes (`load_text` → a synthetic
-        // `title_override`), so if one is focused, "Show Assembly" would try to
-        // lower the *dump's* text (a ~1000-line ANF listing, not a program) and
-        // fail to parse. Guard on the synthetic title: an output view never
-        // re-lowers itself; focus the program's editor instead.
-        if self.title_override.is_some() {
-            super::log_view::append(
-                "[fedit] Show ANF/LLVM/Assembly applies to a Locus source pane, \
-                 not a lowering view — focus the program's editor",
-            );
-            return;
-        }
-        let src = {
+        // The ANF/LLVM/Assembly result panes are themselves editable fedit panes
+        // (`load_text` → a synthetic `title_override`). If one is focused, lowering
+        // ITS text would parse a ~1000-line dump, not a program. So when a result
+        // pane is focused, re-lower the LAST source instead — "Show Assembly" from
+        // the ANF view shows the *program's* assembly. A real source pane lowers
+        // its own buffer/selection and is remembered as that last source.
+        let src = if self.title_override.is_some() {
+            match LAST_LOWERED_SOURCE.lock().ok().and_then(|s| s.clone()) {
+                Some(s) => s,
+                None => {
+                    super::log_view::append(
+                        "[fedit] no Locus program lowered yet — open one and Show ANF/Assembly from it",
+                    );
+                    return;
+                }
+            }
+        } else {
             let sel = self.selected_text();
-            if sel.is_empty() {
+            let s = if sel.is_empty() {
                 self.buffer.to_utf8()
             } else {
                 sel
+            };
+            if let Ok(mut last) = LAST_LOWERED_SOURCE.lock() {
+                *last = Some(s.clone());
             }
+            s
         };
         crate::channels::push(crate::channels::IGuiEvent::ShowLowering { source: src, kind });
     }

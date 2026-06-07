@@ -3,7 +3,7 @@
 *Drafted 2026-06-07; revised the same day after an adversarial design review (the
 fixes are tagged inline and summarized in §8/§10). A **working proposal** (OPEN).
 Companion to
-[`../capabilities.md`](../capabilities.md) (the layer/seal model) and the
+[the capabilities model](../guide/modules-and-capabilities.md) (the layer/seal model) and the
 service-plugin design [`rust-service-plugins.md`](rust-service-plugins.md) (how a
 Rust crate becomes a sealed Locus effect). This document specializes both to one
 domain: talking to databases.*
@@ -61,7 +61,7 @@ domain: talking to databases.*
 Read it top-down as *delegation* and bottom-up as *trust*. Each arrow is a call
 into the layer below; each layer is a transparent wrapper that seals the power
 beneath it so the layer above cannot utter its name
-([`capabilities.md`](../capabilities.md): "seal makes the name private").
+([modules and capabilities](../guide/modules-and-capabilities.md): "seal makes the name private").
 
 ---
 

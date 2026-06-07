@@ -204,6 +204,54 @@ We were tracking powers as a checklist (touches disk: yes/no), but one feature (
 Bottom line: the foundations are proven, the headline guarantee is all-but-assembled with the few remaining bolts clearly named, and two of those bolts told us exactly where our simplified model needs a small upgrade. All machine-checked so far, no hand-waving.
 
 
+## A simple layered design
+
+Underneath the calculus there is a plain shape worth stating outright. A Locus
+program is built in **four named layers**, stacked from the least-trusted world at
+the bottom to ordinary application code at the top.
+
+```mermaid
+flowchart TD
+    APP[App layer - your program and agent code] -->|may call| SVC[Services layer - seal powers behind safe APIs]
+    SVC -->|may call| BND[Boundary layer - mint powers, call the world]
+    BND -->|calls, packets, syscalls| WORLD[The world - OS, network, devices - least trusted]
+```
+
+- **The world** — the OS, the network, the devices: everything outside the
+  program. The lowest layer, and the least trusted.
+- **The boundary** — where the program meets the world and actually sends the
+  calls, the packets, the syscalls. It is the *only* place a raw power can be
+  **minted**, and minting one means editing boundary code and rebuilding the app
+  from source — which in Locus takes seconds, not minutes.
+- **The services** — the only layer allowed to talk to the boundary. A service
+  wraps a raw power in a safe, curated API.
+- **The app** — ordinary application and agent code, which talks only to services.
+
+Every module declares the layer it lives at. And the rule that holds it together
+is deliberately simple — almost a firewall:
+
+> **A function may only call a function one layer below it.**
+
+App calls services; services call the boundary; the boundary calls the world — and
+nothing reaches *past* the next layer down. It is the kind of rule you might hope a
+linter would catch; here it is enforced by the compiler's **semantic analyzer** at
+check time, so crossing a layer is a compile error, not a matter of discipline.
+
+Powers ride these layers too. A capability — touch the disk, open a socket, draw a
+pixel — is an **effect**, and an effect can only be **minted at the boundary**.
+Code that *uses* a power **seals** it, typically at the services layer: the service
+performs the raw effect inside and hands the app an operation that no longer
+carries the raw label. So the dangerous labels live only at the bottom and are gone
+by the time app code sees the API. A few effects are deliberately *never* sealed —
+`mem` (raw memory) and `gc` (allocation) among them — so they stay **ambient**:
+they simply appear in the effect row wherever they are used, because they are too
+pervasive to be worth confining.
+
+That is the whole architecture in four boxes and one rule. The layering gives the
+structure; the effect rows running through it — minted, sealed, or ambient — are
+what the calculus below makes precise.
+
+
 # Locus language — Calculus Mechanization: Status & Theory
 
 *What the Lean development proves, what it still owes, and where each piece sits in

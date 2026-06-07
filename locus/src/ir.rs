@@ -1468,13 +1468,25 @@ impl Ir {
     }
 }
 
+/// The `let` keyword for a binding — `let rec` when it binds a lambda that
+/// refers to its own name (the recursion the lowering re-derives via free vars),
+/// so the printed ANF exposes the binding's actual semantics rather than a plain
+/// `let` whose body mysteriously mentions itself.
+fn let_kw(name: &str, comp: &Comp) -> &'static str {
+    if matches!(comp, Comp::Lam { .. }) && crate::evidence::count_var_comp(name, comp) > 0 {
+        "let rec"
+    } else {
+        "let"
+    }
+}
+
 fn write_ir(s: &mut String, ir: &Ir, depth: usize) {
     match ir {
         Ir::Block { binds, row, comp } => {
             for bind in binds {
                 write_comp(
                     s,
-                    &format!("let {} = ", bind.name),
+                    &format!("{} {} = ", let_kw(&bind.name, &bind.comp), bind.name),
                     &bind.row,
                     &bind.comp,
                     depth,
@@ -1490,7 +1502,7 @@ fn write_ir(s: &mut String, ir: &Ir, depth: usize) {
             comp,
             rest,
         } => {
-            write_comp(s, &format!("let {name} = "), row, comp, depth);
+            write_comp(s, &format!("{} {name} = ", let_kw(name, comp)), row, comp, depth);
             write_ir(s, rest, depth);
         }
         Ir::Ret { row, comp } => write_comp(s, "", row, comp, depth),
@@ -1782,6 +1794,24 @@ mod tests {
         assert!(
             txt.contains("! {console}"),
             "the call's effect is visible:\n{txt}"
+        );
+    }
+
+    #[test]
+    fn a_self_referential_lambda_binding_prints_let_rec() {
+        // A binding whose lambda calls its own name is printed `let rec`, so the
+        // ANF view exposes the recursion rather than a plain `let` whose body
+        // mysteriously mentions itself.
+        let txt = ir_text(
+            "let rec go : Int -> Int = fn n: Int => if n == 0 then 0 else go (n - 1) in go 5",
+            0,
+        );
+        assert!(txt.contains("let rec go ="), "recursive binding:\n{txt}");
+        // A non-recursive lambda stays a plain `let`.
+        let txt2 = ir_text("let f = fn x: Int => x + 1 in f 3", 0);
+        assert!(
+            txt2.contains("let f =") && !txt2.contains("let rec f"),
+            "non-recursive stays a plain let:\n{txt2}"
         );
     }
 

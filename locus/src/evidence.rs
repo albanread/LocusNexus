@@ -345,7 +345,7 @@ pub fn clause_shape(resume: &str, body: &Ir) -> Shape {
 
 /// Count uses of variable `name` across a block (conservative: a shadowing
 /// inner binder of the same name only ever *raises* the count — safe).
-fn count_var(name: &str, ir: &Ir) -> usize {
+pub(crate) fn count_var(name: &str, ir: &Ir) -> usize {
     match ir {
         Ir::Block { binds, comp, .. } => {
             binds
@@ -359,7 +359,7 @@ fn count_var(name: &str, ir: &Ir) -> usize {
     }
 }
 
-fn count_var_comp(name: &str, c: &Comp) -> usize {
+pub(crate) fn count_var_comp(name: &str, c: &Comp) -> usize {
     let is = |a: &Atom| usize::from(matches!(a, Atom::Var(x) if x == name));
     match c {
         Comp::Atom(a) => is(a),

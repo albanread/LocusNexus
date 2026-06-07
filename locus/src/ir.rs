@@ -1512,11 +1512,13 @@ fn write_ir(s: &mut String, ir: &Ir, depth: usize) {
 fn layout_suffix(layout: ValueLayout) -> String {
     if layout.is_word_cell() {
         // A repr-poly `Var` word cell: traced like a pointer but stored verbatim.
-        // Rendered distinctly from a real pointer (`*`) so the dump shows where the
-        // tag/word matrix applies (`set_word`/`get_word`, not `set_ptr`).
-        "~".to_string()
+        // Rendered distinctly from a real pointer (`:ptr`) so the dump shows where
+        // the tag/word matrix applies (`set_word`/`get_word`, not `set_ptr`).
+        ":word".to_string()
     } else if layout.is_single_pointer_cell() {
-        "*".to_string()
+        // A GC-traced reference cell — e.g. a sum/option payload that is a boxed
+        // heap value, vs. a scalar field (no suffix).
+        ":ptr".to_string()
     } else if layout.is_single_scalar_cell() {
         if layout.byte_width == 8 && layout.align == 8 {
             String::new()
@@ -1896,7 +1898,7 @@ mod tests {
     fn function_values_in_aggregates_are_pointer_fields() {
         let txt = ir_text("let f = fn x: Int => x in (f, 0)", 0);
         assert!(
-            txt.contains("(f*, 0)"),
+            txt.contains("(f:ptr, 0)"),
             "function values stored in managed objects must be traced:\n{txt}"
         );
     }
@@ -1957,15 +1959,15 @@ mod tests {
     #[test]
     fn cons_of_a_scalar_tags_into_a_word_cell_field() {
         // `Cons(1, Nil)` directly: the scalar `1` is tagged, and it is stored into
-        // the constructor's **word cell** (the `a` slot, rendered `~` — a verbatim
-        // traced word, NOT a plain `*` pointer nor a scalar). The recursive `List`
-        // rest is a real pointer (`*`). This is the store side of the matrix.
+        // the constructor's **word cell** (the `a` slot, rendered `:word` — a
+        // verbatim traced word, NOT a plain `:ptr` pointer nor a scalar). The
+        // recursive `List` rest is a real pointer (`:ptr`). The store side of the matrix.
         let txt = ir_text_stdlib("Cons(1, Nil)");
         assert!(txt.contains("tag 1"), "the scalar field is tagged:\n{txt}");
-        // The tagged value lands in a `~` word cell — the verbatim/traced store.
+        // The tagged value lands in a `:word` cell — the verbatim/traced store.
         assert!(
-            txt.contains('~'),
-            "the type-variable field is a word cell (rendered ~):\n{txt}"
+            txt.contains(":word"),
+            "the type-variable field is a word cell (rendered :word):\n{txt}"
         );
     }
 

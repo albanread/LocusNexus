@@ -1366,6 +1366,11 @@ struct MethodUse {
     trait_name: String,
     method: String,
     obligation_ty: Type,
+    /// The method's **instantiated type at this use** (`?a -> Int ! ?r`). Its
+    /// latent-row variable `?r` is bound, pre-zonk, to the resolved instance's
+    /// real method row by [`bind_method_use_rows`] — so a variable-row method
+    /// (`trait-resolution.md` §7.3) surfaces the instance's effect, not nothing.
+    use_ty: Type,
 }
 
 /// A recorded **constrained-generic use** (the [`GENERIC_USES`] entry) — one
@@ -1451,7 +1456,7 @@ fn trait_of_method(method: &str) -> Option<String> {
 /// [`DICT_SENTINEL`]-tagged name the post-zonk [`dict_pass`] keys on. A *trait
 /// method* (single own constraint, declared by a trait) is tagged `M`; any other
 /// constrained binding (a user generic) is tagged `G`.
-fn record_dict_use(name: &str, fresh: &[crate::syntax::Constraint]) -> String {
+fn record_dict_use(name: &str, fresh: &[crate::syntax::Constraint], use_ty: &Type) -> String {
     let id = fresh_dict_id();
     if let Some(trait_name) = trait_of_method(name) {
         // A trait method's minted scheme carries exactly its own `Trait a`
@@ -1470,6 +1475,7 @@ fn record_dict_use(name: &str, fresh: &[crate::syntax::Constraint]) -> String {
                 trait_name,
                 method: name.to_string(),
                 obligation_ty,
+                use_ty: use_ty.clone(),
             })
         });
         dict_tag(name, 'M', id)
@@ -1892,6 +1898,13 @@ pub fn elaborate(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed, 
     if let Err(bug) = crate::tagcheck::check_tags(&tree) {
         panic!("{bug}");
     }
+    // **Effect transparency through trait dispatch (`trait-resolution.md` §7.3).**
+    // Bind each concrete-head method use's latent-row variable to its resolved
+    // instance's real method row — *before* zonk defaults the variable to empty.
+    // Without this, a variable-row method (`tick : b -> Int ! {|r}`) silently
+    // drops the instance's effect from the caller's row, negating the calculus's
+    // "every effect is in the type" guarantee.
+    bind_method_use_rows();
     let tree = unify::with_store(|s| unify::zonk(s, &tree));
     // **Seal no-escape (RN-E0403).** Now that every row is solved, check each
     // pending `seal L { e }` obligation: the sealed label may not escape through
@@ -1982,6 +1995,61 @@ fn check_trait_obligations() -> Result<(), TypeErr> {
 /// ambiguity signal? (A bare top-level `Var`; `resolve_ty` does not default it.)
 fn is_unresolved_var(ty: &Type) -> bool {
     matches!(ty, Type::Var(_))
+}
+
+/// **Bind each trait-method use's latent row to its resolved instance's row**
+/// (`trait-resolution.md` §7.3 — "the resolved method's row surfaces in the
+/// caller's row exactly as a direct call would"). Runs **pre-zonk**, store live.
+///
+/// A method declared with a *variable* row (`tick : b -> Int ! {|r}`) instantiates
+/// a fresh `?r` at every use (`mint_method_scheme` quantifies the row var). The App
+/// rule unions `?r` into the caller, but nothing else constrains it — so zonk
+/// defaults it to the empty row and the *resolved instance's* real effect vanishes
+/// from the caller's row. That is silent effect under-reporting: the worst failure
+/// for a language whose contract is "every effect is in the type".
+///
+/// The fix: for each method use whose obligation resolves to a **concrete head**,
+/// unify the use-site method type (carrying `?r`) against the instance's actual
+/// method type (carrying its real latent row) — binding `?r` to that row before
+/// zonk. *Abstract* uses (head still a variable, e.g. a method called on a
+/// constrained generic's own parameter) are left untouched: their row rides the
+/// enclosing scheme via generalization, exactly as for ordinary row polymorphism.
+/// A fixed-row method is a no-op here (no variable to bind).
+fn bind_method_use_rows() {
+    let uses = METHOD_USES.with(|m| m.borrow().clone());
+    for u in uses {
+        let head = unify::with_store(|s| unify::resolve_ty(s, &u.obligation_ty));
+        // Abstract use — the constraint variable is undetermined here; the row is
+        // carried by the enclosing scheme, not resolvable to an instance row yet.
+        if is_unresolved_var(&head) {
+            continue;
+        }
+        let Some(info) = lookup_instance(&u.trait_name, &head) else {
+            continue; // no instance (a real error) — surfaced by check_trait_obligations
+        };
+        let Some((_, body, _)) = info.method_bodies.iter().find(|(m, ..)| *m == u.method) else {
+            continue;
+        };
+        // Unify the use-site method type with the instance's actual method type.
+        // For a ground-head instance the instance type is concrete, so this only
+        // ever *binds* the use's free latent-row variable (and re-checks the
+        // already-agreeing domain/codomain); it never constrains the instance.
+        let inst_ty = body.ty.clone();
+        let _ = unify::with_store(|s| unify::unify(s, &u.use_ty, &inst_ty));
+    }
+}
+
+/// **Generalize `ty`, but first pin any ready trait-method rows.** A `let`
+/// generalizes its RHS *during* elaboration, before the end-of-program method-row
+/// pass ([`bind_method_use_rows`]) runs — so a helper like `let save = fn c =>
+/// db_exec c "…"` would quantify the method's still-free latent-row variable into
+/// `save`'s scheme and *lose* the instance's effect. Binding the ground-head
+/// method rows here, immediately before [`generalize`], keeps those rows out of
+/// the quantified set: `save`'s effect becomes concrete, not spuriously
+/// polymorphic. No-op (and zero-cost) for any program with no trait-method uses.
+fn generalize_resolved(ty: &Type) -> Scheme {
+    bind_method_use_rows();
+    unify::with_store(|s| generalize(s, ty))
 }
 
 /// **R1 step 2 — discharge `Trait ty` by the unique matching instance.** Looks up
@@ -4084,7 +4152,7 @@ fn elaborate_block(
                     let t1 = t1?;
 
                     let binding = if is_value(e1) {
-                        Binding::Poly(unify::with_store(|s| generalize(s, &t1.ty)))
+                        Binding::Poly(generalize_resolved(&t1.ty))
                     } else {
                         Binding::Mono(t1.ty.clone())
                     };
@@ -4115,7 +4183,7 @@ fn elaborate_block(
                     unify::with_store(|s| s.leave_level());
                     let t1 = t1?;
                     demand_eq(&ty, &t1.ty)?;
-                    let scheme = unify::with_store(|s| generalize(s, &ty));
+                    let scheme = generalize_resolved(&ty);
                     if !scheme.constraints.is_empty() {
                         let constraints: Vec<String> =
                             scheme.constraints.iter().map(|c| c.to_string()).collect();
@@ -5579,7 +5647,7 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
                                 // Sprint-2 resolution pass; we only read their fresh
                                 // type variables for the dictionary bridge.
                                 let fresh = unify::peek_obligations_since(before);
-                                let name = record_dict_use(x, &fresh);
+                                let name = record_dict_use(x, &fresh, &t);
                                 return Ok(Typed::at(t, Row::pure(), stage, Node::Var(name)));
                             }
                         }
@@ -5825,7 +5893,7 @@ fn elaborate_inner(sig: &Sig, ctx: &Ctx, stage: Stage, e: &Term) -> Result<Typed
             let t1 = t1?;
 
             let binding = if is_value(e1) {
-                Binding::Poly(unify::with_store(|s| generalize(s, &t1.ty)))
+                Binding::Poly(generalize_resolved(&t1.ty))
             } else {
                 Binding::Mono(t1.ty.clone())
             };
@@ -8283,6 +8351,72 @@ mod tests {
         )
         .expect("the abstract `Show a` rides describe's scheme; its use resolves at Int");
         assert_eq!(t.ty, Type::Str);
+    }
+
+    /// **Effect transparency through trait dispatch with a FIXED method row.**
+    /// Regression guard: a trait method declared `! {mem_access}` surfaces that
+    /// effect at a concrete use. (This already works; it pins the contrast with
+    /// the variable-row case below.)
+    #[test]
+    fn trait_method_with_fixed_row_surfaces_its_effect() {
+        let t = check_src(
+            "effect mem_access : Int -> Int in \
+             type MemC = MemC(Int) in \
+             trait Backend b { tick : b -> Int ! {mem_access} } in \
+             instance Backend MemC { tick = fn c: MemC => mem_access 1 } in \
+             tick (MemC(0))",
+        )
+        .expect("type-checks");
+        let row = format!("{}", t.row);
+        assert!(row.contains("mem_access"), "fixed-row method effect, got `{row}`");
+    }
+
+    /// **Effect transparency through trait dispatch with a VARIABLE method row
+    /// (`trait-resolution.md` §7.3).** A method declared `! {|r}` lets instances
+    /// differ; the *resolved instance's* latent row must surface in the caller —
+    /// otherwise generic dispatch silently drops effects, negating "every effect
+    /// is in the type". The `MemC` instance performs `mem_access`, so using `tick`
+    /// at `MemC` must put `mem_access` in the program's row.
+    #[test]
+    fn trait_method_with_variable_row_propagates_resolved_instance_effect() {
+        let t = check_src(
+            "effect mem_access : Int -> Int in \
+             type MemC = MemC(Int) in \
+             trait Backend b { tick : b -> Int ! {|r} } in \
+             instance Backend MemC { tick = fn c: MemC => mem_access 1 } in \
+             tick (MemC(0))",
+        )
+        .expect("type-checks");
+        let row = format!("{}", t.row);
+        assert!(
+            row.contains("mem_access"),
+            "a variable-row trait method must surface the resolved instance's \
+             latent row (here `mem_access`); dropping it negates effect \
+             transparency. got `{row}`"
+        );
+    }
+
+    /// **The effect survives `let`-generalization of a wrapping helper.** The
+    /// harder case: `go` is a generalized helper that calls a variable-row method
+    /// on a concrete instance. Without binding the method row *before* generalize
+    /// (`generalize_resolved`), `go`'s scheme would quantify the still-free row var
+    /// and lose `mem_access`. The program's row must carry it.
+    #[test]
+    fn trait_method_variable_row_effect_survives_let_generalization() {
+        let t = check_src(
+            "effect mem_access : Int -> Int in \
+             type MemC = MemC(Int) in \
+             trait Backend b { tick : b -> Int ! {|r} } in \
+             instance Backend MemC { tick = fn c: MemC => mem_access 1 } in \
+             let go = fn u: Unit => tick (MemC(0)) in go ()",
+        )
+        .expect("type-checks");
+        let row = format!("{}", t.row);
+        assert!(
+            row.contains("mem_access"),
+            "the instance effect must survive let-generalization of the wrapping \
+             helper (generalize_resolved binds it pre-quantification), got `{row}`"
+        );
     }
 
     /// **R1 step 3 — no instance (`RN-E0230`).** A trait method used at a type with

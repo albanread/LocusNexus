@@ -114,6 +114,33 @@ are all inside the one `locus-ide.exe`.
 *F1 — the integrated manual: a browsable, diagram-rendering help pane (here, the
 Graphics and input page and its world-boundary diagram).*
 
+## The compiler, in the open
+
+The IDE will also show you, step by step, how your code compiles. The **Locus**
+menu opens three views of the current buffer, beside the source:
+
+- **Show ANF IR** — the Locus intermediate form. Your program in A-normal form:
+  every intermediate value named by a `let`, every call and branch made explicit,
+  tail calls marked. It is still *highly reviewable* — you can read your program's
+  shape in it. This is the last stage that still looks like Locus.
+- **Show LLVM IR** — what the backend emits from the ANF: lower-level, in SSA
+  form, and frankly less readable, but the exact module handed to LLVM.
+- **Show Assembly** — the host x86-64 it lowers to.
+
+<img src="../selfie_three_phases.png" alt="The compiler explorer: source, ANF, LLVM IR, and assembly side by side" width="760">
+
+*Source → ANF → LLVM IR → assembly, side by side — the same Julia kernel at every
+stage of the pipeline.*
+
+One choice here is deliberate: the assembly is shown **un-optimised**. At `-O2`,
+LLVM is a brilliant editor — it would hoist, fold, and vectorise away much of what
+the front end emitted, and you'd be reading LLVM's work, not Locus's. These views
+are for seeing what **Locus itself** is doing: that a `loop` became a register
+phi, that the scalars never boxed, that a saturated call lowered to a direct one.
+Reading the un-optimised assembly is the white-box way to confirm the front end
+emitted good code; watching an animation run smooth — or stutter — is the
+black-box way. The IDE gives you both.
+
 ## Your first graphics
 
 The smallest graphical program opens a pane, clears it, writes a word, and

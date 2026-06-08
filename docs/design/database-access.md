@@ -396,50 +396,26 @@ process* is a separate question, answered in §10.
 
 ---
 
-## 9. SQLite reference: what exists, what to build
+## 9. The SQLite reference
 
-**Built and verified:**
-- The `rusqlite` plugin, hardened: every shim entry `catch_unwind`-guarded;
+This design is realized by the bundled SQLite service plugin:
+
+- The hardened `rusqlite` shim — every entry `catch_unwind`-guarded;
   prepared/parameterized statements; NULL fidelity; the in-memory sandbox
-  (authorizer denies `ATTACH`/file-PRAGMA). *(steps 0–1)*
-- `SqliteMem` / `SqliteFs` split with the distinct `sqlite_fs` effect minted at a
-  dedicated on-disk boundary. *(step 2)*
+  (authorizer denies `ATTACH`/file-PRAGMA).
+- The `SqliteMem` / `SqliteFs` split, with the distinct `sqlite_fs` effect minted
+  at a dedicated on-disk boundary.
 - The generic **`Database`** service: phantom-typed `Conn[b]`, capability-honest
   rows (`db_open_memory → {sqlite}`, `db_open_file → {sqlite, sqlite_fs}`),
-  backend-mix rejected by the type checker, generic `db_*` ops. *(step 3)*
+  backend-mix rejected by the type checker, generic `db_*` ops.
 - The **`vault_access`** credential layer: connect by profile name
   (`db_open_profile`), credential = JSON parameter dictionary split into a public
-  `ConnMeta` and an unreadable `Secret`; verified that a password never reaches
-  app scope. Runtime-dispatched connections are `Conn[Dyn]` with the honest
-  worst-case row `{cred_access, sqlite, sqlite_fs}`. *(step 4)*
+  `ConnMeta` and an unreadable `Secret` — a password never reaches app scope.
+  Runtime-dispatched connections are `Conn[Dyn]` with the honest worst-case row
+  `{cred_access, sqlite, sqlite_fs}`.
 - Demos: `examples/{sqlite_demo, sqlite_prepared, db_layer, db_credentials}.locus`.
 
-**Future refinements:** a `Credentials` *service* that seals `cred_access`
-and restricts provisioning (today the vault boundary is exposed directly); BLOB
-support (needs a bytes ABI); `with_db`/`with_query`/`with_transaction` scope
-combinators; the cross-DBMS generic op (awaits a backend-generic effect, i.e.
-associated effects). The original flat `sql_*` surface also remains.
-
-**To build for this design:**
-0. **Harden the existing shim first:** wrap every `#[no_mangle]` entry in
-   `catch_unwind` → `set_last_error` + sentinel; add `db_is_null`, blob
-   bind/get, and non-coercing readers.
-1. Extend the `sqlite_access` shim with `prepare`/`bind_*`/`run_*`/`reset`/
-   `finalize`; model a `Stmt` as `(conn, generation, sql, Vec<Value>)` with
-   `prepare_cached`. Boundary exposes `mem_open` (`{sqlite_access}`)
-   and `file_open` (`{sqlite_access, sqlite_fs}`) — `sqlite_fs` minted here.
-2. `SqliteMem` (`:memory:`, with the `ATTACH`/`PRAGMA` authorizer) and
-   `SqliteFs` (file path) services; opens typed `Conn[SqliteMem]` / `Conn[SqliteFs]`.
-3. `Db` layer (§5 vocabulary) with **type-directed** effect-polymorphic ops over
-   `Conn[b]`; the `Sql` literal-only newtype + `db_ident`;
-   `with_db`/`with_query`/`with_transaction` combinators (resource-discipline).
-4. `vault_access` (fetch a profile blob; bounded `serde_json` parse) →
-   **`ConnMeta` (readable) + `Secret` (no accessor)**; a `Credentials`
-   service exposing `meta_*` only; wire `db_open profile` = resolve →
-   `meta_backend` dispatch → `<driver>.open meta secret`.
-5. Demos: (a) parameterized query + prepared-loop insert on an in-memory db; (b)
-   `db_open "profile"` connecting by name through a credential dictionary — both
-   with the effect manifest shown.
+See [database-implementation.md](database-implementation.md) for the full API surface.
 
 ---
 

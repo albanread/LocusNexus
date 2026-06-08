@@ -9,15 +9,14 @@ what the API looks like, and what the four shipped examples demonstrate.*
 
 ## What was built
 
-Five Locus modules and a Rust plugin shim, added across four commits:
+Five Locus modules and a Rust plugin shim:
 
-| commit | what it added |
-|--------|---------------|
-| `c545ffe` | `SqliteFfi` boundary + `Sqlite` service + basic `sqlite_demo.locus` |
-| `703fd10` | Prepared/parameterized statements; in-memory authorizer sandbox; `sqlite_prepared.locus` |
-| `403822b` | Phantom-typed `Conn[b]`, `Database` service (generic `db_*` API), `db_layer.locus` |
-| `776277f` | `SqliteDisk` boundary, `VaultAccess` boundary, credential vault; `db_credentials.locus` |
-| `0d0ed34` | Scope combinators not yet on the surface |
+- the `SqliteFfi` boundary and the concrete `Sqlite` service;
+- prepared / parameterized statements and the in-memory authorizer sandbox;
+- the phantom-typed `Conn[b]` and the generic `Database` service (`db_*` API);
+- the `SqliteDisk` and `VaultAccess` boundaries and the credential vault;
+- four runnable examples (`sqlite_demo`, `sqlite_prepared`, `db_layer`,
+  `db_credentials`).
 
 The plugin (`locus-sqlite`) lives in `plugins/sqlite/`; it is linked into the
 worker at build time and its symbols are injected into the JIT at startup.
@@ -268,20 +267,3 @@ inside the vault shim.
 **Effect row:** `{ cred_access, sqlite, sqlite_fs, gc }` — honest worst-case for
 runtime-dispatched backend.
 
----
-
-## Future additions
-
-**Scope combinators** (`with_db`, `with_query`, `with_transaction`) are designed
-and their types verified, but not yet on the surface: the flat
-`db_open … db_close` primitives are the current front door. Enabling the
-combinators as the preferred surface is a future step.
-
-**BLOB columns** — cells read as `<blob N bytes>` placeholder text. A proper
-bytes ABI (a non-cstr pointer+length pair) is needed to cross binary data between
-the plugin and Locus; that is out of scope for now.
-
-**A `Credentials` service** — today the vault boundary is exposed directly via
-`cred_provision` / `cred_resolve`. A clean `Credentials` *service* that seals
-`cred_access` and restricts provisioning to an explicit setup path is the next
-layer; `db_open_profile` would call through it.

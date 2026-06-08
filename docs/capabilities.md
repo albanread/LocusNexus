@@ -258,10 +258,7 @@ can read.
 
 ## Decided by wrapping Win32 (and binding the GC)
 
-> **The sealing/capability core is implemented.** The
-> mint/seal build is shipped + tested ([`sealing-plan.md`](sealing-plan.md);
-> [`sealing-solution.md`](sealing-solution.md); user tour in
-> [`user-guide-mint-and-seal.md`](user-guide-mint-and-seal.md)): **O-C3** — minting
+> **The sealing/capability core is implemented.** **O-C3** — minting
 > is `boundary`-only + manifest-gated via `locus.toml [boundary]`
 > (`RN-E0402`/`RN-E0404`), and the gate covers `extern`, raw memory
 > (`peek`/`poke`/`fill`/`copy`), **and `extern asm`**; **O-C5** — per-provider mint

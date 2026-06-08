@@ -1,0 +1,336 @@
+-- Minesweeper in a pane — a graphical Locus demo.
+--
+-- A 12×12 field with 24 mines. Left-click to dig; the first dig is always safe
+-- (the mines are laid down *after* it, never under or next to it) and the board
+-- is fresh each game — seeded from where and when you first click. Clearing a
+-- 0 floods open its neighbours, the classic way.
+--
+--   click          dig the cell (in DIG mode) / toggle a flag (in FLAG mode)
+--   f              switch between DIG and FLAG mode
+--   n              new game
+--   Esc            quit
+--
+-- The field is two flat mutable Array[Int]s (r*12 + c): `mines` (1 = mine) and
+-- `shown` (0 = hidden, 1 = dug, 2 = flagged), mutated in place. The event loop
+-- packs the run flag, the pane size, the phase, the flag-mode bit, and a frame
+-- counter (the entropy for the first-click seed) into one Int.
+--
+-- Run it with F5 inside `locus-ide`. Effects: { graphics, event, gc, mem } —
+-- confined to draw-and-input. It cannot touch the filesystem or the network,
+-- and the IDE's effects pane shows exactly that.
+
+let grid = 12 in
+let ncells = 144 in
+let mines_total = 24 in
+
+let hidden = 0 in
+let dug = 1 in
+let flagged = 2 in
+
+-- phases: 0 = fresh (mines not yet laid), 1 = playing, 2 = won, 3 = lost.
+
+-- ── grid helpers ────────────────────────────────────────────────────────────
+let index = fn r: Int => fn c: Int => (r * grid) + c in
+
+let inBounds = fn r: Int => fn c: Int =>
+  if r < 0 then false
+  else if r >= grid then false
+  else if c < 0 then false
+  else if c >= grid then false
+  else true
+in
+
+let mineAt = fn mines: Array[Int] => fn r: Int => fn c: Int =>
+  if inBounds r c then mines[index r c] == 1 else false
+in
+let mineBit = fn mines: Array[Int] => fn r: Int => fn c: Int =>
+  if mineAt mines r c then 1 else 0
+in
+-- Mines in the eight cells around (r, c).
+let adjacent = fn mines: Array[Int] => fn r: Int => fn c: Int =>
+  (mineBit mines (r - 1) (c - 1)) + (mineBit mines (r - 1) c) +
+  (mineBit mines (r - 1) (c + 1)) + (mineBit mines r (c - 1)) +
+  (mineBit mines r (c + 1)) + (mineBit mines (r + 1) (c - 1)) +
+  (mineBit mines (r + 1) c) + (mineBit mines (r + 1) (c + 1))
+in
+
+-- ── mine placement (a scalar LCG, so stepping it never allocates) ────────────
+let lcg = fn s: Int => ((s * 1103515245) + 12345) & 0x7FFFFFFF in
+
+-- The 3×3 around the first dig stays clear, so the first click always opens.
+let inSafe = fn sr: Int => fn sc: Int => fn r: Int => fn c: Int =>
+  if r < sr - 1 then false
+  else if sr + 1 < r then false
+  else if c < sc - 1 then false
+  else if sc + 1 < c then false
+  else true
+in
+
+let placeMines =
+  fn mines: Array[Int] => fn sr: Int => fn sc: Int => fn seed0: Int =>
+    loop placed = 0, seed = seed0 while placed < mines_total do
+      (let s = lcg seed in
+       let pos = s % ncells in
+       let r = pos / grid in
+       let c = pos % grid in
+       if inSafe sr sc r c then placed
+       else if mines[pos] == 1 then placed
+       else (let _ = mines[pos] <- 1 in placed + 1)),
+      lcg seed
+    else ()
+in
+
+-- ── flood-reveal: repeatedly dig any hidden safe cell that touches a dug 0,
+-- until a pass changes nothing (the classic open-region expansion) ───────────
+let dugZeroAt =
+  fn mines: Array[Int] => fn shown: Array[Int] => fn r: Int => fn c: Int =>
+    if inBounds r c then
+      if shown[index r c] == dug then adjacent mines r c == 0 else false
+    else false
+in
+let touchesDugZero =
+  fn mines: Array[Int] => fn shown: Array[Int] => fn r: Int => fn c: Int =>
+    if dugZeroAt mines shown (r - 1) (c - 1) then true
+    else if dugZeroAt mines shown (r - 1) c then true
+    else if dugZeroAt mines shown (r - 1) (c + 1) then true
+    else if dugZeroAt mines shown r (c - 1) then true
+    else if dugZeroAt mines shown r (c + 1) then true
+    else if dugZeroAt mines shown (r + 1) (c - 1) then true
+    else if dugZeroAt mines shown (r + 1) c then true
+    else if dugZeroAt mines shown (r + 1) (c + 1) then true
+    else false
+in
+let floodPass = fn mines: Array[Int] => fn shown: Array[Int] =>
+  loop pos = 0, changed = false while pos < ncells do
+    pos + 1,
+    (let r = pos / grid in
+     let c = pos % grid in
+     if mines[pos] == 0 then
+       if shown[pos] == hidden then
+         if touchesDugZero mines shown r c then (let _ = shown[pos] <- dug in true)
+         else changed
+       else changed
+     else changed)
+  else changed
+in
+let flood = fn mines: Array[Int] => fn shown: Array[Int] =>
+  loop pass = 0, changed = true while (if pass < ncells then changed else false) do
+    pass + 1, floodPass mines shown
+  else ()
+in
+
+-- Dig (r, c): returns 1 if it was a mine, else 0 (and floods open any region).
+let dig = fn mines: Array[Int] => fn shown: Array[Int] => fn r: Int => fn c: Int =>
+  let i = index r c in
+  if shown[i] != hidden then 0
+  else
+    let _ = shown[i] <- dug in
+    if mines[i] == 1 then 1
+    else (let _ = flood mines shown in 0)
+in
+
+let revealAllMines = fn mines: Array[Int] => fn shown: Array[Int] =>
+  loop i = 0 while i < ncells do
+    (let _ = if mines[i] == 1 then (shown[i] <- dug) else () in i + 1)
+  else ()
+in
+
+-- Count cells in a given state (dug → win check; flagged → mines-left display).
+let countState = fn shown: Array[Int] => fn want: Int =>
+  loop i = 0, n = 0 while i < ncells do
+    i + 1, (if shown[i] == want then n + 1 else n)
+  else n
+in
+
+let clearBoard = fn mines: Array[Int] => fn shown: Array[Int] =>
+  let _ = array_fill_int mines 0 in
+  let _ = array_fill_int shown 0 in
+  ()
+in
+
+-- ── geometry: the square field centred under a status strip, sized to the pane ─
+let cellOf = fn bw: Int => fn bh: Int =>
+  let aw = bw - 20 in
+  let ah = bh - 56 in
+  let avail = if aw < ah then aw else ah in
+  if avail < 96 then 8 else avail / grid
+in
+let originX = fn bw: Int => fn bh: Int => (bw - (cellOf bw bh * grid)) / 2 in
+let originTop = 44 in
+
+let pane = open_window "Minesweeper" in
+let _ = set_redraw_rate pane 50 in
+
+-- ── text ─────────────────────────────────────────────────────────────────────
+let d10 = fn n: Int =>
+  if n == 0 then "0" else if n == 1 then "1" else if n == 2 then "2"
+  else if n == 3 then "3" else if n == 4 then "4" else if n == 5 then "5"
+  else if n == 6 then "6" else if n == 7 then "7" else if n == 8 then "8" else "9"
+in
+let numStr = fn n: Int =>
+  if n < 10 then d10 n else string_concat (d10 (n / 10)) (d10 (n % 10))
+in
+
+-- A dug count drawn in its classic colour (1 blue, 2 green, 3 red, …).
+let drawCount = fn n: Int => fn x: Float => fn y: Float =>
+  if n == 1 then draw_text pane x y "1" 0.30 0.50 0.98 1.0
+  else if n == 2 then draw_text pane x y "2" 0.22 0.64 0.32 1.0
+  else if n == 3 then draw_text pane x y "3" 0.93 0.30 0.28 1.0
+  else if n == 4 then draw_text pane x y "4" 0.50 0.34 0.86 1.0
+  else if n == 5 then draw_text pane x y "5" 0.74 0.34 0.20 1.0
+  else if n == 6 then draw_text pane x y "6" 0.20 0.66 0.70 1.0
+  else if n == 7 then draw_text pane x y "7" 0.85 0.85 0.90 1.0
+  else draw_text pane x y "8" 0.62 0.62 0.68 1.0
+in
+
+let statusText = fn shown: Array[Int] => fn phase: Int => fn flag: Int =>
+  let left = mines_total - (countState shown flagged) in
+  let head = string_concat "Mines: " (numStr (if left < 0 then 0 else left)) in
+  let mode = if flag == 1 then "   [FLAG]" else "   [DIG]" in
+  let tail =
+    if phase == 2 then "    YOU WIN!   (n new game)"
+    else if phase == 3 then "    BOOM!   (n new game)"
+    else "    click dig · f flag-mode · n new · Esc quit"
+  in
+  string_concat (string_concat head mode) tail
+in
+
+-- ── draw the whole field ─────────────────────────────────────────────────────
+let drawBoard =
+  fn mines: Array[Int] => fn shown: Array[Int] =>
+  fn phase: Int => fn flag: Int => fn bw: Int => fn bh: Int =>
+    let cell = cellOf bw bh in
+    let ox = originX bw bh in
+    let oy = originTop in
+    let _ = gfx_begin pane in
+    let _ = clear 0.10 0.11 0.14 1.0 in
+    let _ = draw_text pane 12.0 12.0 (statusText shown phase flag) 0.88 0.90 0.96 1.0 in
+    let _ =
+      loop r = 0 while r < grid do
+        let _ =
+          loop c = 0 while c < grid do
+            let i = index r c in
+            let x0i = ox + (c * cell) in
+            let y0i = oy + (r * cell) in
+            let x0 = toFloat (x0i + 1) in
+            let y0 = toFloat (y0i + 1) in
+            let x1 = toFloat (x0i + cell - 1) in
+            let y1 = toFloat (y0i + cell - 1) in
+            let cx = toFloat (x0i + (cell / 2)) in
+            let cy = toFloat (y0i + (cell / 2)) in
+            let s = shown[i] in
+            let _ =
+              if s == hidden then
+                let _ = fill_rect x0 y0 x1 y1 0.62 0.63 0.67 1.0 in
+                stroke_rect x0 y0 x1 y1 1.0 0.34 0.35 0.39 1.0
+              else if s == flagged then
+                let _ = fill_rect x0 y0 x1 y1 0.62 0.63 0.67 1.0 in
+                let _ = stroke_rect x0 y0 x1 y1 1.0 0.34 0.35 0.39 1.0 in
+                fill_circle cx cy (toFloat (cell / 5)) 0.92 0.22 0.18 1.0
+              else
+                if mines[i] == 1 then
+                  let _ = fill_rect x0 y0 x1 y1 0.82 0.24 0.22 1.0 in
+                  fill_circle cx cy (toFloat (cell / 4)) 0.08 0.07 0.10 1.0
+                else
+                  let _ = fill_rect x0 y0 x1 y1 0.20 0.21 0.25 1.0 in
+                  let n = adjacent mines r c in
+                  if n == 0 then ()
+                  else
+                    drawCount n
+                      (toFloat (x0i + ((cell * 36) / 100)))
+                      (toFloat (y0i + ((cell * 16) / 100)))
+            in
+            c + 1
+          else c
+        in
+        r + 1
+      else r
+    in
+    gfx_submit ()
+in
+
+-- Pixel (px, py) → cell index, or -1 if outside the field.
+let cellAt = fn px: Int => fn py: Int => fn bw: Int => fn bh: Int =>
+  let cell = cellOf bw bh in
+  let ox = originX bw bh in
+  let oy = originTop in
+  let span = cell * grid in
+  if px < ox then (0 - 1)
+  else if py < oy then (0 - 1)
+  else if px >= ox + span then (0 - 1)
+  else if py >= oy + span then (0 - 1)
+  else (let c = (px - ox) / cell in let r = (py - oy) / cell in index r c)
+in
+
+-- A click → the new phase. Mutates the board in place.
+let handleClick =
+  fn mines: Array[Int] => fn shown: Array[Int] =>
+  fn px: Int => fn py: Int => fn bw: Int => fn bh: Int =>
+  fn phase: Int => fn flag: Int => fn frame: Int =>
+    if phase == 2 then phase
+    else if phase == 3 then phase
+    else
+      let pos = cellAt px py bw bh in
+      if pos < 0 then phase
+      else
+        let r = pos / grid in
+        let c = pos % grid in
+        if flag == 1 then
+          let s = shown[pos] in
+          if s == hidden then (let _ = shown[pos] <- flagged in phase)
+          else if s == flagged then (let _ = shown[pos] <- hidden in phase)
+          else phase
+        else
+          let s = shown[pos] in
+          if s == flagged then phase
+          else if s == dug then phase
+          else if phase == 0 then
+            -- the first dig: lay the mines clear of here, then dig.
+            let seed0 =
+              ((px * 7919) + (py * 104729) + (frame * 1299709) + 12345) & 0x7FFFFFFF in
+            let _ = placeMines mines r c seed0 in
+            let hit = dig mines shown r c in
+            if hit == 1 then (let _ = revealAllMines mines shown in 3)
+            else if countState shown dug == ncells - mines_total then 2
+            else 1
+          else
+            let hit = dig mines shown r c in
+            if hit == 1 then (let _ = revealAllMines mines shown in 3)
+            else if countState shown dug == ncells - mines_total then 2
+            else 1
+in
+
+let mines = array_make_int ncells 0 in
+let shown = array_make_int ncells 0 in
+
+-- Event loop. One Int carries: bit0 = running, bits 1..12 = pane width,
+-- bits 13..24 = pane height, bits 25..26 = phase, bit 27 = flag-mode,
+-- bits 28..43 = a frame counter (entropy for the first-click seed).
+let pack =
+  fn go: Int => fn w: Int => fn h: Int => fn phase: Int => fn flag: Int => fn frame: Int =>
+    go | ((w & 0xFFF) << 1) | ((h & 0xFFF) << 13)
+       | ((phase & 3) << 25) | ((flag & 1) << 27) | ((frame & 0xFFFF) << 28)
+in
+
+loop st = (pack 1 480 540 0 0 0) while (st & 1) == 1 do
+  let bw = (st >> 1) & 0xFFF in
+  let bh = (st >> 13) & 0xFFF in
+  let phase = (st >> 25) & 3 in
+  let flag = (st >> 27) & 1 in
+  let frame = (st >> 28) & 0xFFFF in
+  let _ = drawBoard mines shown phase flag bw bh in
+  match poll_event 50 with
+  | MouseDown(px, py) =>
+      let np = handleClick mines shown px py bw bh phase flag frame in
+      pack 1 bw bh np flag ((frame + 1) & 0xFFFF)
+  | Key(k) =>
+      if k == 27 then pack 0 bw bh phase flag frame
+      else if k == 78 then (let _ = clearBoard mines shown in pack 1 bw bh 0 flag ((frame + 1) & 0xFFFF))
+      else if k == 70 then pack 1 bw bh phase (1 - flag) ((frame + 1) & 0xFFFF)
+      else pack 1 bw bh phase flag ((frame + 1) & 0xFFFF)
+  | Resize(nw, nh) => pack 1 nw nh phase flag frame
+  | Close => pack 0 bw bh phase flag frame
+  | _ => pack 1 bw bh phase flag ((frame + 1) & 0xFFFF)
+else
+  let _ = close_window pane in
+  countState shown dug

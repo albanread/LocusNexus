@@ -375,3 +375,11 @@ enough to play Othello in.
 
 — Back to the [guide index](index.md), or read how the boundary works in general
 in [Modules and capabilities](modules-and-capabilities.md).
+
+---
+
+## Get it
+
+The IDE ships as a self-contained Windows zip — no install, no runtime to fetch.
+See the **[Download page](download.md)** for what's in the bundle and how to get
+started.

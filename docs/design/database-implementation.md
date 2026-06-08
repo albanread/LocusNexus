@@ -1,7 +1,7 @@
 # Locus — Database Access: What Is Built
 
-*2026-06-07. Companion to [database-access.md](database-access.md) (the layered
-design proposal) and [rust-service-plugins.md](rust-service-plugins.md) (the
+*Companion to [database-access.md](database-access.md) (the layered
+design) and [rust-service-plugins.md](rust-service-plugins.md) (the
 plugin model). This page documents the **implementation** — what is committed,
 what the API looks like, and what the four shipped examples demonstrate.*
 
@@ -17,7 +17,7 @@ Five Locus modules and a Rust plugin shim, added across four commits:
 | `703fd10` | Prepared/parameterized statements; in-memory authorizer sandbox; `sqlite_prepared.locus` |
 | `403822b` | Phantom-typed `Conn[b]`, `Database` service (generic `db_*` API), `db_layer.locus` |
 | `776277f` | `SqliteDisk` boundary, `VaultAccess` boundary, credential vault; `db_credentials.locus` |
-| `0d0ed34` | Deferred `with_db`/`with_query` scope combinators (T0 coercion bug — see below) |
+| `0d0ed34` | Scope combinators not yet on the surface |
 
 The plugin (`locus-sqlite`) lives in `plugins/sqlite/`; it is linked into the
 worker at build time and its symbols are injected into the JIT at startup.
@@ -270,7 +270,7 @@ runtime-dispatched backend.
 
 ---
 
-## What is deferred
+## Future additions
 
 **Scope combinators** (`with_db`, `with_query`, `with_transaction`) are designed
 and their types verified, but not yet on the surface: the flat
@@ -279,7 +279,7 @@ combinators as the preferred surface is a future step.
 
 **BLOB columns** — cells read as `<blob N bytes>` placeholder text. A proper
 bytes ABI (a non-cstr pointer+length pair) is needed to cross binary data between
-the plugin and Locus; that is out of scope for the current plugin sprint.
+the plugin and Locus; that is out of scope for now.
 
 **A `Credentials` service** — today the vault boundary is exposed directly via
 `cred_provision` / `cred_resolve`. A clean `Credentials` *service* that seals

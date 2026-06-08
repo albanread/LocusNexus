@@ -6,7 +6,7 @@ that builds the Locus worker grants capabilities; deployment never can. This is
 the mint/seal model ([modules-and-capabilities](../guide/modules-and-capabilities.md))
 extended into an organized, repeatable Rust-side contract.*
 
-Status: **design — decided.** Trust model and the open questions below are
+Status: **design — decided.** Trust model and the design notes below are
 settled; this is the spec a first plugin is built against. It formalizes the
 wiring services already use, so adding the next one is a self-contained drop-in
 instead of four hand-edits across the worker.
@@ -239,8 +239,8 @@ The C-ABI carries `i64` / `f64` / `Ptr` only. The conventions, pinned:
 - **Strings** cross **in** as `(Ptr, Int)` (a UTF-8 view — `str_in(ptr,len) -> &[u8]`)
   and **out** as an `i64` String handle (`string_out(s) -> handle`, over the
   runtime's `locus_string_from_utf8`). Plugins never hand-roll UTF-8 marshalling —
-  that path is centralized in `locus-plugin` (and was the source of the
-  FFI-buffer leaks now fixed).
+  that path is centralized in `locus-plugin`, so buffer ownership is handled in
+  one audited place.
 - **Rich values** (`serde_json::Value`, a `PgConnection`, a parsed tree) are
   **host-owned** in a per-plugin `Registry<T>` (a slab behind a `Mutex`) and shown
   to Locus as an **opaque `i64` handle**. Every op takes the handle. The
@@ -264,7 +264,7 @@ The C-ABI carries `i64` / `f64` / `Ptr` only. The conventions, pinned:
 GC-blind types — scalars, `Ptr`, `Unit`, `String`. Handles are `i64`, so they are
 GC-blind by construction. A plugin never takes a raw `Array`/sum/record/`Tuple`
 (a movable managed datum) across the boundary; bulk Locus data goes via the
-shared-buffer pattern (or pinning, once GC pin hooks land — deferred).
+shared-buffer pattern (or pinning, once GC pin hooks land — a future addition).
 
 ---
 
@@ -341,7 +341,7 @@ Platform-owned; removes the boilerplate so a plugin is mostly "wrap the crate":
 
 ---
 
-## Decisions (was "open")
+## Decisions
 
 1. **Trust/linking** — compile-time static; no runtime loader in v1. *(settled)*
 2. **Symbol derivation** — `#[locus_export]` sets the export name *and* records
@@ -349,10 +349,10 @@ Platform-owned; removes the boilerplate so a plugin is mostly "wrap the crate":
    (`service_plugins()`) stays explicit for auditability.
 3. **Errors** — `0 = no value`; service assigns `Option` (partial) vs `Result`/`exn`
    (fallible) reading a per-thread `last_error`. One convention, in `locus-plugin`.
-4. **Async** — blocking v1, plugin owns its runtime; future-handle tier deferred.
+4. **Async** — blocking v1, plugin owns its runtime; future-handle tier is a future addition.
 5. **Granularity** — one effect per *capability* (`effects: &[…]`), split for least
    privilege (`{fs_read}`/`{fs_write}`); no coarse umbrella effect.
-6. **Bulk Locus→plugin data** — shared-buffer (`{mem}`); GC pinning deferred to the
+6. **Bulk Locus→plugin data** — shared-buffer (`{mem}`); GC pinning arrives with the
    pin hooks.
 
 ---

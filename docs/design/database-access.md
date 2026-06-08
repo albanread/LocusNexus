@@ -1,8 +1,6 @@
 # Locus — Database Access (layered design)
 
-*Drafted 2026-06-07; revised the same day after an adversarial design review (the
-fixes are tagged inline and summarized in §8/§10). A **working proposal** (OPEN).
-Companion to
+*The layered database-access design. Companion to
 [`../capabilities.md`](../capabilities.md) (the layer/seal model) and the
 service-plugin design [`rust-service-plugins.md`](rust-service-plugins.md) (how a
 Rust crate becomes a sealed Locus effect). This document specializes both to one
@@ -115,7 +113,7 @@ database is provably sandboxed.
 > path also carries a distinct **`sqlite_fs`** effect: `SqliteMem` surfaces
 > `{ sqlite_access }`, `SqliteFs` surfaces `{ sqlite_access, sqlite_fs }`.
 >
-> **Where `sqlite_fs` is minted (review fix A).** Minting is `boundary`-only
+> **Where `sqlite_fs` is minted.** Minting is `boundary`-only
 > (`RN-E0402`); a *service* cannot mint. So `sqlite_fs` is minted **in the
 > `sqlite_access` plugin boundary**, not in the `SqliteFs` service: the boundary
 > exposes two opens — `mem_open` carrying `{ sqlite_access }` and `file_open`
@@ -153,7 +151,7 @@ parameters — `backend`, `host`, `port`, `dbname`, `user`, `password`, `certpat
   "dbname": "analytics", "user": "svc_ro", "password": "…", "sslmode": "require" }
 ```
 
-**Resolving splits the dictionary into two typed values (review fix C).** A
+**Resolving splits the dictionary into two typed values.** A
 single opaque `Cred` with string-keyed accessors was a mistake: if any layer can
 call `cred_str cred "host"`, it can call `cred_str cred "password"`, so "secrets
 never reach the app" reduces to *every layer choosing not to read it* — discipline,
@@ -178,7 +176,7 @@ not structure. Instead `vault_access` partitions the parsed dictionary at the se
   can be *moved*, never *read* — so "the password never becomes a readable value"
   is a type-level fact, not a convention. (Which JSON keys are secret is decided
   by `vault_access` from a per-backend manifest, not by the caller.)
-- **Dispatch reads only the public tag (review fix J).** `Db` calls
+- **Dispatch reads only the public tag.** `Db` calls
   `meta_backend` — a public field — to choose the driver. It never holds a
   `Secret`-reading capability because none exists; the secret-reading TCB shrinks
   to the driver's connect path. Dispatch and credentials remain "the same decision
@@ -200,9 +198,9 @@ not structure. Instead `vault_access` partitions the parsed dictionary at the se
 `Db` is the one module the app imports for *operations*. It is **backend-neutral**,
 and the organizing principle is:
 
-> **The connection directs the flow — at the type level (review fix B).** The app
-> opens a *connection* and the connection routes every operation. The subtlety the
-> review caught: if `Conn` is a bare `i64` and `db_exec` dispatches on a *runtime*
+> **The connection directs the flow — at the type level.** The app
+> opens a *connection* and the connection routes every operation. The subtlety:
+> if `Conn` is a bare `i64` and `db_exec` dispatches on a *runtime*
 > tag, then `db_exec`'s effect row is one fixed static thing — it must either be
 > the *union* of all backends (so a SQLite-only program falsely carries
 > `mysql_access` + `sqlite_fs`) or an abstract `{db}` (which *erases* the very
@@ -242,16 +240,16 @@ The vocabulary (v1) — every op is `Conn[b]`-polymorphic unless noted:
 | `db_run_exec stmt`                | execute the prepared stmt (DML) → rows                    |
 | `db_reset stmt`                   | clear bindings to re-run with new values                  |
 | `db_finalize stmt`                | release the prepared statement                            |
-| `with_transaction conn (fn => …)` | commit on normal exit, **rollback on early exit** (fix I) |
+| `with_transaction conn (fn => …)` | commit on normal exit, **rollback on early exit** |
 | `db_rows rs` / `db_cols rs`       | shape of a result set                                     |
-| `db_is_null rs r c`               | distinguish SQL `NULL` from a real `0`/`""` (fix I)       |
+| `db_is_null rs r c`               | distinguish SQL `NULL` from a real `0`/`""`               |
 | `db_get_int rs r c` / `_text` / `_blob` | read a cell (no silent `Real`→`Int` coercion)       |
 | `db_free rs` / `db_close conn`    | release                                                   |
 | `db_error ()`                     | last error message (redacted — never echoes bound values) |
 
 **The security spine: values only ever cross via bind, never via string-building.**
 The moment a runtime value is involved the app must `db_prepare` + `db_bind_*`.
-This is enforced by a **type, not a comment (review fix D)**: `db_query`/`db_exec`
+This is enforced by a **type, not a comment**: `db_query`/`db_exec`
 take `sql : Sql`, and a `Sql` is constructible *only from a string literal* (a
 compile-time-checked newtype). A runtime `String` — and therefore
 `concat "… " name` — **cannot reach** `db_query`; the unsafe path is not merely
@@ -288,11 +286,11 @@ mechanisms, both built on the access layer's `prepare`/`bind`/`step`:
   ```
   `author` is sent to the engine as a *bound value*, so `'; DROP TABLE notes; --`
   is just a string that matches no author. **Value injection is prevented by
-  construction**: the SQL text and the data travel on different rails, and (fix D)
+  construction**: the SQL text and the data travel on different rails, and
   the `Sql` text rail only accepts string *literals*, so a runtime value cannot
   reach it without going through `bind`.
 
-  **Honest scope (review fix D).** This stops *value* injection (WHERE/VALUES
+  **Honest scope.** This stops *value* injection (WHERE/VALUES
   positions). It does **not** make all injection "impossible": SQL identifiers —
   table/column names, `PRAGMA` args, `ATTACH DATABASE '<path>'`, `ORDER BY`
   direction — are not bindable placeholders in any engine. For those, the design
@@ -312,14 +310,14 @@ mechanisms, both built on the access layer's `prepare`/`bind`/`step`:
   ```
   Compiled once, executed many times — the standard performance + safety win.
 
-**`ATTACH`/`PRAGMA` and the mem sandbox (review fix D).** `db_exec` accepts
+**`ATTACH`/`PRAGMA` and the mem sandbox.** `db_exec` accepts
 arbitrary literal SQL, and `ATTACH DATABASE '/etc/…'` / file-touching `PRAGMA`s
 would let a `SqliteMem`-only program reach the filesystem *through SQL text*,
 defeating §3. The `SqliteMem` connection therefore installs a rusqlite
 `set_authorizer` that **denies `ATTACH` and file `PRAGMA`s** — the in-memory
 sandbox is enforced at the engine, not just by which `open` you could name.
 
-**Implementation note — what "prepared" really means (review fix F).** A
+**Implementation note — what "prepared" really means.** A
 `rusqlite::Statement` borrows its `Connection`, so we cannot store one behind an
 `i64`. The plugin models a `Stmt` as `(conn_handle, conn_generation, sql,
 Vec<Value>)` and uses `Connection::prepare_cached(sql)` at run time. Honest
@@ -335,8 +333,7 @@ the upgrade path if the re-parse ever matters.) The `conn_generation` makes a
 
 ## 7. Security properties (what the design buys — and what it doesn't)
 
-Each property is tagged with *how* it is enforced, so the guarantee is not
-oversold (the adversarial review's main lesson).
+Each property is tagged with *how* it is enforced, so the guarantee is precise.
 
 1. **Effect transparency — structural.** Because dispatch is type-directed (§5),
    a program's row is *exactly* the union of the backends it opened:
@@ -373,8 +370,7 @@ process* is a separate question, answered in §10.
   Opens return backend-specific `Conn[b]`; generic ops are effect-polymorphic
   (`db_exec : Conn[b] -> Sql -> Rows ! eff(b) | e`). Dispatch is **static** (from
   the connection's type), so the effect row is exactly the backends opened — not a
-  runtime `i64` tag, which would force over-reporting or erasure. *(§5; review
-  fix B.)*
+  runtime `i64` tag, which would force over-reporting or erasure. *(§5.)*
 - **Q2 — fs vs mem in the row → distinct effect for disk.** `SqliteMem` surfaces
   `{ sqlite_access }`; `SqliteFs` additionally mints **`sqlite_fs`**, so the
   manifest proves filesystem access. *(§3.)*
@@ -387,9 +383,9 @@ process* is a separate question, answered in §10.
   complete act of connecting. `vault_access` parses it into a **public `ConnMeta`**
   (readable: backend/host/port/…) and an **opaque `Secret`** with *no read
   accessor* — moved into a driver's connect call, never read as a value. `Db`
-  reads only the public `backend` tag to dispatch. *(§4; review fixes C + J.)*
+  reads only the public `backend` tag to dispatch. *(§4.)*
 
-### Resolved by the adversarial review (§7/§10)
+### Design decisions
 - **B** — type-directed dispatch (not runtime `i64`) so effect transparency holds.
 - **C/J** — `Secret` has no read accessor; `Db` is credential-blind beyond the tag.
 - **D** — `Sql` literal-only type; `set_authorizer` blocks `ATTACH`/file-`PRAGMA`.
@@ -402,7 +398,7 @@ process* is a separate question, answered in §10.
 
 ## 9. SQLite reference: what exists, what to build
 
-**Built & verified so far** (committed; full suite green):
+**Built and verified:**
 - The `rusqlite` plugin, hardened: every shim entry `catch_unwind`-guarded;
   prepared/parameterized statements; NULL fidelity; the in-memory sandbox
   (authorizer denies `ATTACH`/file-PRAGMA). *(steps 0–1)*
@@ -418,28 +414,27 @@ process* is a separate question, answered in §10.
   worst-case row `{cred_access, sqlite, sqlite_fs}`. *(step 4)*
 - Demos: `examples/{sqlite_demo, sqlite_prepared, db_layer, db_credentials}.locus`.
 
-**Refinements still open:** a `Credentials` *service* that seals `cred_access`
+**Future refinements:** a `Credentials` *service* that seals `cred_access`
 and restricts provisioning (today the vault boundary is exposed directly); BLOB
 support (needs a bytes ABI); `with_db`/`with_query`/`with_transaction` scope
 combinators; the cross-DBMS generic op (awaits a backend-generic effect, i.e.
 associated effects). The original flat `sql_*` surface also remains.
 
-**To build for this design** (review fixes folded in):
+**To build for this design:**
 0. **Harden the existing shim first:** wrap every `#[no_mangle]` entry in
-   `catch_unwind` → `set_last_error` + sentinel (fix H); add `db_is_null`, blob
-   bind/get, and non-coercing readers (fix I). This applies to code already
-   committed.
+   `catch_unwind` → `set_last_error` + sentinel; add `db_is_null`, blob
+   bind/get, and non-coercing readers.
 1. Extend the `sqlite_access` shim with `prepare`/`bind_*`/`run_*`/`reset`/
    `finalize`; model a `Stmt` as `(conn, generation, sql, Vec<Value>)` with
-   `prepare_cached` (fixes F, G). Boundary exposes `mem_open` (`{sqlite_access}`)
-   and `file_open` (`{sqlite_access, sqlite_fs}`) — `sqlite_fs` minted here (fix A).
-2. `SqliteMem` (`:memory:`, with the `ATTACH`/`PRAGMA` authorizer, fix D) and
+   `prepare_cached`. Boundary exposes `mem_open` (`{sqlite_access}`)
+   and `file_open` (`{sqlite_access, sqlite_fs}`) — `sqlite_fs` minted here.
+2. `SqliteMem` (`:memory:`, with the `ATTACH`/`PRAGMA` authorizer) and
    `SqliteFs` (file path) services; opens typed `Conn[SqliteMem]` / `Conn[SqliteFs]`.
 3. `Db` layer (§5 vocabulary) with **type-directed** effect-polymorphic ops over
-   `Conn[b]` (fix B); the `Sql` literal-only newtype + `db_ident` (fix D);
-   `with_db`/`with_query`/`with_transaction` combinators (fixes I, resource-discipline).
-4. `vault_access` (fetch a profile blob; bounded `serde_json` parse, fix K) →
-   **`ConnMeta` (readable) + `Secret` (no accessor)** (fixes C, J); a `Credentials`
+   `Conn[b]`; the `Sql` literal-only newtype + `db_ident`;
+   `with_db`/`with_query`/`with_transaction` combinators (resource-discipline).
+4. `vault_access` (fetch a profile blob; bounded `serde_json` parse) →
+   **`ConnMeta` (readable) + `Secret` (no accessor)**; a `Credentials`
    service exposing `meta_*` only; wire `db_open profile` = resolve →
    `meta_backend` dispatch → `<driver>.open meta secret`.
 5. Demos: (a) parameterized query + prepared-loop insert on an in-memory db; (b)
@@ -450,8 +445,8 @@ associated effects). The original flat `sql_*` surface also remains.
 
 ## 10. Threat model & runtime contract
 
-The review showed that several claims are only meaningful relative to a stated
-threat model and a hardened FFI contract. Both were missing; here they are.
+Several claims are only meaningful relative to a stated
+threat model and a hardened FFI contract. Here they are.
 
 ### 10.1 Threat model
 
@@ -466,35 +461,34 @@ threat model and a hardened FFI contract. Both were missing; here they are.
   tenants in v1; such tenants get **separate worker processes** (OS-level
   isolation). If in-process isolation becomes a goal, §10.3 is the upgrade.
 
-Stating this is the fix to the review's objection E: "provably sandboxed" means
+So "provably sandboxed" means
 *against the app*, with cross-tenant isolation delegated to the process boundary —
-not an unstated assumption.
+stated explicitly, not an unstated assumption.
 
 ### 10.2 The FFI contract every plugin shim must honor
 
-- **Panics never cross the C ABI (review fix H).** Unwinding out of an
+- **Panics never cross the C ABI.** Unwinding out of an
   `extern "C"` fn is, on current Rust, a hard **abort** (UB on older toolchains) —
   either way it takes down the worker and every connection in it. So **every
   `#[no_mangle]` entry point wraps its body in `std::panic::catch_unwind`**, and a
   caught panic becomes `set_last_error(...)` + the error sentinel (`0` / `-1`).
-  This is added to the `rust-service-plugins.md` contract and applies to the
-  **already-committed** SQLite reference too (it currently has none — a latent
-  worker-killer on any `.unwrap()` or OOM inside `query_map`).
-- **Handles fail closed, never stale-resolve (review nuance G).** The `Registry`
+  This is part of the `rust-service-plugins.md` contract and is honored by the
+  SQLite reference, so a `.unwrap()` or OOM inside `query_map` never becomes a
+  worker-killer.
+- **Handles fail closed, never stale-resolve.** The `Registry`
   counter is **monotonic** — a freed handle id is *never* reissued — so a `Stmt`
   whose `Conn` was closed resolves to *nothing* and returns an error; it can never
-  silently run against a *different*, recycled connection (the ABA the review
-  feared does not arise). A `conn_generation` stamped on each `Stmt` makes this
+  silently run against a *different*, recycled connection (the ABA risk
+  does not arise). A `conn_generation` stamped on each `Stmt` makes this
   explicit and survives even if the allocator ever changes.
 - **No silent data corruption.** `db_get_blob`/`db_bind_blob` carry binary as
   bytes (no UTF-8 lossy round-trip); `db_is_null` distinguishes `NULL`; cell
-  readers do not coerce `Real`→`Int` silently. (Fixes the lossy paths the review
-  found in the current shim.)
+  readers do not coerce `Real`→`Int` silently.
 
 ### 10.3 If in-process isolation is later required
 
 Per-capability registries (`CONNS_MEM` / `CONNS_FS` / …) plus **unforgeable
 handles** — each handle a `(capability_tag, generation, index)` triple, the
 generation random-seeded so a guessed integer fails to resolve. This closes
-objection E's cross-capability forge and is cheap; it is deferred only because v1's
+the cross-capability forge and is cheap; it is future work because v1's
 threat model puts distrusting tenants in separate processes.

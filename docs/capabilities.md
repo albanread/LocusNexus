@@ -1,6 +1,6 @@
 # Locus — Capabilities, Sealing, and the Layered Runtime
 
-*Drafted 2026-05-31. A **working proposal** (OPEN), companion to
+*Companion to
 [`design.md`](design.md) §7 and [`../MANIFESTO.md`](../MANIFESTO.md). Prose-first
 by intent: if this model only works inside the calculus, it is
 spec-by-implementation (principle 4). It should read clearly without the maths —
@@ -12,7 +12,7 @@ the maths is the footnote, not the argument.*
 > - **D1 — i62 in traced cells.** A generic `Int` is i62 *only when stored in a traced heap cell*, with a loud `panic` on overflow; concrete and stack-resident ints are full i64.
 > - **D2 — No subtyping (v1).** "Is-a" is trait membership; "has-these-fields" is row polymorphism.
 > - **D3 — Float-on-the-stack + use-inferred kinds.** A scalar is a raw full-width word on the stack/in registers (the GC never scans it). A type variable is `Uniform` (excludes `Wide` = Float/Float32/SIMD; tags integers to i62) *only at traced-store sites*. Generic float *functions* work at runtime; bulk float data uses `Array[Float]`; a concrete-float closure capture is a scalar (untraced) cell. Only a `Wide` value in a *traced* slot is a (loud) error → `Array`/monomorphize.
-> - **D4 — Set-rows (v1).** Effect rows are unordered idempotent sets; scoped rows / `mask` deferred.
+> - **D4 — Set-rows (v1).** Effect rows are unordered idempotent sets; scoped rows / `mask` are a future addition.
 > - **D5 — JASM is Layer 0.** AOT-assembled, embedded in app storage at deploy, reached only via a sealed `asm` capability; no inline asm.
 > - **D6 — Single-param traits (v1).** Associated types are the v2 path for collections; no multi-param/fundeps.
 
@@ -129,7 +129,7 @@ structure.**
 (A general grant **DAG** — peers at one layer with *different* clearances — is a
 strict generalization we are **not** building. The layer model gives *vertical*
 confinement perfectly; *horizontal* peer-isolation it does not give, and v1 does
-not need it. Named, deferred, not forgotten.)
+not need it. A future addition.)
 
 ## Why there is no WinAPI taxonomy
 
@@ -215,9 +215,9 @@ act there. The two readings of `nogc` — "allocates nothing" and "the GC can't
 touch this" — are the **same fact**: sealing `gc` / `gc!` over a region.
 
 *(v1 reality: NewGC is single-threaded STW with no safepoint/poll API yet, so the
-inbound channel is currently coarse. The model needs **no new GC work** — it is
-how the **already-planned** `gc.statepoint` + `LocusLayout` effort (PLAN Phase 4)
-fits the security story. Correctness-before-perf: do not touch the collector for
+inbound channel is coarse. The model needs **no new GC work** — it is
+how the **planned** `gc.statepoint` + `LocusLayout` GC work
+fits the security story. Correctness-before-perf: the collector is untouched for
 this.)*
 
 ## How it lands in the calculus (the footnote)
@@ -246,19 +246,19 @@ this.)*
 ≈ **one** new surface feature (the `seal` / boundary-`mask` operator, = generalized
 `runST`) plus **one** rule (capability mints are kernel-only). *(This boundary
 `mask`/seal is the `runST`-style no-escape check on a `World` label; it is **not**
-the effect-row `mask` that reorders scoped rows — that one is deferred with scoped
+the effect-row `mask` that reorders scoped rows — that one is a future addition with scoped
 rows under D4. Effect rows themselves are **unordered idempotent sets** in v1 (D4),
 which is all the seal's "label appears nowhere in the outward row" check needs.)*
 Everything else —
 the layers, "call down only," capability flow — is **module-import discipline
 Locus already has.** The GC's two-sided contract (statepoints, stack maps,
-`LocusLayout`) is **already-planned Phase-4 work**, not new spend for this model.
+`LocusLayout`) is **planned GC work**, not new spend for this model.
 The layering is the simplification: it turns a policy problem into a structure you
 can read.
 
-## OPEN — decided by wrapping Win32 (and binding the GC), not in the abstract
+## Decided by wrapping Win32 (and binding the GC)
 
-> **Status (2026-06-03) — the sealing/capability core is IMPLEMENTED.** The
+> **The sealing/capability core is implemented.** The
 > mint/seal build is shipped + tested ([`sealing-plan.md`](sealing-plan.md);
 > [`sealing-solution.md`](sealing-solution.md); user tour in
 > [`user-guide-mint-and-seal.md`](user-guide-mint-and-seal.md)): **O-C3** — minting
@@ -267,9 +267,9 @@ can read.
 > (`peek`/`poke`/`fill`/`copy`), **and `extern asm`**; **O-C5** — per-provider mint
 > labels via the **`mints (L)`** clause; the **`seal` surface** (region + module
 > `seals (…)`) enforces no-escape (`RN-E0403`); the **`asm`** capability is a live
-> mint label (`extern asm`, with the GC-blind gate `RN-E0405`). Still **[NYIMP]**:
+> mint label (`extern asm`, with the GC-blind gate `RN-E0405`). Future additions:
 > `gc!` as a mint label, and de-hardcoding the `row_label` set (fully
-> manifest-driven recognition). **O-C2** and **O-C4** stay deferred as written below.
+> manifest-driven recognition). **O-C2** and **O-C4** are future work as written below.
 
 - **O-C1.** The exact abstract surface each layer exports (`console`/`fs`/…).
   Emerges from the wrappers; not pre-enumerated.

@@ -29,10 +29,9 @@ stack: it trades in abstract effects and literally cannot name the raw powers, s
 it cannot call them. The unsafe layer is a sealed room with a service window — the
 app orders `console`, the kernel does the WinAPI, the app never holds the key.
 
-> **Enforcement status (2026-06-07 — now enforced).** The security claims below are
-> **enforced**, via the two checks in [`design/level-enforcement.md`](design/level-enforcement.md)
-> (the gap that prompted them is recorded in
-> [`design/sealing-enforcement-gap.md`](design/sealing-enforcement-gap.md)):
+> **Enforcement status — enforced.** The security claims below are **enforced**,
+> via the raw-power mint floor plus two SEMA checks (symbol visibility and effect
+> ceilings):
 > - **Rule 1 — mint.** App / non-boundary code cannot `extern`/`peek`/`poke` (`RN-E0402/E0404`); a raw power cannot be *forged*. This is the floor.
 > - **Symbol visibility (D1).** A name resolves only at its own layer and one below, and only if exposed — `app` cannot name a `boundary` power (`RN-E0405` out-of-layer / `RN-E0406` not-exposed). An app that names `win_cred_read` is rejected, not silently grafted.
 > - **Effect ceilings (D2).** A module's `seals (E)` *strips* E from its exported rows, so a sealed raw power does not rise above the sealing service — a console app's row is `{gc}`, not `{winapi}` (`RN-E0407` rejects sealing `gc`/`exn`/`insert`). Verified not to re-leak through trait dispatch or staging.

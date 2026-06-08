@@ -272,17 +272,10 @@ runtime-dispatched backend.
 
 ## What is deferred
 
-**Scope combinators** (`with_db`, `with_query`, `with_transaction`) are described
-in the design but deferred (commit `0d0ed34`). They trip a compiler edge: passing
-a phantom-typed `Conn[b]` into a row-polymorphic body argument requires a `ToPtr`
-coercion that sema does not yet insert, causing `check_tags` to panic. Once that
-coercion-insertion gap is fixed (tracked in
-[assurance-dispatch.md](assurance-dispatch.md)), they replace the bare
-`open/close` as the preferred front door.
-
-Until then, the flat `db_open … db_close` primitives are the surface. The
-`with_*` combinators were already designed and their types verified; the fix is
-purely on the compiler side.
+**Scope combinators** (`with_db`, `with_query`, `with_transaction`) are designed
+and their types verified, but not yet on the surface: the flat
+`db_open … db_close` primitives are the current front door. Enabling the
+combinators as the preferred surface is a future step.
 
 **BLOB columns** — cells read as `<blob N bytes>` placeholder text. A proper
 bytes ABI (a non-cstr pointer+length pair) is needed to cross binary data between

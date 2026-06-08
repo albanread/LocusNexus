@@ -4,7 +4,6 @@
 //! young. It reuses the shared front end, LLVM lowering, and runtime shims, but
 //! owns the Linux-specific driver/JIT decisions locally.
 
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -190,94 +189,25 @@ fn cmd_effects(args: &[String]) -> Result<i32, String> {
     }
     let labels: Vec<&locus::Label> = tree.row.labels().collect();
     let ty = tree.ty.to_string();
+    // The module declarations the layer attribution reads from (the Linux stdlib
+    // set `linux_program` grafts), so each effect can show the layer it enters at.
+    let decls = locus::linux_stdlib_module_decls();
     if json {
-        print_effects_json(file, &ty, &labels);
+        print_effects_json(file, &ty, &labels, &decls);
     } else {
-        print_effects_human(file, &ty, &labels);
+        print_effects_human(file, &ty, &labels, &decls);
     }
     Ok(0)
 }
 
-const EFFECT_CATALOG: &str = include_str!("../../../locus-llvm/src/effects.catalog");
-
-struct Catalog {
-    order: Vec<String>,
-    by_label: HashMap<String, (String, String)>,
-    by_kind: HashMap<String, (String, String)>,
-}
-
-fn load_catalog() -> Catalog {
-    let mut order = Vec::new();
-    let mut by_label = HashMap::new();
-    let mut by_kind = HashMap::new();
-    for line in EFFECT_CATALOG.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let tok: Vec<&str> = line.split_whitespace().collect();
-        if tok[0] == "order" {
-            order = tok[1..].iter().map(|s| s.to_string()).collect();
-            continue;
-        }
-        if tok.len() < 3 {
-            continue;
-        }
-        let entry = (tok[1].to_string(), tok[2..].join(" "));
-        if let Some(kind) = tok[0].strip_prefix("kind:") {
-            by_kind.insert(kind.to_string(), entry);
-        } else {
-            by_label.insert(tok[0].to_string(), entry);
-        }
-    }
-    Catalog {
-        order,
-        by_label,
-        by_kind,
-    }
-}
-
-fn catalog() -> &'static Catalog {
-    static C: std::sync::OnceLock<Catalog> = std::sync::OnceLock::new();
-    C.get_or_init(load_catalog)
-}
-
-fn label_kind(l: &locus::Label) -> &'static str {
-    use locus::Label::*;
-    match l {
-        World(_) => "world",
-        User(_) => "user",
-        Exn(_) => "exn",
-        Gc => "gc",
-        St => "state",
-        Insert => "staging",
-    }
-}
-
-fn lookup(l: &locus::Label) -> (&'static str, &'static str) {
-    let cat = catalog();
-    let name = format!("{l}");
-    if let Some((c, g)) = cat.by_label.get(&name) {
-        return (c.as_str(), g.as_str());
-    }
-    if let Some((c, g)) = cat.by_kind.get(label_kind(l)) {
-        return (c.as_str(), g.as_str());
-    }
-    ("user", "effect")
-}
-
-fn category(l: &locus::Label) -> &'static str {
-    lookup(l).0
-}
-
 fn grouped<'a>(labels: &[&'a locus::Label]) -> Vec<(&'static str, Vec<&'a locus::Label>)> {
     let mut out = Vec::new();
-    for cat in &catalog().order {
+    for cat in locus::analysis::category_order() {
         let cat = cat.as_str();
         let in_cat: Vec<&locus::Label> = labels
             .iter()
             .copied()
-            .filter(|l| category(l) == cat)
+            .filter(|l| locus::analysis::category(l) == cat)
             .collect();
         if !in_cat.is_empty() {
             out.push((cat, in_cat));
@@ -286,7 +216,18 @@ fn grouped<'a>(labels: &[&'a locus::Label]) -> Vec<(&'static str, Vec<&'a locus:
     out
 }
 
-fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label]) {
+/// The layer tag shown beside an effect: `L0` boundary / `L1` services / `L2`
+/// app, or `L·` for a cross-cutting effect that is not layer-confined.
+fn layer_tag(l: &locus::Label, decls: &[locus::ModuleDecl]) -> &'static str {
+    match locus::analysis::effect_layer_in(l, decls) {
+        Some(0) => "L0",
+        Some(1) => "L1",
+        Some(2) => "L2",
+        _ => "L\u{b7}",
+    }
+}
+
+fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label], decls: &[locus::ModuleDecl]) {
     println!("{file}");
     println!("  type    : {ty}");
     if labels.is_empty() {
@@ -313,12 +254,17 @@ fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label]) {
         println!();
         println!("  {cat} ({})", ls.len());
         for l in ls {
-            println!("    {:<10} {}", format!("{l}"), describe(l));
+            println!(
+                "    {}  {:<10} {}",
+                layer_tag(l, decls),
+                format!("{l}"),
+                locus::analysis::describe(l)
+            );
         }
     }
 }
 
-fn print_effects_json(file: &str, ty: &str, labels: &[&locus::Label]) {
+fn print_effects_json(file: &str, ty: &str, labels: &[&locus::Label], decls: &[locus::ModuleDecl]) {
     let cats = grouped(labels);
     println!("{{");
     println!("  \"file\": \"{}\",", json_escape(file));
@@ -333,10 +279,16 @@ fn print_effects_json(file: &str, ty: &str, labels: &[&locus::Label]) {
     println!("  \"effects\": [");
     for (i, l) in labels.iter().enumerate() {
         let comma = if i + 1 < labels.len() { "," } else { "" };
+        // `layer` is the layer the effect enters at (0/1/2), or `null` if it is
+        // cross-cutting (not layer-confined).
+        let layer = match locus::analysis::effect_layer_in(l, decls) {
+            Some(n) => n.to_string(),
+            None => "null".to_string(),
+        };
         println!(
-            "    {{ \"label\": \"{}\", \"category\": \"{}\" }}{comma}",
+            "    {{ \"label\": \"{}\", \"category\": \"{}\", \"layer\": {layer} }}{comma}",
             json_escape(&format!("{l}")),
-            category(l)
+            locus::analysis::category(l)
         );
     }
     println!("  ]");
@@ -357,10 +309,6 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
-}
-
-fn describe(l: &locus::Label) -> &'static str {
-    lookup(l).1
 }
 
 fn cmd_republish(args: &[String]) -> Result<i32, String> {
@@ -385,14 +333,14 @@ fn cmd_republish(args: &[String]) -> Result<i32, String> {
         println!("republished {}", path.display());
     }
     let cat_path = dir.join("effects.catalog");
-    std::fs::write(&cat_path, EFFECT_CATALOG)
+    std::fs::write(&cat_path, locus::analysis::EFFECT_CATALOG_SRC)
         .map_err(|e| format!("writing `{}`: {e}", cat_path.display()))?;
     manifest.push_str(&format!(
         "  {:<5}  {:<11}  {:<7}  {:#018x}  effects.catalog\n",
         "cfg",
         "effects",
-        EFFECT_CATALOG.len(),
-        fnv1a(EFFECT_CATALOG)
+        locus::analysis::EFFECT_CATALOG_SRC.len(),
+        fnv1a(locus::analysis::EFFECT_CATALOG_SRC)
     ));
     println!("republished {}", cat_path.display());
     let mpath = dir.join("MANIFEST.txt");

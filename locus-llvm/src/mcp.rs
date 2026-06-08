@@ -27,8 +27,6 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const EFFECT_CATALOG: &str = include_str!("effects.catalog");
-
 #[derive(Debug, Clone)]
 pub struct LocusMcpServer {
     tool_router: ToolRouter<Self>,
@@ -218,6 +216,9 @@ struct SourceUnit {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EffectEntry {
     label: String,
+    /// The layer the effect enters at (0 boundary / 1 services / 2 app), or
+    /// `None` if it is cross-cutting (not layer-confined).
+    layer: Option<u8>,
     category: String,
     description: String,
 }
@@ -1022,10 +1023,12 @@ fn compile_pipeline(source: String, authorized: HashSet<String>) -> Result<Pipel
         let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
             .map_err(|e| e.to_string())?;
         let ty = tree.ty.to_string();
-        let effects = tree.row.labels().map(effect_entry).collect();
 
+        // The module declarations the layer attribution reads from — the same
+        // grafted set (stdlib + the user's own modules) the program elaborated.
         let mut all_modules = locus::stdlib_module_decls();
         all_modules.extend(user_modules);
+        let effects = tree.row.labels().map(|l| effect_entry(l, &all_modules)).collect();
         locus::check_module_seals(&all_modules, &tree).map_err(|e| e.to_string())?;
 
         let tree = locus::stage_reduce(&tree)?;
@@ -1054,9 +1057,12 @@ fn effect_manifest(
         let (term, _demanded) = crate::winapi_resolve::resolve(term)?;
         let tree = locus::elaborate(&locus::prelude::sig(), &locus::Ctx::new(), 0, &term)
             .map_err(|e| e.to_string())?;
+        // `program` grafts the stdlib only, so the layer attribution reads from
+        // the stdlib module declarations.
+        let decls = locus::stdlib_module_decls();
         Ok((
             tree.ty.to_string(),
-            tree.row.labels().map(effect_entry).collect(),
+            tree.row.labels().map(|l| effect_entry(l, &decls)).collect(),
         ))
     })
 }
@@ -2602,74 +2608,16 @@ fn current_exe_display() -> String {
         .unwrap_or_else(|err| format!("<unavailable: {err}>"))
 }
 
-fn effect_entry(label: &locus::Label) -> EffectEntry {
+/// Build an [`EffectEntry`] for a label: its catalog category + gloss (from
+/// `locus::analysis`) and the layer it enters at, read from `decls` (the module
+/// set the program elaborated against).
+fn effect_entry(label: &locus::Label, decls: &[locus::ModuleDecl]) -> EffectEntry {
     EffectEntry {
         label: format!("{label}"),
-        category: category(label).to_string(),
-        description: describe(label).to_string(),
+        layer: locus::analysis::effect_layer_in(label, decls),
+        category: locus::analysis::category(label).to_string(),
+        description: locus::analysis::describe(label).to_string(),
     }
-}
-
-struct Catalog {
-    by_label: HashMap<String, (String, String)>,
-    by_kind: HashMap<String, (String, String)>,
-}
-
-fn catalog() -> &'static Catalog {
-    static CATALOG: OnceLock<Catalog> = OnceLock::new();
-    CATALOG.get_or_init(|| {
-        let mut by_label = HashMap::new();
-        let mut by_kind = HashMap::new();
-        for line in EFFECT_CATALOG.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let tok: Vec<&str> = line.split_whitespace().collect();
-            if tok[0] == "order" || tok.len() < 3 {
-                continue;
-            }
-            let entry = (tok[1].to_string(), tok[2..].join(" "));
-            if let Some(kind) = tok[0].strip_prefix("kind:") {
-                by_kind.insert(kind.to_string(), entry);
-            } else {
-                by_label.insert(tok[0].to_string(), entry);
-            }
-        }
-        Catalog { by_label, by_kind }
-    })
-}
-
-fn label_kind(l: &locus::Label) -> &'static str {
-    use locus::Label::*;
-    match l {
-        World(_) => "world",
-        User(_) => "user",
-        Exn(_) => "exn",
-        Gc => "gc",
-        St => "state",
-        Insert => "staging",
-    }
-}
-
-fn lookup(l: &locus::Label) -> (&'static str, &'static str) {
-    let catalog = catalog();
-    let name = format!("{l}");
-    if let Some((category, gloss)) = catalog.by_label.get(&name) {
-        return (category.as_str(), gloss.as_str());
-    }
-    if let Some((category, gloss)) = catalog.by_kind.get(label_kind(l)) {
-        return (category.as_str(), gloss.as_str());
-    }
-    ("user", "effect")
-}
-
-fn category(l: &locus::Label) -> &'static str {
-    lookup(l).0
-}
-
-fn describe(l: &locus::Label) -> &'static str {
-    lookup(l).1
 }
 
 fn stdlib_entries(

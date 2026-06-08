@@ -147,9 +147,12 @@ pub fn check_source(source: &str) -> Vec<Diagnostic> {
 /// run, plus the effect-manifest read from `cmd_effects`. Runs entirely
 /// on the worker thread `run_on_pipeline_stack` spawns.
 fn eval_pipeline(source: String) -> EvalOutcome {
-    // parse + graft the stdlib prelude. A parse error is the same
-    // structured diagnostic the CLI renders (`Report::parse_error`).
-    let term = match locus::program(&source) {
+    // parse + graft the stdlib prelude AND the service plugins — the same module
+    // set `analyze`/`run`/`effects` use, so a plugin-backed program (e.g. one
+    // using `db_open_memory`) resolves here too and the run path agrees with the
+    // Analyze report. A parse error is the CLI's structured diagnostic.
+    let modules = locus_llvm::plugins::plugin_grafted_modules();
+    let term = match locus::program_with_stdlib(&source, &modules).map(|(t, _)| t) {
         Ok(t) => t,
         Err(e) => return EvalOutcome::from_diags(vec![diag_from_report(&locus::Report::parse_error(&e, &source))]),
     };
@@ -224,6 +227,9 @@ fn ide_symbols() -> Vec<(String, u64)> {
         .into_iter()
         .chain(igui::console_bridge::symbol_overrides())
         .map(|(name, addr)| (name.to_string(), addr))
+        // The service plugins' C-ABI symbols (e.g. the sqlite shim), so a grafted
+        // boundary's externs resolve in the JIT — mirroring the CLI `run` path.
+        .chain(locus_llvm::plugins::plugin_symbols())
         .collect()
 }
 
@@ -238,7 +244,8 @@ pub fn effect_manifest(source: &str) -> Vec<String> {
 }
 
 fn manifest_pipeline(source: String) -> Vec<String> {
-    let Ok(term) = locus::program(&source) else {
+    let modules = locus_llvm::plugins::plugin_grafted_modules();
+    let Ok((term, _)) = locus::program_with_stdlib(&source, &modules) else {
         return Vec::new();
     };
     let Ok((term, _apis)) = locus_llvm::winapi_resolve::resolve(term) else {
@@ -310,7 +317,8 @@ pub fn compiler_view(source: &str, view: CompilerView) -> ViewText {
 }
 
 fn view_pipeline(source: &str, view: CompilerView) -> ViewText {
-    let term = match locus::program(source) {
+    let modules = locus_llvm::plugins::plugin_grafted_modules();
+    let term = match locus::program_with_stdlib(source, &modules).map(|(t, _)| t) {
         Ok(t) => t,
         Err(e) => {
             return ViewText::from_diags(vec![diag_from_report(&locus::Report::parse_error(
@@ -362,33 +370,24 @@ impl FromPipelinePanic for ViewText {
 
 // ── static analysis: the per-function effect table ──────────────────────────
 
-/// One row of the analysis function table: a named function the program
-/// references, and where its powers come from. `module`/`layer` say where it
-/// is defined (a stdlib service module + its privilege layer, the user's own
-/// program, or `—` for a builtin); `args` are the parameter types (the curried
-/// arrow's domains); `effects` are the latent effect labels the function's type
-/// carries — i.e. the powers performed when it is called.
-#[derive(Debug, Clone)]
-pub struct FnRow {
-    pub module: String,
-    pub name: String,
-    pub layer: String,
-    pub args: Vec<String>,
-    pub effects: Vec<String>,
-}
+/// The analysis result types are the **shared** ones from [`locus::analysis`] —
+/// the single source of truth behind the CLI `effects` manifest, the MCP report,
+/// and this report pane — so layer/effect/data attribution is computed in one
+/// place. Re-exported here for the report renderer.
+pub use locus::analysis::{CallEdge, DataRow, EffectInfo, FnInfo};
 
 /// The full static analysis of a buffer: parse/type **diagnostics** (if it does
-/// not elaborate), the program's root **effect manifest**, the per-function
-/// **table** ([`FnRow`]), and the **call graph** among those functions
-/// (`(caller, callee)` edges). Built from a single elaboration — no JIT, no run.
+/// not elaborate), the program's root **effect manifest** (each effect tagged
+/// with the layer it enters at), the per-function **table** ([`FnInfo`]), the
+/// **call graph** ([`CallEdge`]s among those functions), and the **data-access
+/// tree** ([`DataRow`]s). Built from a single elaboration — no JIT, no run.
 #[derive(Debug, Clone, Default)]
 pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
-    pub effects: Vec<String>,
-    pub functions: Vec<FnRow>,
-    /// Directed `caller -> callee` edges, both endpoints in `functions`,
-    /// sorted and deduped. Empty when no table function calls another.
-    pub calls: Vec<(String, String)>,
+    pub effects: Vec<EffectInfo>,
+    pub functions: Vec<FnInfo>,
+    pub calls: Vec<CallEdge>,
+    pub data_access: Vec<DataRow>,
 }
 
 /// Statically analyze `source`: elaborate it once (no JIT) and report its
@@ -400,15 +399,13 @@ pub fn analyze(source: &str) -> Analysis {
 }
 
 fn analyze_pipeline(source: String) -> Analysis {
-    // The identifiers the user actually wrote (a conservative token scan) and
-    // the names they bind at top level — used to scope the table to *this*
-    // program and to attribute user-defined functions.
-    let referenced = referenced_idents(&source);
-    let user_names = user_bound_names(&source);
-
     // parse + graft + resolve + elaborate (the front half of `eval_pipeline`).
-    let term = match locus::program(&source) {
-        Ok(t) => t,
+    // Graft the stdlib **and the service plugins** — the same module set `run`
+    // and `effects` use — so plugin surfaces like `db_open_memory` resolve and
+    // their sealed effects (e.g. `{ sqlite }`) show up in the report.
+    let modules = locus_llvm::plugins::plugin_grafted_modules();
+    let (term, user_modules) = match locus::program_with_stdlib(&source, &modules) {
+        Ok(pair) => pair,
         Err(e) => {
             return Analysis::from_diags(vec![diag_from_report(&locus::Report::parse_error(
                 &e, &source,
@@ -426,353 +423,19 @@ fn analyze_pipeline(source: String) -> Analysis {
         }
     };
 
-    let effects: Vec<String> = tree.row.labels().map(|l| l.to_string()).collect();
-
-    // One whole-tree pass: a binding's body (`defs`, for its declared type and
-    // its callees) and a `Var`'s node at a use site (`uses`, the fallback for a
-    // function only seen at a call). First-wins in each.
-    use locus::sema::{Node, TypedBlockItem};
-    let mut defs: std::collections::HashMap<String, &locus::Typed> = std::collections::HashMap::new();
-    let mut uses: std::collections::HashMap<String, &locus::Typed> = std::collections::HashMap::new();
-    walk(&tree, &mut |n| match &n.node {
-        Node::Var(name) => {
-            uses.entry(name.clone()).or_insert(n);
-        }
-        Node::Let { name, bound, .. } => {
-            defs.entry(name.clone()).or_insert(bound.as_ref());
-        }
-        Node::Block { items, .. } => {
-            for it in items {
-                if let TypedBlockItem::Let { name, bound } = it {
-                    defs.entry(name.clone()).or_insert(bound);
-                }
-            }
-        }
-        _ => {}
-    });
-    let ty_of = |name: &str| -> Option<&locus::Type> {
-        defs.get(name)
-            .map(|b| &b.ty)
-            .or_else(|| uses.get(name).map(|v| &v.ty))
-    };
-    let modmap = module_map();
-
-    let mut functions: Vec<FnRow> = Vec::new();
-    for name in &referenced {
-        let Some(ty) = ty_of(name) else { continue };
-        let Some((args, fx)) = decode_fun(ty) else { continue };
-        let (module, layer) = attribute(name, &user_names, &modmap);
-        let effects = friendly_effects(&fx, &module);
-        functions.push(FnRow {
-            module,
-            name: name.clone(),
-            layer,
-            args,
-            effects,
-        });
-    }
-    functions.sort_by(|a, b| {
-        layer_rank(&a.layer)
-            .cmp(&layer_rank(&b.layer))
-            .then(a.module.cmp(&b.module))
-            .then(a.name.cmp(&b.name))
-    });
-
-    // Call graph: for each table function with a known body, the table
-    // functions it references (its callees). Self-edges dropped.
-    let names: std::collections::HashSet<&str> =
-        functions.iter().map(|r| r.name.as_str()).collect();
-    let mut edges: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
-    for r in &functions {
-        let Some(body) = defs.get(&r.name) else { continue };
-        let mut callees: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        walk(body, &mut |n| {
-            if let Node::Var(g) = &n.node {
-                if g != &r.name && names.contains(g.as_str()) {
-                    callees.insert(g.clone());
-                }
-            }
-        });
-        for g in callees {
-            edges.insert((r.name.clone(), g));
-        }
-    }
-
+    // The shared analysis engine (the single source of truth behind the CLI /
+    // MCP reports too): the layer-tagged effect manifest, the per-function
+    // origin table, the call graph, and the data-access tree. It reads layers
+    // from the grafted module declarations (stdlib + plugins + the user's own).
+    let mut decls = locus_llvm::plugins::plugin_grafted_module_decls();
+    decls.extend(user_modules);
+    let report = locus::analysis::analyze(&tree, &decls, &source);
     Analysis {
         diagnostics: Vec::new(),
-        effects,
-        functions,
-        calls: edges.into_iter().collect(),
-    }
-}
-
-/// Maximal `[A-Za-z_][A-Za-z0-9_]*` words in the source. Conservative on
-/// purpose: a word is only ever shown in the table if it is *also* a real
-/// function binding, so over-inclusion (a word in a comment/string) is
-/// harmless — it simply will not match a binding.
-fn referenced_idents(src: &str) -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    let mut cur = String::new();
-    for ch in src.chars() {
-        if ch.is_alphanumeric() || ch == '_' {
-            cur.push(ch);
-        } else if !cur.is_empty() {
-            set.insert(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        set.insert(cur);
-    }
-    set
-}
-
-/// The names the *user's* source binds with `let`, at **any** depth — so the
-/// table attributes them to "(this program)" rather than leaving a nested
-/// helper unattributed. A lightweight token scan (not a parse): the identifier
-/// following each `let` (skipping `mut`/`rec`) is a binding. Conservative and
-/// only consulted for names that are *also* real function bindings, so the odd
-/// `let` in a comment/string is harmless.
-fn user_bound_names(src: &str) -> std::collections::HashSet<String> {
-    let mut s = std::collections::HashSet::new();
-    let mut expect = false;
-    for word in src.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-        if word.is_empty() {
-            continue;
-        }
-        if expect {
-            if word == "mut" || word == "rec" {
-                continue; // still expecting the bound name
-            }
-            s.insert(word.to_string());
-            expect = false;
-        } else if word == "let" {
-            expect = true;
-        }
-    }
-    s
-}
-
-/// Pre-order visit of every node in the typed tree, calling `f` on each.
-/// One generic walker backs both passes: collecting binding / use-site
-/// function types, and collecting the callees inside a function body. The
-/// stdlib graft binds the service functions (`console_writeln`, `fill_rect`,
-/// …) deep inside nested spines, so a whole-tree walk is required.
-fn walk<'a>(t: &'a locus::Typed, f: &mut impl FnMut(&'a locus::Typed)) {
-    use locus::sema::{Node, TypedBlockItem};
-    f(t);
-    match &t.node {
-        Node::Var(_) | Node::Int(_) | Node::Float(_) | Node::Bool(_) | Node::Unit
-        | Node::Brk | Node::Str(_) | Node::Extern(..) => {}
-        Node::Bin(_, a, b) => {
-            walk(a, f);
-            walk(b, f);
-        }
-        Node::Cast(_, a)
-        | Node::MaskReduce(_, a)
-        | Node::FloatMathUnary(_, a)
-        | Node::Quote(a)
-        | Node::Splice(a)
-        | Node::Genlet(a)
-        | Node::Letloc(a)
-        | Node::Peek(_, a)
-        | Node::Len(a) => walk(a, f),
-        Node::Coerce { inner, .. } => walk(inner, f),
-        Node::FloatMathBinary(_, a, b) | Node::Poke(_, a, b) | Node::Index(_, a, b) => {
-            walk(a, f);
-            walk(b, f);
-        }
-        Node::FloatMathTernary(_, a, b, c)
-        | Node::If(a, b, c)
-        | Node::Fill(a, b, c)
-        | Node::Copy(a, b, c)
-        | Node::IndexSet(_, a, b, c) => {
-            walk(a, f);
-            walk(b, f);
-            walk(c, f);
-        }
-        Node::VectorSelect { mask, then_value, else_value } => {
-            walk(mask, f);
-            walk(then_value, f);
-            walk(else_value, f);
-        }
-        Node::VectorLit { elems, .. } | Node::Tuple(elems) | Node::ArrayLit { elems, .. } => {
-            for e in elems {
-                walk(e, f);
-            }
-        }
-        Node::VectorSplat { value, .. } | Node::Assign { value, .. } | Node::RefNew { value } => {
-            walk(value, f)
-        }
-        Node::VectorLoad { arr, idx, .. } | Node::ArrayGet { arr, idx, .. } => {
-            walk(arr, f);
-            walk(idx, f);
-        }
-        Node::VectorStore { arr, idx, value, .. } | Node::ArraySet { arr, idx, val: value, .. } => {
-            walk(arr, f);
-            walk(idx, f);
-            walk(value, f);
-        }
-        Node::VectorExtract { vector, .. } => walk(vector, f),
-        Node::Loop { vars, cond, steps, result } => {
-            for (_, _, _, init) in vars {
-                walk(init, f);
-            }
-            walk(cond, f);
-            for s in steps {
-                walk(s, f);
-            }
-            walk(result, f);
-        }
-        Node::Lam { body, .. } => walk(body, f),
-        Node::App { fun, arg } => {
-            walk(fun, f);
-            walk(arg, f);
-        }
-        Node::Let { bound, body, .. } => {
-            walk(bound, f);
-            walk(body, f);
-        }
-        Node::Block { items, body } => {
-            for it in items {
-                match it {
-                    TypedBlockItem::Let { bound, .. }
-                    | TypedBlockItem::LetMut { bound, .. }
-                    | TypedBlockItem::LetTuple { bound, .. } => walk(bound, f),
-                }
-            }
-            walk(body, f);
-        }
-        Node::LetMut { bound, body, .. } | Node::LetTuple(_, bound, body) => {
-            walk(bound, f);
-            walk(body, f);
-        }
-        Node::Deref { cell } => walk(cell, f),
-        Node::RefAssign { target, value } => {
-            walk(target, f);
-            walk(value, f);
-        }
-        Node::Perform { arg, .. } => walk(arg, f),
-        Node::Handle { scrutinee, handler } => {
-            walk(scrutinee, f);
-            for op in &handler.ops {
-                walk(&op.body, f);
-            }
-            walk(&handler.ret.body, f);
-        }
-        Node::Record(fields) => {
-            for (_, e) in fields {
-                walk(e, f);
-            }
-        }
-        Node::Field(a, _) => walk(a, f),
-        Node::Construct { args, .. } => {
-            for (e, _, _) in args {
-                walk(e, f);
-            }
-        }
-        Node::Match { scrutinee, arms } => {
-            walk(scrutinee, f);
-            for arm in arms {
-                walk(&arm.body, f);
-            }
-        }
-    }
-}
-
-/// Map every stdlib-module-exposed function name to its `(module, layer)`,
-/// read straight from the module declarations (no elaboration). Uses the
-/// module's `exposing` list — the public surface — since a module body is
-/// often a `handle … with` (e.g. `Console`), not a plain `let` spine, so the
-/// exposed names are the reliable source. Falls back to the body's top-level
-/// `let` names when a module exposes everything (`exposing = None`).
-fn module_map() -> std::collections::HashMap<String, (String, String)> {
-    let mut map = std::collections::HashMap::new();
-    for m in locus::stdlib_module_decls() {
-        let layer = m.layer.name().to_string();
-        match &m.exposing {
-            Some(names) => {
-                for n in names {
-                    map.entry(n.clone())
-                        .or_insert((m.name.clone(), layer.clone()));
-                }
-            }
-            None => {
-                let mut cur = &m.body;
-                while let locus::Term::Let(name, _, body) = cur {
-                    map.entry(name.clone())
-                        .or_insert((m.name.clone(), layer.clone()));
-                    cur = body;
-                }
-            }
-        }
-    }
-    map
-}
-
-/// Decode a (curried) function type into `(arg-type strings, effect labels)`.
-/// Returns `None` for a non-function type. The effect is the union of the
-/// latent rows along the arrow chain — the powers performed when it is applied.
-fn decode_fun(ty: &locus::Type) -> Option<(Vec<String>, Vec<String>)> {
-    let mut args = Vec::new();
-    let mut effs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut cur = ty;
-    let mut is_fun = false;
-    while let locus::Type::Fun(dom, cod, row) = cur {
-        is_fun = true;
-        args.push(dom.to_string());
-        for l in row.labels() {
-            effs.insert(l.to_string());
-        }
-        cur = cod.as_ref();
-    }
-    is_fun.then(|| (args, effs.into_iter().collect()))
-}
-
-/// Friendly-up a function's effect labels for display. Handler-based service
-/// modules (`Console`, `Time`, `Db`, `LocusEnv`) give their functions an
-/// internal per-operation label like `console_writeln_op`; collapse any such
-/// `*_op` label to the module's service name (`console`, `time`, …) — the
-/// effect the function conceptually performs. Non-`_op` labels (`gc`, `mem`,
-/// `graphics`, `event`, …) pass through unchanged. Only applied to functions
-/// attributed to a real stdlib module (not user code / unknown). Deduped.
-fn friendly_effects(effs: &[String], module: &str) -> Vec<String> {
-    let mappable = module != "(this program)" && module != "\u{2014}";
-    let svc = module.rsplit('.').next().unwrap_or(module).to_lowercase();
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for e in effs {
-        if mappable && e.ends_with("_op") {
-            out.insert(svc.clone());
-        } else {
-            out.insert(e.clone());
-        }
-    }
-    out.into_iter().collect()
-}
-
-/// Where a referenced function is defined: the user's own program, a stdlib
-/// module (+ its layer), or `—` for a builtin/primitive with no module binding.
-fn attribute(
-    name: &str,
-    user: &std::collections::HashSet<String>,
-    modmap: &std::collections::HashMap<String, (String, String)>,
-) -> (String, String) {
-    if user.contains(name) {
-        return ("(this program)".to_string(), "app".to_string());
-    }
-    if let Some((m, l)) = modmap.get(name) {
-        return (m.clone(), l.clone());
-    }
-    ("\u{2014}".to_string(), "\u{2014}".to_string())
-}
-
-/// Privilege order for sorting: boundary (most privileged) → services → app →
-/// builtin/unknown. Reads top-down from where powers enter the world.
-fn layer_rank(layer: &str) -> u8 {
-    match layer {
-        "boundary" => 0,
-        "services" => 1,
-        "app" => 2,
-        _ => 3,
+        effects: report.effects,
+        functions: report.functions,
+        calls: report.calls,
+        data_access: report.data_access,
     }
 }
 
@@ -780,9 +443,7 @@ impl Analysis {
     fn from_diags(diagnostics: Vec<Diagnostic>) -> Self {
         Analysis {
             diagnostics,
-            effects: Vec::new(),
-            functions: Vec::new(),
-            calls: Vec::new(),
+            ..Default::default()
         }
     }
 }
@@ -801,7 +462,11 @@ impl FromPipelinePanic for Analysis {
 /// The checker pipeline — `program → elaborate`, error → one
 /// `Diagnostic`. Empty `Vec` on success.
 fn check_pipeline(source: String) -> Vec<Diagnostic> {
-    let term = match locus::program(&source) {
+    // Same plugin-grafted set as analyze/eval, so the live editor checker does
+    // not squiggle a valid plugin-backed program (e.g. `db_open_memory`) that
+    // F6/Analyze accepts.
+    let modules = locus_llvm::plugins::plugin_grafted_modules();
+    let term = match locus::program_with_stdlib(&source, &modules).map(|(t, _)| t) {
         Ok(t) => t,
         Err(e) => return vec![diag_from_report(&locus::Report::parse_error(&e, &source))],
     };
@@ -973,9 +638,9 @@ mod tests {
     #[test]
     fn eval_console_writeln_runs_and_reports_world_effects() {
         let mut s = LocusSession::new();
-        // `console_writeln` runs over raw Win32 — its row is the
-        // boundary/world/memory powers. We assert it ran (some i64) and
-        // that the manifest names the winapi + gc powers.
+        // `console_writeln` runs over raw Win32, but the Console service **seals**
+        // winapi: the app's manifest is `{ gc }` (allocating the string), and the
+        // raw winapi power is confined to the boundary — it does not surface here.
         let out = s.eval(r#"console_writeln "hi""#);
         assert!(
             out.result.is_some(),
@@ -983,13 +648,47 @@ mod tests {
             out.diagnostics
         );
         assert!(
-            out.effects.iter().any(|e| e == "winapi"),
-            "console output crosses the winapi boundary: {:?}",
+            out.effects.iter().any(|e| e == "gc"),
+            "building the string allocates (gc): {:?}",
             out.effects
         );
         assert!(
-            out.effects.iter().any(|e| e == "gc"),
-            "building the string allocates (gc): {:?}",
+            !out.effects.iter().any(|e| e == "winapi"),
+            "winapi is sealed at the Console service — confined, not in the app manifest: {:?}",
+            out.effects
+        );
+    }
+
+    #[test]
+    fn eval_runs_an_in_memory_db_program_end_to_end() {
+        // The IDE eval path now grafts the service plugins (like analyze) AND
+        // resolves their C-ABI symbols in the JIT, so a plugin-backed program
+        // runs — not just analyzes. Opens an in-memory SQLite db, inserts, reads
+        // it back. Guards the eval/analyze consistency the review flagged.
+        let mut s = LocusSession::new();
+        let out = s.eval(
+            r#"
+let c = db_open_memory () in
+let _ = db_exec c "CREATE TABLE t (x INTEGER)" in
+let _ = db_exec c "INSERT INTO t VALUES (42)" in
+let q = db_prepare c "SELECT x FROM t" in
+let rs = db_run_query q in
+let v = db_get_int rs 0 0 in
+let _ = db_free rs in
+let _ = db_finalize q in
+let _ = db_close c in
+v
+"#,
+        );
+        assert_eq!(
+            out.result,
+            Some(42),
+            "the in-memory db program runs and reads back the row: {:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.effects.iter().any(|e| e == "sqlite"),
+            "the run manifest names the sqlite data effect: {:?}",
             out.effects
         );
     }

@@ -29,6 +29,8 @@ pub mod lower;
 #[cfg(all(feature = "windows-driver", feature = "mcp"))]
 pub mod mcp;
 #[cfg(feature = "windows-driver")]
+pub mod plugins;
+#[cfg(feature = "windows-driver")]
 pub mod runtime;
 #[cfg(feature = "windows-driver")]
 pub mod winapi_resolve;

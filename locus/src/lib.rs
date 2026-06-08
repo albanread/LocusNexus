@@ -70,6 +70,7 @@
 //! The pipeline `parse → check → …` is built one honest slice at a time;
 //! nothing here is scaffolded ahead of a proved rule.
 
+pub mod analysis;
 pub mod capability;
 pub mod check;
 pub mod diag;

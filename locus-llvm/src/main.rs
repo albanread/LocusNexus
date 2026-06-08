@@ -12,14 +12,13 @@
 //! All run the same front end (`locus::parse` → `elaborate` → `lower`) to the
 //! ANF IR, then hand it to the backend.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(feature = "mcp")]
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 #[cfg(feature = "mcp")]
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 #[cfg(feature = "mcp")]
 use std::time::{Duration, Instant};
 
@@ -596,35 +595,11 @@ fn guard_layer2(src: &str, authorized: &HashSet<String>) -> Result<(), String> {
 /// Front end: source → ANF IR + the demanded Win32 DLLs. `program` grafts the
 /// prelude (e.g. `console_writeln`); the resolver fills bare `extern "Sym"` from the
 /// Win32 oracle and collects the DLLs the AOT linker will need.
-/// The compile-time **service plugins** linked into this driver — the grant
-/// list. Each entry contributes its boundary+service `.locus` modules (grafted
-/// alongside the stdlib) and its C-ABI symbols (injected into the JIT). See
-/// locusnexus docs/design/rust-service-plugins.md.
-fn service_plugins() -> Vec<locus_plugin::ServicePlugin> {
-    vec![locus_sqlite::plugin()]
-}
-
-/// Stdlib modules + every plugin's modules, for the graft. A plugin's modules
-/// auto-include only when a program names one of its exposed surface.
-fn plugin_grafted_modules() -> Vec<(u8, &'static str, &'static str)> {
-    let mut m: Vec<(u8, &'static str, &'static str)> = locus::stdlib_modules().to_vec();
-    for p in service_plugins() {
-        m.extend(p.modules);
-    }
-    m
-}
-
-/// Every plugin's C-ABI symbols (name → address), for the JIT's absolute-symbol
-/// manifold (passed to `jit_run_i64_with_symbols`).
-fn plugin_symbols() -> Vec<(String, u64)> {
-    let mut s = Vec::new();
-    for p in service_plugins() {
-        for (name, addr) in p.symbols {
-            s.push((name.to_string(), addr));
-        }
-    }
-    s
-}
+///
+/// The compile-time **service plugins** — graft module set + C-ABI symbols —
+/// now live in the library ([`locus_llvm::plugins`]) so the IDE's analysis path
+/// grafts the same set; the driver re-uses them here.
+use locus_llvm::plugins::{plugin_grafted_modules, plugin_symbols};
 
 fn to_ir(
     src: &str,
@@ -781,98 +756,6 @@ fn cmd_asm(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-/// The embedded effect-catalog source — data the compiler ships, `republish`
-/// emits, and a project may edit and rebuild. Single source for both the loader
-/// and `republish`, so the emitted copy is byte-identical to the one in use.
-const EFFECT_CATALOG: &str = include_str!("effects.catalog");
-
-/// The effect catalog — the category roll-up order, and per-label / per-kind
-/// category + gloss. **Data, not hardcoded logic**: parsed from the embedded
-/// `effects.catalog` (which `republish` emits), so a project owns its taxonomy.
-struct Catalog {
-    /// Categories in display order.
-    order: Vec<String>,
-    /// Explicit `label -> (category, gloss)`.
-    by_label: HashMap<String, (String, String)>,
-    /// Fallback `kind -> (category, gloss)` for labels not named explicitly.
-    by_kind: HashMap<String, (String, String)>,
-}
-
-/// Parse the embedded catalog once. Lenient: blank / `#` lines and malformed
-/// lines are skipped, so a missing entry degrades to the ultimate default rather
-/// than failing the command.
-fn load_catalog() -> Catalog {
-    let mut order = Vec::new();
-    let mut by_label = HashMap::new();
-    let mut by_kind = HashMap::new();
-    for line in EFFECT_CATALOG.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let tok: Vec<&str> = line.split_whitespace().collect();
-        if tok[0] == "order" {
-            order = tok[1..].iter().map(|s| s.to_string()).collect();
-            continue;
-        }
-        if tok.len() < 3 {
-            continue;
-        }
-        let entry = (tok[1].to_string(), tok[2..].join(" "));
-        if let Some(kind) = tok[0].strip_prefix("kind:") {
-            by_kind.insert(kind.to_string(), entry);
-        } else {
-            by_label.insert(tok[0].to_string(), entry);
-        }
-    }
-    Catalog {
-        order,
-        by_label,
-        by_kind,
-    }
-}
-
-/// The catalog, loaded once, before any lookup (`effects` consults it).
-fn catalog() -> &'static Catalog {
-    static C: OnceLock<Catalog> = OnceLock::new();
-    C.get_or_init(load_catalog)
-}
-
-/// A label's KIND — the fallback key when it isn't named explicitly.
-fn label_kind(l: &locus::Label) -> &'static str {
-    use locus::Label::*;
-    match l {
-        World(_) => "world",
-        User(_) => "user",
-        Exn(_) => "exn",
-        Gc => "gc",
-        // `st` — observable `Ref` mutation (mutability.md §2). Its own kind so the
-        // effect manifest groups it distinctly; the catalog's `by_kind`/default
-        // fallback supplies the gloss when "state" has no explicit entry.
-        St => "state",
-        Insert => "staging",
-    }
-}
-
-/// `(category, gloss)` for a label: explicit entry wins, else the kind fallback,
-/// else the ultimate default. Strings live in the `'static` catalog.
-fn lookup(l: &locus::Label) -> (&'static str, &'static str) {
-    let cat = catalog();
-    let name = format!("{l}");
-    if let Some((c, g)) = cat.by_label.get(&name) {
-        return (c.as_str(), g.as_str());
-    }
-    if let Some((c, g)) = cat.by_kind.get(label_kind(l)) {
-        return (c.as_str(), g.as_str());
-    }
-    ("user", "effect")
-}
-
-/// Which bucket an effect label rolls up into (from the catalog).
-fn category(l: &locus::Label) -> &'static str {
-    lookup(l).0
-}
-
 /// `effects FILE [--json]` — print FILE's effect MANIFEST: its type and the
 /// effects it performs, grouped by category and glossed. This is the "review
 /// everything" surface — the transparency that makes layer-2 work by interns /
@@ -921,10 +804,13 @@ fn cmd_effects(args: &[String]) -> Result<i32, String> {
     // `labels()` walks a BTreeSet, so the order is sorted and stable — diffable.
     let labels: Vec<&locus::Label> = tree.row.labels().collect();
     let ty = tree.ty.to_string();
+    // The module declarations the layer attribution reads from (same grafted set
+    // we just elaborated), so each effect can show the layer it enters at.
+    let decls = locus::stdlib_module_decls_from(&modules);
     if json {
-        print_effects_json(file, &ty, &labels);
+        print_effects_json(file, &ty, &labels, &decls);
     } else {
-        print_effects_human(file, &ty, &labels);
+        print_effects_human(file, &ty, &labels, &decls);
     }
     Ok(0)
 }
@@ -932,12 +818,12 @@ fn cmd_effects(args: &[String]) -> Result<i32, String> {
 /// Group the labels into the non-empty categories, in `CATEGORY_ORDER`.
 fn grouped<'a>(labels: &[&'a locus::Label]) -> Vec<(&'static str, Vec<&'a locus::Label>)> {
     let mut out = Vec::new();
-    for cat in &catalog().order {
+    for cat in locus::analysis::category_order() {
         let cat = cat.as_str();
         let in_cat: Vec<&locus::Label> = labels
             .iter()
             .copied()
-            .filter(|l| category(l) == cat)
+            .filter(|l| locus::analysis::category(l) == cat)
             .collect();
         if !in_cat.is_empty() {
             out.push((cat, in_cat));
@@ -946,9 +832,21 @@ fn grouped<'a>(labels: &[&'a locus::Label]) -> Vec<(&'static str, Vec<&'a locus:
     out
 }
 
+/// The layer tag shown beside an effect: `L0` boundary / `L1` services / `L2`
+/// app, or `L·` for a cross-cutting effect that is not layer-confined.
+fn layer_tag(l: &locus::Label, decls: &[locus::ModuleDecl]) -> &'static str {
+    match locus::analysis::effect_layer_in(l, decls) {
+        Some(0) => "L0",
+        Some(1) => "L1",
+        Some(2) => "L2",
+        _ => "L\u{b7}",
+    }
+}
+
 /// The human manifest: type, a one-line summary (explicit set when small, a
-/// category roll-up when wide), then the legend grouped by category.
-fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label]) {
+/// category roll-up when wide), then the legend grouped by category. Each legend
+/// line is prefixed with the layer the effect enters at (`L0`/`L1`/`L2`/`L·`).
+fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label], decls: &[locus::ModuleDecl]) {
     println!("{file}");
     println!("  type    : {ty}");
     if labels.is_empty() {
@@ -975,7 +873,12 @@ fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label]) {
         println!();
         println!("  {cat} ({})", ls.len());
         for l in ls {
-            println!("    {:<10} {}", format!("{l}"), describe(l));
+            println!(
+                "    {}  {:<10} {}",
+                layer_tag(l, decls),
+                format!("{l}"),
+                locus::analysis::describe(l)
+            );
         }
     }
 }
@@ -983,7 +886,7 @@ fn print_effects_human(file: &str, ty: &str, labels: &[&locus::Label]) {
 /// The machine manifest: stable, sorted JSON for `git diff` / CI policy. Labels
 /// are the diff signal (glosses are derived, so they're left out to keep diffs
 /// quiet). No serde dependency — the shape is small and fixed.
-fn print_effects_json(file: &str, ty: &str, labels: &[&locus::Label]) {
+fn print_effects_json(file: &str, ty: &str, labels: &[&locus::Label], decls: &[locus::ModuleDecl]) {
     let cats = grouped(labels);
     println!("{{");
     println!("  \"file\": \"{}\",", json_escape(file));
@@ -998,10 +901,16 @@ fn print_effects_json(file: &str, ty: &str, labels: &[&locus::Label]) {
     println!("  \"effects\": [");
     for (i, l) in labels.iter().enumerate() {
         let comma = if i + 1 < labels.len() { "," } else { "" };
+        // `layer` is the layer the effect enters at (0/1/2), or `null` if it is
+        // cross-cutting (not layer-confined).
+        let layer = match locus::analysis::effect_layer_in(l, decls) {
+            Some(n) => n.to_string(),
+            None => "null".to_string(),
+        };
         println!(
-            "    {{ \"label\": \"{}\", \"category\": \"{}\" }}{comma}",
+            "    {{ \"label\": \"{}\", \"category\": \"{}\", \"layer\": {layer} }}{comma}",
             json_escape(&format!("{l}")),
-            category(l)
+            locus::analysis::category(l)
         );
     }
     println!("  ]");
@@ -1023,12 +932,6 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
-}
-
-/// A one-line gloss for an effect label — the legend in the `effects` manifest,
-/// read from the catalog.
-fn describe(l: &locus::Label) -> &'static str {
-    lookup(l).1
 }
 
 /// `republish [DIR]` — write the compiler's embedded platform to DIR (default
@@ -1063,14 +966,14 @@ fn cmd_republish(args: &[String]) -> Result<i32, String> {
     // The effect catalog — review config, not a code layer, so it gets the `cfg`
     // pseudo-layer in the manifest.
     let cat_path = dir.join("effects.catalog");
-    std::fs::write(&cat_path, EFFECT_CATALOG)
+    std::fs::write(&cat_path, locus::analysis::EFFECT_CATALOG_SRC)
         .map_err(|e| format!("writing `{}`: {e}", cat_path.display()))?;
     manifest.push_str(&format!(
         "  {:<5}  {:<11}  {:<7}  {:#018x}  effects.catalog\n",
         "cfg",
         "effects",
-        EFFECT_CATALOG.len(),
-        fnv1a(EFFECT_CATALOG)
+        locus::analysis::EFFECT_CATALOG_SRC.len(),
+        fnv1a(locus::analysis::EFFECT_CATALOG_SRC)
     ));
     println!("republished {}", cat_path.display());
     let mpath = dir.join("MANIFEST.txt");
@@ -1102,16 +1005,16 @@ mod tests {
     fn catalog_classifies_every_label_kind() {
         // winapi is the raw FFI edge — its own `boundary` bucket, NOT lumped in
         // with the abstract IO capabilities (`console` / `fs` / `net`).
-        assert_eq!(category(&Label::World("winapi".into())), "boundary");
-        assert_eq!(category(&Label::World("console".into())), "world");
-        assert_eq!(category(&Label::World("fs".into())), "world");
-        assert_eq!(category(&Label::World("mem".into())), "memory");
-        assert_eq!(category(&Label::Gc), "memory");
-        assert_eq!(category(&Label::Exn("Overflow".into())), "control");
-        assert_eq!(category(&Label::User("Db".into())), "user");
-        assert_eq!(category(&Label::Insert), "staging");
+        assert_eq!(locus::analysis::category(&Label::World("winapi".into())), "boundary");
+        assert_eq!(locus::analysis::category(&Label::World("console".into())), "world");
+        assert_eq!(locus::analysis::category(&Label::World("fs".into())), "world");
+        assert_eq!(locus::analysis::category(&Label::World("mem".into())), "memory");
+        assert_eq!(locus::analysis::category(&Label::Gc), "memory");
+        assert_eq!(locus::analysis::category(&Label::Exn("Overflow".into())), "control");
+        assert_eq!(locus::analysis::category(&Label::User("Db".into())), "user");
+        assert_eq!(locus::analysis::category(&Label::Insert), "staging");
         // every category produced is one the catalog also orders (no orphan bucket)
-        let order = &catalog().order;
+        let order = locus::analysis::category_order();
         for l in [
             Label::World("winapi".into()),
             Label::Gc,
@@ -1119,7 +1022,7 @@ mod tests {
             Label::Insert,
         ] {
             assert!(
-                order.iter().any(|c| c == category(&l)),
+                order.iter().any(|c| c == locus::analysis::category(&l)),
                 "{l} fell outside the roll-up order"
             );
         }
@@ -1129,10 +1032,10 @@ mod tests {
     /// label or user effect is still categorised (never silently dropped).
     #[test]
     fn unlisted_labels_fall_back_to_their_kind() {
-        assert_eq!(category(&Label::World("bluetooth".into())), "world"); // unlisted world
-        assert_eq!(category(&Label::User("Telemetry".into())), "user"); // unlisted user
+        assert_eq!(locus::analysis::category(&Label::World("bluetooth".into())), "world"); // unlisted world
+        assert_eq!(locus::analysis::category(&Label::User("Telemetry".into())), "user"); // unlisted user
                                                                         // and the gloss comes from the kind fallback, not empty
-        assert!(!describe(&Label::User("Telemetry".into())).is_empty());
+        assert!(!locus::analysis::describe(&Label::User("Telemetry".into())).is_empty());
     }
 
     /// The hand-rolled JSON escaper covers the cases that would break a parser;

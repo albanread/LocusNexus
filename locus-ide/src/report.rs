@@ -13,7 +13,9 @@
 
 use std::fmt::Write as _;
 
-use crate::session::{analyze, compiler_view, Analysis, CompilerView, FnRow};
+use crate::session::{
+    analyze, compiler_view, Analysis, CompilerView, DataRow, EffectInfo, FnInfo,
+};
 use crate::EvalOutcome;
 
 /// Render the Markdown effect/capability report for an eval outcome
@@ -47,9 +49,10 @@ pub fn analyze_report(source: &str) -> String {
         diagnostics_section(&mut md, &a.diagnostics);
         return md;
     }
-    effects_section(&mut md, &a.effects);
+    effects_manifest(&mut md, &a.effects);
     functions_section(&mut md, &a.functions);
     calls_section(&mut md, &a);
+    data_access_section(&mut md, &a.data_access);
     md
 }
 
@@ -91,40 +94,56 @@ pub fn lowering_report(source: &str, view: CompilerView) -> String {
 fn calls_section(md: &mut String, a: &Analysis) {
     use std::collections::{BTreeMap, BTreeSet};
 
-    if a.calls.is_empty() {
+    let any_recursion = a.functions.iter().any(|f| f.recursive);
+    if a.calls.is_empty() && !any_recursion {
         return;
     }
-    // name -> (module, layer) for every table function.
-    let info: BTreeMap<&str, (&str, &str)> = a
+    // name -> (module, layer-name, layer-rank) for every table function.
+    let info: BTreeMap<&str, (&str, &str, Option<u8>)> = a
         .functions
         .iter()
-        .map(|f| (f.name.as_str(), (f.module.as_str(), f.layer.as_str())))
+        .map(|f| (f.name.as_str(), (f.module.as_str(), f.layer.as_str(), f.layer_rank)))
         .collect();
 
-    // The node a function maps to: an app/user function keeps its own node;
-    // any other (stdlib) function collapses to its module node. Returns
-    // `(node_id, label)`.
-    let node_of = |name: &str| -> (String, String) {
+    // The node a function maps to: an app/user (or builtin) function keeps its
+    // own node; a boundary/services function collapses to its module node, so
+    // the many stdlib/plugin leaves converge on one node per service. Returns
+    // `(node_id, label, layer_rank)`.
+    let node_of = |name: &str| -> (String, String, Option<u8>) {
         match info.get(name) {
-            Some((module, layer)) if *layer != "app" => {
-                let id = format!("mod_{}", sanitize(module));
-                (id, format!("{module} ({layer})"))
+            Some((module, layer, rank)) if matches!(rank, Some(0) | Some(1)) => {
+                (format!("mod_{}", sanitize(module)), format!("{module} ({layer})"), *rank)
             }
-            Some(_) => (format!("fn_{}", sanitize(name)), name.to_string()),
-            // Not in the table (shouldn't happen for edge endpoints) — own node.
-            None => (format!("fn_{}", sanitize(name)), name.to_string()),
+            Some((_, _, rank)) => (format!("fn_{}", sanitize(name)), name.to_string(), *rank),
+            None => (format!("fn_{}", sanitize(name)), name.to_string(), None),
         }
     };
 
-    let mut nodes: BTreeMap<String, (String, bool)> = BTreeMap::new(); // id -> (label, is_module)
-    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    for (caller, callee) in &a.calls {
-        let (cid, clabel) = node_of(caller);
-        let (eid, elabel) = node_of(callee);
-        nodes.insert(cid.clone(), (clabel, cid.starts_with("mod_")));
-        nodes.insert(eid.clone(), (elabel, eid.starts_with("mod_")));
+    let mut nodes: BTreeMap<String, (String, Option<u8>, bool)> = BTreeMap::new(); // id -> (label, rank, is_module)
+    // (caller_id, callee_id) -> (union of crossing effects, crosses a layer?)
+    let mut edges: BTreeMap<(String, String), (BTreeSet<String>, bool)> = BTreeMap::new();
+    for e in &a.calls {
+        let (cid, clabel, crank) = node_of(&e.caller);
+        let (eid, elabel, erank) = node_of(&e.callee);
+        nodes.insert(cid.clone(), (clabel, crank, cid.starts_with("mod_")));
+        nodes.insert(eid.clone(), (elabel, erank, eid.starts_with("mod_")));
         if cid != eid {
-            edges.insert((cid, eid));
+            let entry = edges.entry((cid, eid)).or_default();
+            for fx in &e.effects {
+                entry.0.insert(fx.clone());
+            }
+            entry.1 |= e.crosses_layer;
+        }
+    }
+    // Recursion: a self-loop on each recursive function that has its own node
+    // (a collapsed module node hides intra-module recursion, so skip those).
+    for f in &a.functions {
+        if f.recursive {
+            let (id, label, rank) = node_of(&f.name);
+            if !id.starts_with("mod_") {
+                nodes.insert(id.clone(), (label, rank, false));
+                edges.entry((id.clone(), id)).or_default();
+            }
         }
     }
     if edges.is_empty() {
@@ -132,22 +151,37 @@ fn calls_section(md: &mut String, a: &Analysis) {
     }
 
     md.push_str("\n## Call graph\n\n");
-    md.push_str("*Your functions are individual nodes; stdlib calls collapse to one node per service module.*\n\n");
+    md.push_str(
+        "*Your functions are individual nodes (coloured by layer: boundary red, \
+         services amber, app blue); boundary/services calls collapse to one node \
+         per service module. An edge is labelled with the powers that flow across \
+         it; a **bold** `==>` edge crosses a layer; `↻` marks recursion.*\n\n",
+    );
     md.push_str("```mermaid\nflowchart LR\n");
-    for (id, (label, is_module)) in &nodes {
+    for (id, (label, rank, is_module)) in &nodes {
         if *is_module {
-            // Stadium shape + amber fill marks a collapsed service module.
             let _ = writeln!(md, "  {id}([\"{label}\"])");
-            // docpane reads node colour from a `%% @node` annotation (not the
-            // `style` statement): dark-amber fill + bright-amber stroke, which
-            // reads against the fixed light node text.
-            let _ = writeln!(md, "  %% @node {id} fill=\"#5C3D10\" stroke=\"#E8A33D\"");
         } else {
             let _ = writeln!(md, "  {id}[\"{label}\"]");
         }
+        // docpane reads node colour from a `%% @node` annotation (not `style`).
+        let (fill, stroke) = layer_color(*rank);
+        let _ = writeln!(md, "  %% @node {id} fill=\"{fill}\" stroke=\"{stroke}\"");
     }
-    for (c, e) in &edges {
-        let _ = writeln!(md, "  {c} --> {e}");
+    for ((c, e), (fx, crosses)) in &edges {
+        if c == e {
+            let _ = writeln!(md, "  {c} -->|↻| {e}");
+        } else {
+            let arrow = if *crosses { "==>" } else { "-->" };
+            if fx.is_empty() {
+                let _ = writeln!(md, "  {c} {arrow} {e}");
+            } else {
+                // Quote the edge label: an effect like `exn[Overflow]` contains a
+                // `[` that, unquoted, breaks the whole Mermaid flowchart parse.
+                let label = fx.iter().cloned().collect::<Vec<_>>().join(", ");
+                let _ = writeln!(md, "  {c} {arrow}|\"{label}\"| {e}");
+            }
+        }
     }
     md.push_str("```\n");
 }
@@ -159,37 +193,186 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-/// The per-function origin table: for each named function the program uses,
-/// where it is defined (module + layer), its argument types, and the effect it
-/// carries — so the manifest's powers can be traced to the functions that bring
-/// them in.
-fn functions_section(md: &mut String, fns: &[FnRow]) {
+/// The per-function origin table, **grouped by privilege layer**: for each named
+/// function the program uses, where it is defined (module), its argument types,
+/// and the effect it carries — so the manifest's powers can be traced to the
+/// functions that bring them in, and you see at a glance which layer each lives
+/// at. The rows arrive pre-sorted by layer rank, so a subheading is emitted each
+/// time the layer changes. A `↻` marks a self-recursive function.
+fn functions_section(md: &mut String, fns: &[FnInfo]) {
     md.push_str("\n## Functions — where the effects originate\n\n");
     if fns.is_empty() {
         md.push_str("_No named library functions referenced._\n");
         return;
     }
-    md.push_str("| Module | Function | Layer | Arguments | Effect |\n");
-    md.push_str("|---|---|---|---|---|\n");
+    md.push_str(
+        "*Grouped by privilege layer — boundary (0) mints raw powers, services (1) \
+         seal and re-export them, app (2) is your own code.*\n",
+    );
+    let mut current: Option<Option<u8>> = None;
     for f in fns {
+        if current != Some(f.layer_rank) {
+            current = Some(f.layer_rank);
+            let heading = match f.layer_rank {
+                Some(r) => format!("Layer {r} — {}", f.layer),
+                None => "Builtins".to_string(),
+            };
+            let _ = write!(
+                md,
+                "\n### {heading}\n\n| Function | Module | Arguments | Effect |\n|---|---|---|---|\n"
+            );
+        }
+        let name = if f.recursive {
+            format!("`{}` ↻", f.name)
+        } else {
+            format!("`{}`", f.name)
+        };
         let args = if f.args.is_empty() {
             "()".to_string()
         } else {
             f.args.join(", ")
-        };
+        }
+        .replace('|', "\\|");
         let eff = if f.effects.is_empty() {
             "\u{2014}".to_string()
         } else {
             f.effects.join(", ")
         };
-        // Guard the few characters that would break a Markdown table cell.
-        let args = args.replace('|', "\\|");
+        let _ = writeln!(md, "| {name} | {} | {args} | {eff} |", f.module);
+    }
+}
+
+/// The colour (docpane `%% @node` fill / stroke) for a layer rank — boundary
+/// (raw power) reads red, services amber, app blue, a builtin/unknown gray. The
+/// docpane reads colour from this annotation, not a Mermaid `style` statement.
+fn layer_color(rank: Option<u8>) -> (&'static str, &'static str) {
+    match rank {
+        Some(0) => ("#5C1010", "#E85C5C"),
+        Some(1) => ("#5C3D10", "#E8A33D"),
+        Some(2) => ("#103D5C", "#3DA3E8"),
+        _ => ("#333333", "#888888"),
+    }
+}
+
+/// `"0 · boundary"` etc. for a table cell; bare layer name when the rank is
+/// unknown (a builtin).
+fn layer_tag(rank: Option<u8>, name: &str) -> String {
+    match rank {
+        Some(r) => format!("{r} · {name}"),
+        None => name.to_string(),
+    }
+}
+
+fn layer_name(rank: u8) -> &'static str {
+    match rank {
+        0 => "boundary",
+        1 => "services",
+        2 => "app",
+        _ => "?",
+    }
+}
+
+/// The **effect manifest** (the powers the program names), each tagged with the
+/// **layer it enters at** (0 boundary · 1 services · 2 app) and a gloss, plus the
+/// Mermaid confinement flow with nodes coloured by that layer.
+fn effects_manifest(md: &mut String, effects: &[EffectInfo]) {
+    if effects.is_empty() {
+        md.push_str(
+            "## Effects\n\nNone — this program is **pure** (`{}`). It touches no \
+             world capability.\n",
+        );
+        return;
+    }
+    md.push_str("## Effects (capabilities named)\n\n");
+    md.push_str(
+        "*Each power is tagged with the layer it enters the program at — \
+         0 boundary · 1 services · 2 app.*\n\n",
+    );
+    for e in effects {
+        let layer = match e.layer {
+            Some(r) => format!("layer {r} ({})", layer_name(r)),
+            None => "cross-cutting".to_string(),
+        };
+        let data = if e.is_data { " · **data**" } else { "" };
         let _ = writeln!(
             md,
-            "| {} | `{}` | {} | {} | {} |",
-            f.module, f.name, f.layer, args, eff
+            "- `{}` — {} · {}{}  \n  _{}_",
+            e.label, layer, e.category, data, e.gloss
         );
     }
+    md.push_str("\n## Confinement\n\n```mermaid\nflowchart LR\n");
+    md.push_str("  prog[\"program\"]\n");
+    for (i, e) in effects.iter().enumerate() {
+        let _ = writeln!(md, "  prog --> e{i}([\"{}\"])", e.label);
+        let (fill, stroke) = layer_color(e.layer);
+        let _ = writeln!(md, "  %% @node e{i} fill=\"{fill}\" stroke=\"{stroke}\"");
+    }
+    md.push_str("```\n");
+}
+
+/// The **data-access tree**: which functions touch a data store (a SQL DB, the
+/// credential vault, the filesystem, raw memory) or mutable state, and the
+/// boundary provider behind each effect. Omitted when the program touches no
+/// data. `gc` (allocation) is excluded as ubiquitous.
+fn data_access_section(md: &mut String, rows: &[DataRow]) {
+    use std::collections::BTreeSet;
+    if rows.is_empty() {
+        return;
+    }
+    md.push_str("\n## Data access\n\n");
+    md.push_str(
+        "*Which functions read or write a data store — a SQL database, the \
+         credential vault, the filesystem, raw memory — or mutable state, and the \
+         boundary provider behind each. Allocation (`gc`) is excluded as \
+         ubiquitous.*\n\n",
+    );
+    md.push_str("| Function | Layer | Data effect | Provider |\n|---|---|---|---|\n");
+    for r in rows {
+        for (eff, prov) in &r.providers {
+            let _ = writeln!(
+                md,
+                "| `{}` | {} | `{}` | {} |",
+                r.function,
+                layer_tag(r.layer_rank, &r.layer),
+                eff,
+                prov
+            );
+        }
+    }
+    // The tree: function (its layer colour) → data effect (gray) → boundary
+    // provider (red). Each node emitted once.
+    md.push_str("\n```mermaid\nflowchart LR\n");
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for r in rows {
+        let fnid = format!("fn_{}", sanitize(&r.function));
+        if seen.insert(fnid.clone()) {
+            let _ = writeln!(md, "  {fnid}[\"{}\"]", r.function);
+            let (fill, stroke) = layer_color(r.layer_rank);
+            let _ = writeln!(md, "  %% @node {fnid} fill=\"{fill}\" stroke=\"{stroke}\"");
+        }
+        for (eff, prov) in &r.providers {
+            let effid = format!("data_{}", sanitize(eff));
+            if seen.insert(effid.clone()) {
+                let _ = writeln!(md, "  {effid}[\"{eff}\"]");
+                let _ = writeln!(md, "  %% @node {effid} fill=\"#2B2B2B\" stroke=\"#9090A0\"");
+            }
+            edges.insert((fnid.clone(), effid.clone()));
+            if prov != "\u{2014}" {
+                let provid = format!("prov_{}", sanitize(prov));
+                if seen.insert(provid.clone()) {
+                    let _ = writeln!(md, "  {provid}([\"{prov}\"])");
+                    let (fill, stroke) = layer_color(Some(0));
+                    let _ = writeln!(md, "  %% @node {provid} fill=\"{fill}\" stroke=\"{stroke}\"");
+                }
+                edges.insert((effid, provid));
+            }
+        }
+    }
+    for (a, b) in &edges {
+        let _ = writeln!(md, "  {a} --> {b}");
+    }
+    md.push_str("```\n");
 }
 
 /// Shared renderer: the "Effects" list + the Mermaid "Confinement" flow
@@ -258,12 +441,22 @@ mod tests {
 
     #[test]
     fn analyze_report_names_powers_without_running() {
-        // `console_writeln` elaborates with the winapi/gc powers; analysis
-        // reports them without executing (no result line, no console I/O).
+        // `console_writeln` elaborates with the `gc` power; `winapi` is sealed at
+        // the Console service, so the app manifest names `gc` (the raw winapi is
+        // confined to the boundary, not surfaced here). Reported without running.
         let md = analyze_report(r#"console_writeln "hi""#);
         assert!(md.contains("Static"), "analysis is marked static: {md}");
         assert!(!md.contains("Result:"), "nothing ran, so no result: {md}");
-        assert!(md.contains("- `winapi`"), "the winapi power is named: {md}");
+        assert!(md.contains("- `gc`"), "the gc power is named: {md}");
+        assert!(
+            md.contains("layer 0 (boundary)"),
+            "each manifest effect is tagged with the layer it enters at: {md}"
+        );
+        // winapi is confined to the boundary — it must not surface as an app power.
+        assert!(
+            !md.contains("- `winapi`"),
+            "the raw winapi power is sealed, not named in the manifest: {md}"
+        );
         assert!(md.contains("```mermaid"), "confinement flow drawn: {md}");
     }
 
@@ -315,17 +508,22 @@ in
 outer 3
 "#;
         let md = analyze_report(src);
+        // The table groups by layer; the app layer is a subheading, the helper a
+        // row under it attributed to "(this program)".
         assert!(
-            md.lines().any(|l| l.contains("`helper`")
-                && l.contains("(this program)")
-                && l.contains("app")),
-            "the nested helper is attributed to the program / app layer: {md}"
+            md.contains("### Layer 2 — app"),
+            "an app-layer group is present: {md}"
         );
-        // No function row may have a blank (em-dash) module or layer.
-        for l in md.lines().filter(|l| l.starts_with("| ") && l.contains('`')) {
+        assert!(
+            md.lines()
+                .any(|l| l.starts_with("| `helper`") && l.contains("(this program)")),
+            "the nested helper is attributed to the program: {md}"
+        );
+        // No function row may have a blank (em-dash) module. Rows are
+        // `| `name` | Module | args | eff |`, so the module is cell index 2.
+        for l in md.lines().filter(|l| l.starts_with("| `")) {
             let cells: Vec<&str> = l.split('|').map(|c| c.trim()).collect();
-            assert_ne!(cells.get(1), Some(&"\u{2014}"), "module is attributed: {l}");
-            assert_ne!(cells.get(3), Some(&"\u{2014}"), "layer is attributed: {l}");
+            assert_ne!(cells.get(2), Some(&"\u{2014}"), "module is attributed: {l}");
         }
     }
 
@@ -366,13 +564,23 @@ let _ = a 1 in b 2
 "#;
         let md = analyze_report(src);
         assert!(md.contains("mod_Graphics([\"Graphics (services)\"])"), "collapsed service node: {md}");
-        assert!(md.contains("fn_a --> mod_Graphics"), "user fn -> service edge: {md}");
+        // `a` (app) -> Graphics (services) is a layer-crossing edge (`==>`) and
+        // carries the graphics power that flows across it.
+        assert!(
+            md.lines()
+                .any(|l| l.contains("fn_a") && l.contains("mod_Graphics") && l.contains("graphics")),
+            "the user fn -> service edge carries the graphics effect: {md}"
+        );
+        assert!(
+            md.contains("==>"),
+            "an app -> services call is marked as crossing a layer: {md}"
+        );
         // No individual fill_rect/gfx_* nodes leak into the graph.
         assert!(!md.contains("fn_fill_rect"), "stdlib leaves are collapsed: {md}");
-        // The service node is tinted amber via a docpane @node annotation.
+        // The service node is tinted amber (services layer) via a docpane @node.
         assert!(
             md.contains("%% @node mod_Graphics fill=\"#5C3D10\""),
-            "service node carries the amber fill annotation: {md}"
+            "service node carries the amber (layer-1) fill annotation: {md}"
         );
     }
 
@@ -414,11 +622,15 @@ let _ = fill_rect 1.0 2.0 3.0 4.0 0.2 0.4 0.7 1.0 in
 gfx_submit ()
 "#;
         let md = analyze_report(g);
-        assert!(md.contains("| Module | Function | Layer | Arguments | Effect |"), "{md}");
-        // fill_rect: Graphics / services / graphics effect.
+        // The table groups by layer; fill_rect lives under the services group,
+        // attributed to the Graphics module, carrying the `graphics` effect.
         assert!(
-            md.contains("| Graphics | `fill_rect` | services |"),
-            "fill_rect is attributed to Graphics/services: {md}"
+            md.contains("### Layer 1 — services"),
+            "a services-layer group is present: {md}"
+        );
+        assert!(
+            md.lines().any(|l| l.starts_with("| `fill_rect`") && l.contains("Graphics")),
+            "fill_rect is attributed to the Graphics module: {md}"
         );
         assert!(
             md.lines().any(|l| l.contains("`fill_rect`") && l.contains("graphics")),
@@ -446,5 +658,65 @@ gfx_submit ()
         assert!(md.contains("Diagnostics"), "errors get a section: {md}");
         assert!(md.contains("3:7  RN-E0201"), "the diagnostic is rendered: {md}");
         assert!(!md.contains("Result:"), "no result line on a failed run: {md}");
+    }
+
+    #[test]
+    fn analyze_report_data_access_tree_traces_a_db_program_to_its_provider() {
+        // A program that opens an in-memory SQLite db and runs a statement: the
+        // service plugins are grafted into analysis, so the `sqlite` data effect
+        // resolves, appears in the manifest tagged as data, and the data-access
+        // tree lists the db functions that touch it.
+        let src = r#"
+let c = db_open_memory () in
+let _ = db_exec c "CREATE TABLE t (x INTEGER)" in
+db_close c
+"#;
+        let md = analyze_report(src);
+        assert!(md.contains("## Data access"), "a data-access section is drawn: {md}");
+        assert!(
+            md.lines().any(|l| l.contains("`db_exec`") && l.contains("sqlite")),
+            "db_exec is shown touching the sqlite data effect: {md}"
+        );
+        // `sqlite` is named in the manifest, tagged as a data effect.
+        assert!(
+            md.lines().any(|l| l.contains("- `sqlite`") && l.contains("**data**")),
+            "sqlite is named in the manifest as a data effect: {md}"
+        );
+    }
+
+    #[test]
+    fn analyze_report_data_access_tree_includes_filesystem_writes() {
+        // DocsFs is a controlled-filesystem store; its docsfs_* effects are data
+        // access and must surface in the tree (a previous version missed them
+        // because the data set only listed raw `fs`, not the sealed service ops).
+        let src = r#"
+let _ = docs_write_text "notes.txt" "hello" in
+docs_read_text "notes.txt"
+"#;
+        let md = analyze_report(src);
+        assert!(md.contains("## Data access"), "filesystem access is a data section: {md}");
+        assert!(
+            md.lines()
+                .any(|l| l.contains("`docs_write_text`") && l.contains("docsfs_write")),
+            "docs_write_text shows its filesystem data effect: {md}"
+        );
+    }
+
+    #[test]
+    fn analyze_report_does_not_fabricate_a_data_row_for_a_mock_service() {
+        // The stdlib `Db` mock performs NO data-store I/O — its op is sealed, so
+        // the root manifest is just gc. The data-access tree must NOT invent a
+        // `db` effect from the module name (the friendly-collapse hazard), and
+        // must agree with the manifest that no data store is touched.
+        let src = r#"if db_mock_connect "test.api.key" then 1 else 0"#;
+        let md = analyze_report(src);
+        assert!(
+            !md.contains("## Data access"),
+            "no data-access section for a non-data mock service: {md}"
+        );
+        assert!(
+            !md.contains("`db`"),
+            "no fabricated `db` data effect from the module name: {md}"
+        );
     }
 }
